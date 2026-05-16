@@ -86,6 +86,14 @@ pub struct TerminalConfig {
     /// build finishes" semantics without a manual `notify-send` step.
     /// `0` disables the feature. Default `10000` (10 s).
     pub slow_command_ms: u64,
+    /// OSC 52 clipboard-write policy. Some terminals accept OSC 52
+    /// silently; that lets a malicious shell (or anything piping into
+    /// `less`) overwrite the system clipboard before the user pastes,
+    /// which is a real-world phishing primitive. Default is `false`
+    /// (deny) to match xterm and modern peer terminals (kitty / wezterm
+    /// / Alacritty all gate this). Set to `true` if you rely on tmux /
+    /// mosh / SSH-forwarded clipboard.
+    pub allow_osc52: bool,
 }
 
 impl Default for TerminalConfig {
@@ -101,6 +109,7 @@ impl Default for TerminalConfig {
             bell_visual: true,
             bell_urgent: true,
             slow_command_ms: 10_000,
+            allow_osc52: false,
         }
     }
 }

@@ -3062,6 +3062,11 @@ pub struct RunConfig {
     /// matches the Chrome/Firefox look. Set to `true` to fall back to
     /// the platform's native title bar (useful on tiling WMs).
     pub os_decorations: bool,
+    /// OSC 52 clipboard-write policy. `false` (default) blocks shell-
+    /// issued `\\e]52;c;<base64>\\e\\\\` from touching the system
+    /// clipboard. Set to `true` if you rely on tmux / mosh / SSH copy
+    /// flows.
+    pub allow_osc52: bool,
 }
 
 pub struct App {
@@ -3203,6 +3208,10 @@ pub struct App {
     bell_visual: bool,
     /// `terminal.bell_urgent` — turn the taskbar attention ping on/off.
     bell_urgent: bool,
+    /// `terminal.allow_osc52` — when false (default) OSC 52 clipboard
+    /// writes from the shell are dropped silently. See the security
+    /// audit in docs for the threat model.
+    allow_osc52: bool,
     /// Set after the FIRST `RedrawRequested` has issued a clear-only frame
     /// to kick the Wayland compositor's `configure` → `Resized` chain.
     /// Until then we render `render_clear_only` rather than the full
@@ -3285,6 +3294,7 @@ impl App {
             active_theme,
             on_theme_change,
             os_decorations,
+            allow_osc52,
         } = cfg;
         // Clamp here so a hand-written config with a negative/zero/huge
         // value can't crash glyphon (Metrics expects positive sizes) or
@@ -3368,6 +3378,7 @@ impl App {
             show_scrollbar,
             bell_visual,
             bell_urgent,
+            allow_osc52,
             first_frame_done: false,
             render_test_only,
             last_frame_tick: None,
@@ -11866,15 +11877,26 @@ impl ApplicationHandler for App {
                     .and_then(|t| t.focused_pane())
                     .and_then(|p| p.terminal.lock().ok().and_then(|mut t| t.take_pending_clipboard()));
                 if let Some(b64) = osc52 {
-                    use base64::Engine;
-                    match base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) {
-                        Ok(bytes) => {
-                            if let Ok(text) = std::str::from_utf8(&bytes) {
-                                clipboard_set(text);
-                                self.events.emit("osc52.write", text);
+                    // Drain the pending OSC 52 even when policy is deny —
+                    // otherwise a shell that keeps trying would have the
+                    // payload re-queued indefinitely and we'd never make
+                    // progress past it. With `allow_osc52 = false` we
+                    // simply drop the bytes and emit `osc52.blocked` so a
+                    // plugin can surface a toast.
+                    if !self.allow_osc52 {
+                        tracing::debug!("OSC 52 clipboard write blocked by config (allow_osc52 = false)");
+                        self.events.emit("osc52.blocked", &b64);
+                    } else {
+                        use base64::Engine;
+                        match base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) {
+                            Ok(bytes) => {
+                                if let Ok(text) = std::str::from_utf8(&bytes) {
+                                    clipboard_set(text);
+                                    self.events.emit("osc52.write", text);
+                                }
                             }
+                            Err(e) => tracing::debug!("OSC 52 base64 decode failed: {e}"),
                         }
-                        Err(e) => tracing::debug!("OSC 52 base64 decode failed: {e}"),
                     }
                 }
                 {

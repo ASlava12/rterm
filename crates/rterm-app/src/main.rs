@@ -1487,6 +1487,7 @@ fn run_gui(
         active_theme: initial_theme,
         on_theme_change,
         os_decorations: config.window.os_decorations,
+        allow_osc52: config.terminal.allow_osc52,
     })
 }
 
@@ -1959,7 +1960,7 @@ fn builtin_event_names() -> Vec<String> {
         "pane.scrollback_enter", "pane.scrollback_leave",
         "cwd", "title", "resize", "window.resize", "window.focus",
         "scroll", "selection.end",
-        "paste", "copy", "link.open", "link.hover", "link.unhover",
+        "paste", "copy", "link.open", "link.blocked", "link.hover", "link.unhover",
         "search.start", "search.end", "search.step",
         "palette.open", "palette.close",
         "output.line", "match", "shell.exit", "pane.shell_exit",
@@ -1967,7 +1968,7 @@ fn builtin_event_names() -> Vec<String> {
         "scrollback.save", "scrollback.clear",
         "prompt.jump", "command.jump",
         "bell", "notification", "progress",
-        "osc52.write",
+        "osc52.write", "osc52.blocked",
     ]
     .into_iter()
     .map(String::from)
@@ -2508,11 +2509,11 @@ mod tests {
             "search.start", "search.end", "search.step",
             "palette.open", "palette.close",
             "prompt.jump", "command.jump",
-            "link.open", "link.hover", "link.unhover",
+            "link.open", "link.blocked", "link.hover", "link.unhover",
             "window.focus", "window.resize",
             "scroll", "selection.end", "progress",
             "scrollback.save", "scrollback.clear",
-            "copy", "paste", "osc52.write",
+            "copy", "paste", "osc52.write", "osc52.blocked",
             "frame.tick", "cwd", "title", "resize",
             "bell", "notification",
         ] {
