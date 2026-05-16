@@ -8306,7 +8306,7 @@ impl App {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        match std::fs::write(path, out) {
+        match write_user_private(path, out.as_bytes()) {
             Ok(()) => tracing::info!(path = %path.display(), "session saved"),
             Err(e) => tracing::warn!("session save failed: {e}"),
         }
@@ -8373,7 +8373,7 @@ impl App {
                 return;
             }
             path.push(format!("scrollback-{}.txt", timestamp));
-            match std::fs::write(&path, &cleaned) {
+            match write_user_private(&path, cleaned.as_bytes()) {
                 Ok(()) => {
                     tracing::info!(path = %path.display(), "scrollback saved");
                     self.events.emit("scrollback.save", &path.display().to_string());
@@ -9991,6 +9991,40 @@ fn toml_escape_basic_string(s: &str) -> String {
         .replace('\n', "\\n")
         .replace('\r', "\\r")
         .replace('\t', "\\t")
+}
+
+/// Write `contents` to `path` with restrictive permissions where the
+/// platform supports them (`0o600` on Unix). rterm writes two kinds of
+/// files that may contain sensitive data — saved scrollback (can carry
+/// shell history, env dumps, accidentally-pasted secrets) and the
+/// session restore file (carries each tab's cwd). Default umask on most
+/// Linux distributions yields world-readable files; on a shared host
+/// any other local user could `cat ~/.cache/rterm/scrollback-*.txt`.
+///
+/// On non-Unix the file is created via plain `fs::write` — Windows
+/// inherits the parent directory's ACL, which is typically user-only
+/// inside `%LOCALAPPDATA%` anyway.
+fn write_user_private(
+    path: &std::path::Path,
+    contents: &[u8],
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(contents)?;
+        f.flush()
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
 }
 
 fn abbreviate_home(path: &str) -> String {
