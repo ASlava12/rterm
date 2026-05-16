@@ -2802,6 +2802,26 @@ struct TabSwapAnim {
 
 const TAB_SWAP_ANIM_MS: u128 = 140;
 
+/// Pre-computed surface of one tab — output of `App::tab_label`.
+/// Shared between hit-test math (`tab_layout`) and rendering
+/// (`header_spans`), so the two never drift.
+#[derive(Debug, Clone)]
+struct TabLabel {
+    /// Whether this tab is the active one (used for prefix + accent).
+    active: bool,
+    /// Whether a background pane in this tab has unread output.
+    activity: bool,
+    /// Final label text including the prefix and trailing space —
+    /// exactly what the header renders. Includes ` ·N` count marker
+    /// and zoom marker when applicable.
+    label: String,
+    /// Width of `label` in monospace cells (`UnicodeWidthChar` sum).
+    body_cells: usize,
+    /// Width of the trailing progress badge in cells, or 0 when no
+    /// pane is reporting OSC 9;4 progress.
+    badge_cells: usize,
+}
+
 /// Pixel layout for one tab in the header bar — output of `tab_layout`.
 #[derive(Debug, Clone, Copy)]
 struct TabLayoutEntry {
@@ -3696,6 +3716,82 @@ impl App {
     /// `(idx, body_left, body_right, close_right)` per tab in cursor
     /// order. Both `tab_hit_at` and `tab_bar_quads` consume this so
     /// hit-testing and the per-tab background quads stay in lockstep.
+    /// Single source of truth for one tab's rendered surface: the
+    /// prefix char (▌ active / • activity / space inactive), the body
+    /// label (`prefix + name + pane-count + zoom-marker`), the body
+    /// cell width, and the progress-badge cell width. Used by both
+    /// `tab_layout` (for hit-test pixel math) and `header_spans` (for
+    /// rendering). When these two paths drift, clicks land on the
+    /// wrong tab — pulling them through one helper keeps them in
+    /// lockstep.
+    fn tab_label(
+        &self,
+        idx: usize,
+        tab: &Tab,
+    ) -> TabLabel {
+        let active = idx == self.active_tab;
+        let activity = !active
+            && tab.panes().iter().any(|p| p.activity.load(Ordering::Relaxed));
+        let prefix = if active {
+            "▌"
+        } else if activity {
+            "•"
+        } else {
+            " "
+        };
+        let label = if let Some(p) = tab.focused_pane() {
+            let zoom_marker = if tab.zoomed { " ⛶" } else { "" };
+            let pane_count = tab.pane_count();
+            let count_marker = if pane_count > 1 {
+                format!(" ·{}", pane_count)
+            } else {
+                String::new()
+            };
+            let name = match tab.custom_title.as_deref() {
+                Some(s) if !s.is_empty() => trim_label(s, 14),
+                _ => trim_label(&p.display_title(), 14),
+            };
+            format!(
+                "{prefix} {pane}{count}{zoom} ",
+                prefix = prefix,
+                pane = name,
+                count = count_marker,
+                zoom = zoom_marker,
+            )
+        } else {
+            format!("{} {} ", prefix, idx + 1)
+        };
+        use unicode_width::UnicodeWidthChar;
+        let body_cells = label
+            .chars()
+            .map(|c| c.width().unwrap_or(0))
+            .sum::<usize>();
+        // OSC 9;4 aggregate progress badge — `tab_bar_quads` /
+        // `header_spans` append a glyph after the label; report its
+        // width so the hit-test stays exact.
+        let badge_cells = if let Some((state_, pct)) = tab
+            .panes()
+            .iter()
+            .filter_map(|p| p.progress.lock().ok().and_then(|g| *g))
+            .max_by_key(|(s, p)| (progress_severity(*s), *p))
+        {
+            match state_ {
+                2..=4 => 2,
+                1 => format!("{}% ", pct).chars().count(),
+                _ => 0,
+            }
+        } else {
+            0
+        };
+        TabLabel {
+            active,
+            activity,
+            label,
+            body_cells,
+            badge_cells,
+        }
+    }
+
     fn tab_layout(&self) -> Option<TabLayoutInfo> {
         let rect = self.tab_strip_rect()?;
         let state = self.state.as_ref()?;
@@ -3716,66 +3812,9 @@ impl App {
         let mut cursor = hb_end;
         let mut entries = Vec::with_capacity(self.tabs.len());
         for (i, tab) in self.tabs.iter().enumerate() {
-            let active = i == self.active_tab;
-            let activity = !active
-                && tab.panes().iter().any(|p| p.activity.load(Ordering::Relaxed));
-            let prefix = if active {
-                "▌"
-            } else if activity {
-                "•"
-            } else {
-                " "
-            };
-            let label = if let Some(p) = tab.focused_pane() {
-                let zoom_marker = if tab.zoomed { " ⛶" } else { "" };
-                let pane_count = tab.pane_count();
-                let count_marker = if pane_count > 1 {
-                    format!(" ·{}", pane_count)
-                } else {
-                    String::new()
-                };
-                let name = match tab.custom_title.as_deref() {
-                    Some(s) if !s.is_empty() => trim_label(s, 14),
-                    _ => trim_label(&p.display_title(), 14),
-                };
-                // Display the pane name only — the numeric prefix that
-                // used to live here was a position index, but during a
-                // drag-reorder it would change under the user's hand,
-                // making "tab 2" sometimes refer to a different tab
-                // than they mentally tracked. Position is already
-                // visible spatially in the tab strip; for keyboard
-                // jumping by N, see Alt+1..9 / Ctrl+Shift+1..9.
-                format!(
-                    "{prefix} {pane}{count}{zoom} ",
-                    prefix = prefix,
-                    pane = name,
-                    count = count_marker,
-                    zoom = zoom_marker,
-                )
-            } else {
-                format!("{} {} ", prefix, i + 1)
-            };
-            use unicode_width::UnicodeWidthChar;
-            let body_cells = label
-                .chars()
-                .map(|c| c.width().unwrap_or(0))
-                .sum::<usize>() as f64;
-            let badge_cells = if let Some((state_, pct)) = tab
-                .panes()
-                .iter()
-                .filter_map(|p| p.progress.lock().ok().and_then(|g| *g))
-                .max_by_key(|(s, p)| (progress_severity(*s), *p))
-            {
-                match state_ {
-                    2..=4 => 2.0,
-                    1 => format!("{}% ", pct).chars().count() as f64,
-                    _ => 0.0,
-                }
-            } else {
-                0.0
-            };
+            let info = self.tab_label(i, tab);
             let close_cells = TAB_CLOSE_WIDTH_CELLS as f64;
-            let body_end = cursor + (body_cells + badge_cells) * cell_w;
+            let body_end = cursor + (info.body_cells + info.badge_cells) as f64 * cell_w;
             let close_end = body_end + close_cells * cell_w;
             // Stop laying out tabs once we run into the window-controls
             // strip on the right. The remaining tabs simply aren't
@@ -5098,49 +5137,9 @@ impl App {
         };
         spans.push((storage.len() - 1, hb_color, self.show_app_menu));
         for (i, tab) in self.tabs.iter().enumerate() {
-            let active = i == self.active_tab;
-            let activity = !active
-                && tab
-                    .panes()
-                    .iter()
-                    .any(|p| p.activity.load(Ordering::Relaxed));
-            let prefix = if active {
-                "▌"
-            } else if activity {
-                "•"
-            } else {
-                " "
-            };
-            let label = if let Some(p) = tab.focused_pane() {
-                let zoom_marker = if tab.zoomed { " ⛶" } else { "" };
-                let pane_count = tab.pane_count();
-                let count_marker = if pane_count > 1 {
-                    format!(" ·{}", pane_count)
-                } else {
-                    String::new()
-                };
-                let name = match tab.custom_title.as_deref() {
-                    Some(s) if !s.is_empty() => trim_label(s, 14),
-                    _ => trim_label(&p.display_title(), 14),
-                };
-                // Display the pane name only — the numeric prefix that
-                // used to live here was a position index, but during a
-                // drag-reorder it would change under the user's hand,
-                // making "tab 2" sometimes refer to a different tab
-                // than they mentally tracked. Position is already
-                // visible spatially in the tab strip; for keyboard
-                // jumping by N, see Alt+1..9 / Ctrl+Shift+1..9.
-                format!(
-                    "{prefix} {pane}{count}{zoom} ",
-                    prefix = prefix,
-                    pane = name,
-                    count = count_marker,
-                    zoom = zoom_marker,
-                )
-            } else {
-                format!("{} {} ", prefix, i + 1)
-            };
-            storage.push(label);
+            let info = self.tab_label(i, tab);
+            let (active, activity) = (info.active, info.activity);
+            storage.push(info.label);
             let color = if active {
                 palette::default_fg()
             } else if activity {
