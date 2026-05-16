@@ -2956,14 +2956,16 @@ const HAMBURGER_WIDTH_CELLS: usize = 4;
 const NEW_TAB_WIDTH_CELLS: usize = 3;
 
 /// Window control glyphs at the right end of the header bar. Each
-/// button now reserves 5 cells (was 3) with a leading + trailing space
-/// pair around the glyph for clear visual separation between the
-/// three chips. Padding between buttons is shown as a thin transparent
-/// gap by leaving one extra cell of strip between consecutive chips.
-const WINDOW_CONTROL_MIN: &str = "  ─  ";
-const WINDOW_CONTROL_MAX: &str = "  ▢  ";
-const WINDOW_CONTROL_CLOSE: &str = "  ✕  ";
-const WINDOW_CONTROL_BUTTON_CELLS: usize = 5;
+/// button is 3 cells wide (one leading space, one centred glyph, one
+/// trailing space) — compact enough that the icons sit clearly anchored
+/// to the right edge even on very large font sizes / HiDPI scale
+/// factors, where the previous 5-cell layout left so much padding
+/// around each glyph that the cluster looked "floating" in the middle
+/// of the header.
+const WINDOW_CONTROL_MIN: &str = " ─ ";
+const WINDOW_CONTROL_MAX: &str = " ▢ ";
+const WINDOW_CONTROL_CLOSE: &str = " ✕ ";
+const WINDOW_CONTROL_BUTTON_CELLS: usize = 3;
 /// Cells of breathing room rendered as plain strip between adjacent
 /// control chips (visual gap between the three glyphs).
 const WINDOW_CONTROL_GAP_CELLS: usize = 1;
