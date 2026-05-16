@@ -92,37 +92,19 @@ impl<L> Tree<L> {
         }
     }
 
-    /// Navigate to a leaf by path.
-    pub fn leaf_at(&self, path: &[bool]) -> Option<&L> {
+    /// Get a shared reference to the subtree at `path` (Leaf, Split or
+    /// Hole). Returns `None` if the path descends past a Leaf.
+    fn slot_at(&self, path: &[bool]) -> Option<&Tree<L>> {
         let mut node = self;
         for &right in path {
             match node {
                 Tree::Split { a, b, .. } => {
-                    node = if right { b } else { a };
+                    node = if right { b.as_ref() } else { a.as_ref() };
                 }
                 _ => return None,
             }
         }
-        match node {
-            Tree::Leaf(l) => Some(l),
-            _ => None,
-        }
-    }
-
-    pub fn leaf_at_mut(&mut self, path: &[bool]) -> Option<&mut L> {
-        let mut node = self;
-        for &right in path {
-            match node {
-                Tree::Split { a, b, .. } => {
-                    node = if right { b } else { a };
-                }
-                _ => return None,
-            }
-        }
-        match node {
-            Tree::Leaf(l) => Some(l),
-            _ => None,
-        }
+        Some(node)
     }
 
     /// Get a mutable reference to the *subtree* at `path` (which may be a
@@ -138,6 +120,21 @@ impl<L> Tree<L> {
             }
         }
         Some(node)
+    }
+
+    /// Navigate to a leaf by path.
+    pub fn leaf_at(&self, path: &[bool]) -> Option<&L> {
+        match self.slot_at(path)? {
+            Tree::Leaf(l) => Some(l),
+            _ => None,
+        }
+    }
+
+    pub fn leaf_at_mut(&mut self, path: &[bool]) -> Option<&mut L> {
+        match self.slot_at_mut(path)? {
+            Tree::Leaf(l) => Some(l),
+            _ => None,
+        }
     }
 
     /// Replace the leaf at `path` with a new Split whose first child is the
@@ -276,16 +273,7 @@ impl<L> Tree<L> {
     /// Inspect the Split at `path`. Returns `(dir, ratio)` or `None` if the
     /// path points at a Leaf / Hole or is out of range.
     pub fn split_info(&self, path: &[bool]) -> Option<(SplitDir, f32)> {
-        let mut node = self;
-        for &right in path {
-            match node {
-                Tree::Split { a, b, .. } => {
-                    node = if right { b.as_ref() } else { a.as_ref() };
-                }
-                _ => return None,
-            }
-        }
-        match node {
+        match self.slot_at(path)? {
             Tree::Split { dir, ratio, .. } => Some((*dir, *ratio)),
             _ => None,
         }
@@ -294,20 +282,12 @@ impl<L> Tree<L> {
     /// Set the ratio of the Split at `path`. Returns false if `path` doesn't
     /// point at a Split.
     pub fn set_split_ratio(&mut self, path: &[bool], new_ratio: f32) -> bool {
-        let mut node: &mut Tree<L> = self;
-        for &right in path {
-            match node {
-                Tree::Split { a, b, .. } => {
-                    node = if right { b.as_mut() } else { a.as_mut() };
-                }
-                _ => return false,
+        match self.slot_at_mut(path) {
+            Some(Tree::Split { ratio, .. }) => {
+                *ratio = new_ratio.clamp(0.05, 0.95);
+                true
             }
-        }
-        if let Tree::Split { ratio, .. } = node {
-            *ratio = new_ratio.clamp(0.05, 0.95);
-            true
-        } else {
-            false
+            _ => false,
         }
     }
 
