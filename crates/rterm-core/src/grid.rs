@@ -93,21 +93,22 @@ impl Grid {
         let mut new_cells = vec![Cell::default(); new_size.cols as usize * new_size.rows as usize];
         let copy_cols = self.size.cols.min(new_size.cols) as usize;
         let copy_rows = self.size.rows.min(new_size.rows) as usize;
+        let old_cols = self.size.cols as usize;
+        let new_cols = new_size.cols as usize;
+        // Copy one row at a time via `copy_from_slice` (lowers to a
+        // single `memcpy`) instead of the cell-by-cell nested loop.
         for row in 0..copy_rows {
-            for col in 0..copy_cols {
-                let old_idx = row * self.size.cols as usize + col;
-                let new_idx = row * new_size.cols as usize + col;
-                new_cells[new_idx] = self.cells[old_idx];
-            }
+            let old_start = row * old_cols;
+            let new_start = row * new_cols;
+            new_cells[new_start..new_start + copy_cols]
+                .copy_from_slice(&self.cells[old_start..old_start + copy_cols]);
         }
         self.size = new_size;
         self.cells = new_cells;
     }
 
     pub fn clear(&mut self) {
-        for c in &mut self.cells {
-            *c = Cell::default();
-        }
+        self.cells.fill(Cell::default());
     }
 
     /// Iterate row `row` as a slice. None if out of bounds.
@@ -150,9 +151,7 @@ impl Grid {
         for i in (region_rows - shift)..region_rows {
             let row_idx = top as usize + i;
             let start = row_idx * cols;
-            for cell in &mut self.cells[start..start + cols] {
-                *cell = blank;
-            }
+            self.cells[start..start + cols].fill(blank);
         }
 
         evicted
@@ -178,9 +177,7 @@ impl Grid {
         for i in 0..shift {
             let row_idx = top as usize + i;
             let start = row_idx * cols;
-            for cell in &mut self.cells[start..start + cols] {
-                *cell = blank;
-            }
+            self.cells[start..start + cols].fill(blank);
         }
     }
 
@@ -204,6 +201,57 @@ mod tests {
         // catches an accidental upgrade to u32 / usize.
         assert_eq!(std::mem::size_of::<Position>(), 4);
         assert_eq!(std::mem::size_of::<Size>(), 4);
+    }
+
+    #[test]
+    fn resize_preserves_overlap_blanks_growth() {
+        // Seed 3×3 with unique chars so we can spot mis-copies.
+        let mut g = Grid::new(Size { cols: 3, rows: 3 });
+        for r in 0..3u16 {
+            for c in 0..3u16 {
+                let cell = g.cell_mut(Position { col: c, row: r }).unwrap();
+                cell.ch = char::from_u32(b'a' as u32 + (r * 3 + c) as u32).unwrap();
+            }
+        }
+        // Grow cols, shrink rows: overlap = 2 rows × 3 cols.
+        g.resize(Size { cols: 5, rows: 2 });
+        // Originals stay in place at their (row, col).
+        for r in 0..2u16 {
+            for c in 0..3u16 {
+                let expected = char::from_u32(b'a' as u32 + (r * 3 + c) as u32).unwrap();
+                assert_eq!(
+                    g.cell(Position { col: c, row: r }).unwrap().ch,
+                    expected,
+                    "lost cell at ({c},{r})"
+                );
+            }
+        }
+        // New columns are blanks (space).
+        for r in 0..2u16 {
+            for c in 3..5u16 {
+                assert_eq!(g.cell(Position { col: c, row: r }).unwrap().ch, ' ');
+            }
+        }
+    }
+
+    #[test]
+    fn scroll_up_blanks_vacated_rows_and_evicts_top() {
+        let mut g = Grid::new(Size { cols: 2, rows: 3 });
+        for r in 0..3u16 {
+            for c in 0..2u16 {
+                g.cell_mut(Position { col: c, row: r }).unwrap().ch =
+                    char::from_u32(b'a' as u32 + (r * 2 + c) as u32).unwrap();
+            }
+        }
+        let blank = Cell { ch: '.', ..Cell::default() };
+        let evicted = g.scroll_up(0, 2, 1, blank);
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].iter().map(|c| c.ch).collect::<String>(), "ab");
+        // Surviving rows shifted up.
+        assert_eq!(g.row(0).unwrap().iter().map(|c| c.ch).collect::<String>(), "cd");
+        assert_eq!(g.row(1).unwrap().iter().map(|c| c.ch).collect::<String>(), "ef");
+        // Bottom row blanked with `blank`.
+        assert_eq!(g.row(2).unwrap().iter().map(|c| c.ch).collect::<String>(), "..");
     }
 
     #[test]
