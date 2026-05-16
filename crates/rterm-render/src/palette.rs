@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use rterm_core::{Color as TermColor, NamedColor};
 
 /// Resolved RGB values for the 16 ANSI colours plus default fg/bg.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
     pub default_fg: [u8; 3],
     pub default_bg: [u8; 3],
@@ -22,29 +22,9 @@ pub struct Palette {
 
 impl Default for Palette {
     fn default() -> Self {
-        Self {
-            default_fg: [220, 220, 220],
-            default_bg: [10, 12, 18],
-            cursor: None,
-            named: [
-                [0, 0, 0],          // Black
-                [205, 49, 49],      // Red
-                [13, 188, 121],     // Green
-                [229, 229, 16],     // Yellow
-                [36, 114, 200],     // Blue
-                [188, 63, 188],     // Magenta
-                [17, 168, 205],     // Cyan
-                [229, 229, 229],    // White
-                [102, 102, 102],    // BrightBlack
-                [241, 76, 76],      // BrightRed
-                [35, 209, 139],     // BrightGreen
-                [245, 245, 67],     // BrightYellow
-                [59, 142, 234],     // BrightBlue
-                [214, 112, 214],    // BrightMagenta
-                [41, 184, 219],     // BrightCyan
-                [255, 255, 255],    // BrightWhite
-            ],
-        }
+        // Single source of truth: the `DEFAULT_THEME` const below. Keeping
+        // these in sync by hand would diverge sooner or later.
+        DEFAULT_THEME
     }
 }
 
@@ -72,10 +52,10 @@ pub fn builtin_themes() -> &'static [(&'static str, Palette)] {
 /// palette + the canonical key so callers can persist / log the
 /// resolved name.
 pub fn theme_by_name(name: &str) -> Option<(&'static str, Palette)> {
-    let needle = name.trim().to_ascii_lowercase();
+    let needle = name.trim();
     builtin_themes()
         .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(&needle))
+        .find(|(k, _)| k.eq_ignore_ascii_case(needle))
         .copied()
 }
 
@@ -384,6 +364,16 @@ mod tests {
         let (_, d) = theme_by_name("dracula").unwrap();
         let (_, s) = theme_by_name("solarized-dark").unwrap();
         assert_ne!(d.default_bg, s.default_bg);
+    }
+
+    #[test]
+    fn default_palette_matches_default_theme() {
+        // The Default impl now delegates to DEFAULT_THEME; pin the
+        // equivalence so a future edit to one constant without the
+        // other gets caught here instead of as a subtle theme drift
+        // ("Default" and "default" rendering differently).
+        let (_, dflt) = theme_by_name("default").unwrap();
+        assert_eq!(Palette::default(), dflt);
     }
 
     #[test]
