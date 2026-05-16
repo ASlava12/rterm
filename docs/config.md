@@ -59,6 +59,50 @@ RUST_BACKTRACE = "1"
 | `bell_visual` | bool | `true` | `true` / `false` | Визуальная вспышка экрана на BEL (`\a`) или `rterm.bell()` из плагина. |
 | `bell_urgent` | bool | `true` | `true` / `false` | Дёргать оконный менеджер (urgency-хинт / dock-badge) на BEL, когда окно не в фокусе. |
 | `slow_command_ms` | int (ms) | `10000` | `≥ 0`; `0` отключает | Порог для события `pane.slow_command`. Команда, помеченная OSC 133;C / 133;D (shell-integration), выполняющаяся дольше — триггерит edge-событие и, если окно не в фокусе, пинг в таскбар. |
+| `allow_osc52` | bool | `false` | `true` / `false` | Разрешить шеллу записывать в системный clipboard через `ESC ] 52 ; c ; <base64> ESC \`. По умолчанию **выключено** — враждебный pager-вывод или цепочка пайпов может перезаписать буфер между вашим «копировать» и «вставить» (реальный phishing-сценарий). Включай, только если завязан на tmux / mosh / SSH clipboard forwarding. Заблокированные записи фиксируются событием `osc52.blocked` (плагин может показать тоаст). |
+
+## `[guake]`
+
+Guake-style «drop-down» терминал: окно по нажатию бинда «выскакивает» поверх остальных, занимая часть экрана (как в [Guake](https://github.com/Guake/guake) / [Yakuake](https://apps.kde.org/yakuake/) / `tmux popup`). Удобно для quick-access без переключения столов.
+
+| Ключ | Тип | По умолчанию | Допустимые значения | Описание |
+|------|-----|--------------|---------------------|----------|
+| `enabled` | bool | `false` | `true` / `false` | Мастер-выключатель. Если `false`, action `toggle_guake` — no-op. |
+| `position` | string | `"top"` | `"top"` / `"bottom"` / `"full"` | К какому краю экрана прижимать «дроп». `"full"` — на весь монитор. |
+| `height_pct` | int | `50` | `10..=100` | Какую долю высоты монитора занимает окно (для `"top"` / `"bottom"`). Игнорируется для `"full"`. |
+| `width_pct` | int | `100` | `20..=100` | Какую долю ширины монитора занимает окно. |
+
+### Пример: F11 → выкатывание сверху на пол-экрана
+
+```toml
+[guake]
+enabled = true
+position = "top"     # вылазит сверху
+height_pct = 50      # на половину высоты экрана
+width_pct = 100      # на всю ширину
+
+[[keybindings]]
+keys   = "F11"
+action = "toggle_guake"
+```
+
+После этого `F11` (когда окно rterm в фокусе) сворачивает / разворачивает окно в дроп-режиме. Повторное нажатие — minimize.
+
+### Платформа
+
+- **X11 / Windows / macOS** — `set_outer_position` + `request_inner_size` работают; окно точно ложится на нужный край.
+- **Wayland** — композитор владеет позиционированием; `"top"` / `"full"` падают в `set_maximized(true)`, `"bottom"` только меняет размер (где появится окно — решает композитор).
+
+### Системный (глобальный) хоткей
+
+Бинд `toggle_guake` срабатывает **только когда окно rterm в фокусе** (или восстанавливается из minimize через taskbar/Alt-Tab). Чтобы F11 поднимал rterm даже из-под другого приложения — это уровень WM/DE, rterm специально не тянет глобальный shortcut-крейт. Варианты:
+
+- **GNOME**: Settings → Keyboard → Custom Shortcut → команда `wmctrl -xa rterm` (или `xdotool search --class rterm windowactivate`), клавиша `F11`.
+- **KDE / KWin**: System Settings → Shortcuts → Custom Shortcuts → New Global Shortcut → Command/URL → та же команда.
+- **Sway / Hyprland / i3**: добавь в конфиг WM строку вроде `bindsym F11 exec wmctrl -xa rterm` (или `hyprctl dispatch focuswindow class:rterm`).
+- **Windows**: PowerToys Keyboard Manager → ремап F11 на скрипт активации окна.
+
+WM-сторонний шорткат поднимает / фокусит окно, а уже внутри окна сам бинд `F11 → toggle_guake` срабатывает за reposition.
 
 ## `[colors]`
 

@@ -152,7 +152,10 @@ open_settings
 snap_window_left  snap_window_right
 snap_window_top   snap_window_bottom
 maximize_toggle   minimize_window    restore_window
+toggle_guake
 ```
+
+`toggle_guake` — Guake-style выкатывание окна (см. [config.md `[guake]`](config.md#guake)). No-op пока в конфиге не выставлено `[guake] enabled = true`.
 
 ### Прочее
 

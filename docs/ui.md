@@ -88,6 +88,10 @@ keys   = "Ctrl+Alt+Up"
 action = "maximize_toggle"
 ```
 
+## Guake-style drop-down
+
+Опциональный режим: окно по нажатию бинда «выкатывается» поверх остальных, занимая часть экрана. Конфигурируется в `[guake]`-секции (`enabled`, `position`, `height_pct`, `width_pct`). Подробности и пример для `F11` — в [config.md `[guake]`](config.md#guake).
+
 ## Bottom bar
 
 Узкая полоса внизу окна, видимая только в двух случаях:
