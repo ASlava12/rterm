@@ -1083,12 +1083,20 @@ impl TextLayer {
         self.line_height = line_height;
         self.cell_width = cell_width;
         let metrics = Metrics::new(font_size, line_height);
-        self.header_buffer.set_metrics(&mut self.font_system, metrics);
-        self.header_buffer
-            .set_monospace_width(&mut self.font_system, Some(cell_width));
-        self.overlay_buffer.set_metrics(&mut self.font_system, metrics);
-        self.overlay_buffer
-            .set_monospace_width(&mut self.font_system, Some(cell_width));
+        // Resync every persistent buffer the layer owns. Missing one
+        // here means its glyphs render at the OLD font size while the
+        // rect anchored to `cell_width` already moved — produced the
+        // "controls drift / icons cut off when font size grows" bug.
+        for b in [
+            &mut self.header_buffer,
+            &mut self.header_right_buffer,
+            &mut self.title_bar_buffer,
+            &mut self.status_bar_buffer,
+            &mut self.overlay_buffer,
+        ] {
+            b.set_metrics(&mut self.font_system, metrics);
+            b.set_monospace_width(&mut self.font_system, Some(cell_width));
+        }
         for b in &mut self.buffers {
             b.set_metrics(&mut self.font_system, metrics);
             b.set_monospace_width(&mut self.font_system, Some(cell_width));
