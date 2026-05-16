@@ -4032,14 +4032,16 @@ impl App {
                 ]);
             }
         }
-        // Decide visible window. `HELP_VISIBLE_LINES` rows fit
-        // comfortably in the centered overlay rect; the user can
-        // scroll with ↑/↓/PgUp/PgDn/Home/End.
+        // Decide visible window. Capacity is derived from the actual
+        // overlay rect height (see `help_visible_lines`) so a
+        // maximized window shows the full help in one viewport
+        // instead of clipping at a hardcoded line count.
+        let visible = self.help_visible_lines();
         let total = lines.len();
-        let max_off = total.saturating_sub(HELP_VISIBLE_LINES);
+        let max_off = total.saturating_sub(visible);
         let scroll = self.help_scroll.min(max_off);
         let start = scroll;
-        let end = (start + HELP_VISIBLE_LINES).min(total);
+        let end = (start + visible).min(total);
         let mut spans: Vec<(usize, [u8; 3], bool)> = Vec::new();
         // Top "↑ N more" hint when content extends above the viewport.
         if start > 0 {
@@ -4070,6 +4072,39 @@ impl App {
             .into_iter()
             .map(|(idx, color, bold)| (storage[idx].as_str(), color, bold))
             .collect()
+    }
+
+    /// How many lines fit in the current overlay rect, minus the
+    /// caller's `reserved` rows (used for header/footer chrome like
+    /// "↑ N more" hints, the palette query line, etc.). Returns
+    /// `fallback` when the rect or font metrics aren't available yet
+    /// (e.g. before the first frame).
+    fn overlay_visible_lines(&self, reserved: usize, fallback: usize) -> usize {
+        let Some(rect) = self.help_rect() else { return fallback };
+        let Some(state) = self.state.as_ref() else { return fallback };
+        let line_h = state.text.line_height();
+        if line_h <= 0.0 {
+            return fallback;
+        }
+        // `reserved + 1` keeps the last row from sitting flush against
+        // the panel border.
+        let extra = reserved as f32 + 1.0;
+        ((rect.height / line_h - extra).max(1.0) as usize).max(1)
+    }
+
+    /// How many help-overlay lines fit in the current overlay rect.
+    /// Reserves two rows for the "↑ N more" / "↓ N more" hints; the
+    /// fallback constant kicks in only when the rect isn't computable.
+    fn help_visible_lines(&self) -> usize {
+        self.overlay_visible_lines(2, HELP_VISIBLE_LINES)
+    }
+
+    /// How many palette items fit in the current overlay rect. The
+    /// query line, the (N matches) counter, the blank spacer between
+    /// them and the result list, and the optional "↑/↓ N more" hints
+    /// together occupy ~4 rows that the result list cannot use.
+    fn palette_visible_rows(&self) -> usize {
+        self.overlay_visible_lines(4, PALETTE_VISIBLE_ROWS)
     }
 
     fn help_rect(&self) -> Option<PaneRect> {
@@ -7598,6 +7633,10 @@ impl App {
     }
 
     fn palette_step(&mut self, delta: isize) {
+        // Compute the rect-driven page size once with the immutable
+        // borrow; THEN take the mutable borrow on `palette` to apply
+        // it. Can't interleave the two borrows.
+        let visible = self.palette_visible_rows().max(1);
         if let Some(p) = self.palette.as_mut() {
             if p.filtered.is_empty() {
                 return;
@@ -7605,12 +7644,12 @@ impl App {
             let n = p.filtered.len() as isize;
             p.selected = (((p.selected as isize + delta) % n + n) % n) as usize;
             // Pull the viewport along so `selected` is always within
-            // `scroll_offset..scroll_offset + PALETTE_VISIBLE_ROWS`.
-            let max_off = p.filtered.len().saturating_sub(PALETTE_VISIBLE_ROWS);
+            // `scroll_offset..scroll_offset + visible`.
+            let max_off = p.filtered.len().saturating_sub(visible);
             if p.selected < p.scroll_offset {
                 p.scroll_offset = p.selected;
-            } else if p.selected >= p.scroll_offset + PALETTE_VISIBLE_ROWS {
-                p.scroll_offset = p.selected + 1 - PALETTE_VISIBLE_ROWS;
+            } else if p.selected >= p.scroll_offset + visible {
+                p.scroll_offset = p.selected + 1 - visible;
             }
             p.scroll_offset = p.scroll_offset.min(max_off);
         }
@@ -8712,18 +8751,16 @@ impl App {
                     return false;
                 }
                 Key::Named(NamedKey::PageDown) => {
-                    self.help_scroll = self
-                        .help_scroll
-                        .saturating_add(HELP_VISIBLE_LINES);
+                    let page = self.help_visible_lines();
+                    self.help_scroll = self.help_scroll.saturating_add(page);
                     if let Some(state) = self.state.as_ref() {
                         state.window.request_redraw();
                     }
                     return false;
                 }
                 Key::Named(NamedKey::PageUp) => {
-                    self.help_scroll = self
-                        .help_scroll
-                        .saturating_sub(HELP_VISIBLE_LINES);
+                    let page = self.help_visible_lines();
+                    self.help_scroll = self.help_scroll.saturating_sub(page);
                     if let Some(state) = self.state.as_ref() {
                         state.window.request_redraw();
                     }
@@ -8845,11 +8882,13 @@ impl App {
                     return false;
                 }
                 NamedKey::PageDown => {
-                    self.palette_step(PALETTE_VISIBLE_ROWS as isize);
+                    let page = self.palette_visible_rows().max(1) as isize;
+                    self.palette_step(page);
                     return false;
                 }
                 NamedKey::PageUp => {
-                    self.palette_step(-(PALETTE_VISIBLE_ROWS as isize));
+                    let page = self.palette_visible_rows().max(1) as isize;
+                    self.palette_step(-page);
                     return false;
                 }
                 NamedKey::Home => {
@@ -8860,13 +8899,11 @@ impl App {
                     return false;
                 }
                 NamedKey::End => {
+                    let visible = self.palette_visible_rows();
                     if let Some(p) = self.palette.as_mut() {
                         if !p.filtered.is_empty() {
                             p.selected = p.filtered.len() - 1;
-                            p.scroll_offset = p
-                                .filtered
-                                .len()
-                                .saturating_sub(PALETTE_VISIBLE_ROWS);
+                            p.scroll_offset = p.filtered.len().saturating_sub(visible);
                         }
                     }
                     return false;
@@ -8923,8 +8960,9 @@ impl App {
             spans.push((storage.len() - 1, muted, false));
         } else {
             let total = p.filtered.len();
+            let visible = self.palette_visible_rows();
             let start = p.scroll_offset.min(total);
-            let end = (start + PALETTE_VISIBLE_ROWS).min(total);
+            let end = (start + visible).min(total);
             // "↑ N more" hint when there are items above the viewport.
             if start > 0 {
                 storage.push(format!("    ↑ {} more\n", start));
