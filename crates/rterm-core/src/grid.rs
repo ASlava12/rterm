@@ -121,6 +121,20 @@ impl Grid {
         Some(&self.cells[start..start + cols])
     }
 
+    /// Mutable row slice. None if out of bounds.
+    ///
+    /// Lets callers shift / blank a whole row in-place via slice ops
+    /// (`copy_within`, `fill`) instead of allocating an intermediate
+    /// `Vec` and writing back cell-by-cell through `cell_mut`.
+    pub fn row_mut(&mut self, row: u16) -> Option<&mut [Cell]> {
+        if row >= self.size.rows {
+            return None;
+        }
+        let cols = self.size.cols as usize;
+        let start = row as usize * cols;
+        Some(&mut self.cells[start..start + cols])
+    }
+
     /// Scroll the contents in `[top, bottom]` (inclusive) up by `n` rows.
     /// Vacated rows at the bottom are blanked with `blank`. Returns the rows
     /// that fell off the top, in scroll order (oldest first); callers can push
@@ -232,6 +246,26 @@ mod tests {
                 assert_eq!(g.cell(Position { col: c, row: r }).unwrap().ch, ' ');
             }
         }
+    }
+
+    #[test]
+    fn row_mut_writes_visible_through_row() {
+        let mut g = Grid::new(Size { cols: 3, rows: 2 });
+        // Write via row_mut, read back via row.
+        {
+            let r = g.row_mut(1).unwrap();
+            assert_eq!(r.len(), 3);
+            r[0].ch = 'x';
+            r[2].ch = 'z';
+        }
+        let r = g.row(1).unwrap();
+        assert_eq!(r[0].ch, 'x');
+        assert_eq!(r[1].ch, ' ');
+        assert_eq!(r[2].ch, 'z');
+        // Untouched row stays default.
+        assert_eq!(g.row(0).unwrap()[0].ch, ' ');
+        // Out-of-bounds row returns None.
+        assert!(g.row_mut(2).is_none());
     }
 
     #[test]

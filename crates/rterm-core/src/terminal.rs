@@ -1047,22 +1047,17 @@ impl<'a> TerminalPerform<'a> {
         let blank = self.blank_cell();
         let g = self.grid_mut();
         for row in top..=bottom {
-            let row_cells = match g.row(row) {
-                Some(r) => r.to_vec(),
-                None => continue,
-            };
-            let mut new_row = vec![blank; cols];
+            let Some(row_slice) = g.row_mut(row) else { continue };
+            // In-place shift via `copy_within` (handles overlap) + blank
+            // the vacated side. No per-row Vec allocation.
             if delta > 0 {
                 let d = (delta as usize).min(cols);
-                new_row[d..cols].copy_from_slice(&row_cells[..cols - d]);
+                row_slice.copy_within(0..cols - d, d);
+                row_slice[..d].fill(blank);
             } else {
                 let d = ((-delta) as usize).min(cols);
-                new_row[..cols - d].copy_from_slice(&row_cells[d..cols]);
-            }
-            for (i, c) in new_row.into_iter().enumerate() {
-                if let Some(slot) = g.cell_mut(Position { col: i as u16, row }) {
-                    *slot = c;
-                }
+                row_slice.copy_within(d..cols, 0);
+                row_slice[cols - d..].fill(blank);
             }
         }
     }
