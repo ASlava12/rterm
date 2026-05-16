@@ -11957,9 +11957,15 @@ impl ApplicationHandler for App {
                 let before_panes_quads: Vec<bg::BgQuad> = {
                     let mut v = self.tab_bar_quads();
                     v.extend(self.pane_split_quads());
-                    v.extend(self.status_bar_quads());
                     v
                 };
+                // Bottom bar quads go in the AFTER-panes pass so they
+                // visually mask the last terminal row when the scrollback
+                // indicator is "floating" (i.e. does not reserve pane
+                // space). Painting them BEFORE pane glyphs let pane text
+                // bleed through the bar background and made the indicator
+                // overlap whatever was on the last visible row.
+                let status_bar_quads = self.status_bar_quads();
                 // Resize-marker quads share the same "compute before
                 // mut-borrowing state" requirement. Stored separately
                 // so the after-panes assembly inside the state borrow
@@ -12054,6 +12060,11 @@ impl ApplicationHandler for App {
                     // shadow expanded by a few pixels, then the panel
                     // body on top of it.
                     let mut after_panes_quads: Vec<bg::BgQuad> = Vec::new();
+                    // Bottom bar fill + separator — drawn AFTER pane
+                    // glyphs so the bar masks any last-row content that
+                    // would otherwise leak through. The bar text itself
+                    // sits in `main_areas` and renders on top of this.
+                    after_panes_quads.extend(status_bar_quads);
                     // Resize-marker strip / corner-L the cursor is over
                     // — drawn on top of pane content so the affordance
                     // is visible.
