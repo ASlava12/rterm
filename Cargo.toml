@@ -1,0 +1,76 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rterm-core",
+    "crates/rterm-pty",
+    "crates/rterm-config",
+    "crates/rterm-plugin",
+    "crates/rterm-render",
+    "crates/rterm-app",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+authors = ["rterm contributors"]
+repository = "https://github.com/example/rterm"
+
+[workspace.dependencies]
+# Internal crates
+rterm-core = { path = "crates/rterm-core" }
+rterm-pty = { path = "crates/rterm-pty" }
+rterm-config = { path = "crates/rterm-config" }
+rterm-plugin = { path = "crates/rterm-plugin" }
+rterm-render = { path = "crates/rterm-render" }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Async
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "time"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Lua plugins
+mlua = { version = "0.10", features = ["lua54", "vendored", "send", "async"] }
+
+# Terminal emulation
+vte = "0.13"
+portable-pty = "0.8"
+bitflags = "2.6"
+
+# Unicode / text
+unicode-width = "0.2"
+
+# Rendering
+wgpu = "23"
+winit = "0.30"
+cosmic-text = "0.12"
+glyphon = "0.7"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+arboard = "3"
+open = "5"
+base64 = "0.22"
+regex = "1"
+
+[profile.dev]
+opt-level = 1            # Лучше отзывчивость TUI/PTY в dev-сборке
+debug = true
+
+[profile.dev.package."*"]
+opt-level = 3            # Зависимости (wgpu, cosmic-text) собираем оптимизированно
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

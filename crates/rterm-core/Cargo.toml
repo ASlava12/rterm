@@ -1,0 +1,15 @@
+[package]
+name = "rterm-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Terminal grid, cell model, and ANSI/VT processing for rterm"
+
+[dependencies]
+vte = { workspace = true }
+bitflags = { workspace = true }
+unicode-width = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

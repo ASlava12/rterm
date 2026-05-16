@@ -1,0 +1,133 @@
+# rterm configuration — generated on first run. Edit freely. Reloaded with
+# init.lua on file change.
+
+[font]
+# Pick a family installed on your system, e.g. "JetBrains Mono",
+# "Fira Code", "MesloLGS NF". Empty = system monospace default.
+family = ""
+size = 13.0
+# When true (xterm default), SGR `bold` also remaps the 8 base ANSI colours
+# to their bright variants. Set false for themes that already use bold
+# explicitly for emphasis without colour changes.
+bold_is_bright = true
+
+[window]
+width = 1024
+height = 640
+# 1.0 = opaque. Lower values require a compositor that honours window
+# transparency (Wayland / macOS / DWM-enabled Windows).
+opacity = 1.0
+
+[shell]
+# Leave program = "" to inherit $SHELL (Unix) / powershell.exe (Windows).
+# program = "/bin/zsh"
+# args = ["-l"]
+# Extra environment variables for every spawned shell. Applied after the
+# built-in TERM / COLORTERM / TERM_PROGRAM defaults so user entries win
+# on key collision. Parent env stays intact — this is additive.
+# [shell.env]
+# RUST_BACKTRACE = "1"
+# LANG = "en_US.UTF-8"
+
+[terminal]
+# Scrollback retention per pane. Set to 0 to disable scrollback entirely.
+scrollback = 10000
+# Dump the focused pane's scrollback automatically when the window closes
+# (same path / format as the `save_scrollback` action).
+save_scrollback_on_exit = false
+# Persist the list of tabs (one focused-pane cwd per tab) on exit and
+# restore it on next startup. Splits are not preserved — each saved tab
+# restores as a single pane in the recorded cwd.
+restore_session = false
+# Snap the view back to live on any new output (tail-like). Default keeps
+# the user anchored to the line they were reading.
+scroll_on_output = false
+# Master cursor-blink toggle. Set to false for a steady cursor regardless
+# of what the shell requests via DECSCUSR.
+cursor_blink = true
+# Draw the slim right-edge scrollbar when scrollback exists. Set to false
+# to hide it entirely.
+show_scrollbar = true
+# Milliseconds a tab must be idle (after producing output) before the
+# edge-triggered `tab.silence` plugin event fires. Set to 0 to disable
+# the event entirely.
+tab_silence_ms = 5000
+# Visual flash on BEL (or `rterm.bell()`). Set to false if you find the
+# screen-flash distracting; the `bell` plugin event still fires.
+bell_visual = true
+# Ping the window manager (taskbar urgency / dock badge) on BEL when the
+# rterm window is unfocused. Useful for "ping me when this build
+# finishes" workflows; set to false on desktops where the ping is noisy.
+bell_urgent = true
+# Milliseconds a shell command (between OSC 133;C and 133;D) must run
+# before the `pane.slow_command` plugin event fires and (when unfocused)
+# the window pings the taskbar. Pair with shell integration to get a
+# "long task finished" notification. Set to 0 to disable entirely.
+slow_command_ms = 10000
+
+# Terminal palette. All entries are optional [r, g, b] byte triples; any
+# missing field falls back to the built-in xterm-ish defaults.
+[colors]
+# fg      = [220, 220, 220]
+# bg      = [10, 12, 18]
+# cursor  = [255, 204, 102]   # uncomment to pin the cursor colour
+
+# black   = [0, 0, 0]
+# red     = [205, 49, 49]
+# green   = [13, 188, 121]
+# yellow  = [229, 229, 16]
+# blue    = [36, 114, 200]
+# magenta = [188, 63, 188]
+# cyan    = [17, 168, 205]
+# white   = [229, 229, 229]
+# bright_black   = [102, 102, 102]
+# bright_red     = [241, 76, 76]
+# bright_green   = [35, 209, 139]
+# bright_yellow  = [245, 245, 67]
+# bright_blue    = [59, 142, 234]
+# bright_magenta = [214, 112, 214]
+# bright_cyan    = [41, 184, 219]
+# bright_white   = [255, 255, 255]
+
+# Custom keybindings (override built-ins; see `Ctrl+Shift+H` in-app for the
+# full default list). Each entry: keys + action.
+#
+# Recognised modifiers: Ctrl (or Control), Shift, Alt (or Option),
+#                       Super (or Cmd, Meta, Win).
+# Named keys: Enter (Return), Escape (Esc), Tab, Space, Backspace,
+#             Delete (Del), Insert (Ins), Home, End, PageUp (PgUp),
+#             PageDown (PgDn), Up/Down/Left/Right (ArrowUp/Down/Left/Right),
+#             F1..F12.
+# Punctuation aliases (use in place of bare `+` or unprintable keys):
+#             Plus (+), Minus/Dash (-), Equal (=), Comma (,),
+#             Period/Dot (.), Slash (/), Backslash (\\), Semicolon (;),
+#             Colon (:), Apostrophe/Quote (').
+#
+# Actions (run `rterm --list-actions` for the live canonical list):
+#   new_tab, close_tab, next_tab, prev_tab, move_tab_left, move_tab_right,
+#   split_horizontal, split_vertical, split_auto, close_pane,
+#   goto_first_tab, goto_last_tab,
+#   focus_next_pane, focus_prev_pane, focus_first_pane, focus_last_pane,
+#   paste, copy, clear_selection, search,
+#   jump_prev_prompt, jump_next_prompt, jump_prev_command,
+#   jump_next_command, scroll_page_up, scroll_page_down,
+#   scroll_half_page_up, scroll_half_page_down,
+#   scroll_line_up, scroll_line_down, scroll_home,
+#   scroll_end, clear_scrollback, resize_pane_left, resize_pane_right,
+#   resize_pane_up, resize_pane_down,
+#   toggle_help, open_palette, save_scrollback, zoom_pane, balance_panes,
+#   quit, font_increase, font_decrease, font_reset, opacity_increase,
+#   opacity_decrease, opacity_reset, toggle_last_tab, copy_hovered_url,
+#   reset_pane, swap_pane_next, swap_pane_prev, toggle_bell_mute,
+#   open_hovered_url, cycle_theme, cycle_theme_prev, open_settings,
+#   rename_tab, snap_window_left, snap_window_right, snap_window_top,
+#   snap_window_bottom, maximize_toggle, minimize_window,
+#   restore_window.
+
+# [[keybindings]]
+# keys   = "Ctrl+T"
+# action = "new_tab"
+
+# [[keybindings]]
+# keys   = "F2"
+# action = "search"
