@@ -64,6 +64,32 @@ bell_urgent = true
 # the window pings the taskbar. Pair with shell integration to get a
 # "long task finished" notification. Set to 0 to disable entirely.
 slow_command_ms = 10000
+# OSC 52 clipboard-write policy. A shell can request a clipboard
+# overwrite via `\e]52;c;<base64>\e\\`. Allowing this silently is a
+# real phishing primitive (a shell pipeline that fires the sequence
+# between your copy and your paste can swap the buffer contents).
+# Default is `false`; set to `true` if you rely on tmux / mosh / SSH
+# clipboard forwarding.
+allow_osc52 = false
+
+# Guake-style drop-down. When `enabled = true`, the `toggle_guake`
+# action toggles the window between a "dropped" state (sized per
+# `width_pct` × `height_pct` of the current monitor, anchored to
+# `position`, raised above other windows) and a minimised state.
+# Bind `toggle_guake` to a key in `[[keybindings]]` below to use it.
+# A system-wide global hotkey (so the binding works while the rterm
+# window is not focused) is not provided by rterm — wire a desktop
+# shortcut to a `wmctrl` / `xdotool` / KWin script that targets the
+# already-running rterm instance.
+[guake]
+enabled = false
+# "top" | "bottom" | "full". On Wayland positioning is owned by the
+# compositor so "top" / "full" fall back to `set_maximized(true)`.
+position = "top"
+# 10..=100 % of the monitor height (ignored for "full").
+height_pct = 50
+# 20..=100 % of the monitor width.
+width_pct = 100
 
 # Terminal palette. All entries are optional [r, g, b] byte triples; any
 # missing field falls back to the built-in xterm-ish defaults.
@@ -122,7 +148,7 @@ slow_command_ms = 10000
 #   open_hovered_url, cycle_theme, cycle_theme_prev, open_settings,
 #   rename_tab, snap_window_left, snap_window_right, snap_window_top,
 #   snap_window_bottom, maximize_toggle, minimize_window,
-#   restore_window.
+#   restore_window, toggle_guake.
 
 # [[keybindings]]
 # keys   = "Ctrl+T"

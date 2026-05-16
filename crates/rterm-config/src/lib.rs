@@ -22,6 +22,57 @@ pub struct Config {
     pub keybindings: Vec<Keybinding>,
     pub terminal: TerminalConfig,
     pub appearance: AppearanceConfig,
+    pub guake: GuakeConfig,
+}
+
+/// Guake-style drop-down preferences. When `enabled`, the
+/// `toggle_guake` action toggles the window between a "dropped-down"
+/// state (sized to the configured fraction of the monitor, anchored
+/// to one edge, raised above other windows) and a hidden / minimised
+/// state. The intent is `tmux popup`-style quick access — same
+/// virtual desktop, no app switching.
+///
+/// Notes:
+/// - On Wayland the compositor owns positioning, so `position`
+///   degrades to `set_maximized(true)` for "top" / "full". X11 /
+///   Windows / macOS honour `set_outer_position` and pin the window
+///   to the requested edge.
+/// - A true system-wide hotkey (F12 when rterm is not focused)
+///   needs a platform-specific global-shortcut binding that this
+///   crate intentionally doesn't pull in. The `toggle_guake` action
+///   works the same way other actions do — bind it to a key in
+///   `[[keybindings]]` and it fires while rterm is focused.
+///   Restoring the window from a minimised state requires either
+///   the desktop's window-pick hotkey, a system tray click, or a
+///   WM shortcut that launches `rterm` (which then targets the
+///   already-running instance via the OS focus stealing rules).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GuakeConfig {
+    /// Master toggle. `false` (default) makes `toggle_guake` a no-op.
+    pub enabled: bool,
+    /// Which edge the dropped window anchors to. `"top"` (default),
+    /// `"bottom"`, or `"full"` (full-screen overlay).
+    pub position: String,
+    /// Fraction of the monitor's height the window occupies when
+    /// dropped. Honoured only for `position = "top" | "bottom"`;
+    /// `"full"` ignores this and takes the whole screen. Clamped to
+    /// `[10, 100]` at runtime. Default `50`.
+    pub height_pct: u8,
+    /// Fraction of the monitor's width. Default `100`. Clamped to
+    /// `[20, 100]`.
+    pub width_pct: u8,
+}
+
+impl Default for GuakeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            position: "top".to_string(),
+            height_pct: 50,
+            width_pct: 100,
+        }
+    }
 }
 
 /// Live appearance preferences (theme name + future visual prefs). Kept

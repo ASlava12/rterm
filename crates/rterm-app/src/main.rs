@@ -1488,6 +1488,16 @@ fn run_gui(
         on_theme_change,
         os_decorations: config.window.os_decorations,
         allow_osc52: config.terminal.allow_osc52,
+        guake: if config.guake.enabled {
+            Some(rterm_render::GuakeRunConfig {
+                enabled: true,
+                position: config.guake.position.clone(),
+                height_pct: config.guake.height_pct,
+                width_pct: config.guake.width_pct,
+            })
+        } else {
+            None
+        },
     })
 }
 

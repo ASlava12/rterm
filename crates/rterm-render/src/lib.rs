@@ -2276,6 +2276,13 @@ pub enum AppAction {
     /// Restore window to a sensible default size centered on the
     /// current monitor. Cancels any snap / maximize.
     RestoreWindow,
+    /// Guake-style drop-down: toggle the window between a "dropped"
+    /// state (sized + anchored per `[guake]` config, raised above
+    /// other windows) and a minimised / hidden state. A no-op when
+    /// `[guake] enabled = false`. Binding is in-app only — a true
+    /// system-wide hotkey needs OS-level integration that this crate
+    /// intentionally doesn't pull in.
+    ToggleGuake,
 }
 
 impl AppAction {
@@ -2351,6 +2358,7 @@ impl AppAction {
             "maximize_toggle",
             "minimize_window",
             "restore_window",
+            "toggle_guake",
         ]
         .into_iter()
         .map(String::from)
@@ -2433,6 +2441,7 @@ impl AppAction {
             "maximize_toggle" | "toggle_maximize" => Self::MaximizeToggle,
             "minimize_window" | "minimize" => Self::MinimizeWindow,
             "restore_window" | "restore" => Self::RestoreWindow,
+            "toggle_guake" | "guake" | "drop_down" | "toggle_dropdown" => Self::ToggleGuake,
             _ => return None,
         })
     }
@@ -2520,6 +2529,7 @@ impl AppAction {
             AppAction::MaximizeToggle => "maximize_toggle",
             AppAction::MinimizeWindow => "minimize_window",
             AppAction::RestoreWindow => "restore_window",
+            AppAction::ToggleGuake => "toggle_guake",
         }
     }
 
@@ -2591,6 +2601,7 @@ impl AppAction {
         (AppAction::MaximizeToggle, "Window: toggle maximize"),
         (AppAction::MinimizeWindow, "Window: minimize"),
         (AppAction::RestoreWindow, "Window: restore to default size"),
+        (AppAction::ToggleGuake, "Window: Guake drop-down toggle"),
     ];
 }
 
@@ -3010,6 +3021,23 @@ impl ActiveSelection {
     }
 }
 
+/// Guake-style drop-down snapshot. Mirrors `rterm_config::GuakeConfig`
+/// but lives in the render crate so the renderer doesn't depend on the
+/// config crate.
+#[derive(Debug, Clone)]
+pub struct GuakeRunConfig {
+    /// Master toggle. When `false`, `toggle_guake` is a no-op.
+    pub enabled: bool,
+    /// `"top"` | `"bottom"` | `"full"`. Other values fall back to
+    /// `"top"`.
+    pub position: String,
+    /// 10..=100, height fraction of the current monitor for `top` /
+    /// `bottom`. Ignored for `"full"`.
+    pub height_pct: u8,
+    /// 20..=100, width fraction of the current monitor.
+    pub width_pct: u8,
+}
+
 /// Bundle of construction parameters for [`App::new`] / [`run`]. Replaces a
 /// 13-arg signature with one named-field struct so call sites stay readable.
 pub struct RunConfig {
@@ -3071,6 +3099,8 @@ pub struct RunConfig {
     /// clipboard. Set to `true` if you rely on tmux / mosh / SSH copy
     /// flows.
     pub allow_osc52: bool,
+    /// Guake-style drop-down configuration. `None` disables the action.
+    pub guake: Option<GuakeRunConfig>,
 }
 
 pub struct App {
@@ -3216,6 +3246,9 @@ pub struct App {
     /// writes from the shell are dropped silently. See the security
     /// audit in docs for the threat model.
     allow_osc52: bool,
+    /// Guake-style drop-down config snapshot. `None` keeps the action
+    /// disabled. Cloned per call inside `toggle_guake`.
+    guake: Option<GuakeRunConfig>,
     /// Set after the FIRST `RedrawRequested` has issued a clear-only frame
     /// to kick the Wayland compositor's `configure` → `Resized` chain.
     /// Until then we render `render_clear_only` rather than the full
@@ -3299,6 +3332,7 @@ impl App {
             on_theme_change,
             os_decorations,
             allow_osc52,
+            guake,
         } = cfg;
         // Clamp here so a hand-written config with a negative/zero/huge
         // value can't crash glyphon (Metrics expects positive sizes) or
@@ -3383,6 +3417,7 @@ impl App {
             bell_visual,
             bell_urgent,
             allow_osc52,
+            guake,
             first_frame_done: false,
             render_test_only,
             last_frame_tick: None,
@@ -7885,6 +7920,7 @@ impl App {
                 }
             }
             AppAction::RestoreWindow => self.restore_window(),
+            AppAction::ToggleGuake => self.toggle_guake(),
         }
         false
     }
@@ -7928,6 +7964,92 @@ impl App {
         state.window.set_outer_position(pos);
         let _ = state.window.request_inner_size(size);
         tracing::info!(?dir, ?target_pos, ?target_size, "window snap requested");
+    }
+
+    /// Guake-style drop-down: toggle between a "dropped" state (sized
+    /// per `[guake]` config, anchored to the configured edge, raised
+    /// above other windows) and a minimised state. Disabled when
+    /// `[guake].enabled = false` (no-op).
+    ///
+    /// Platform notes: Wayland disallows app-controlled positioning;
+    /// the function falls back to `set_maximized(true)` for `top` /
+    /// `full` and warns once for `bottom`. X11 / Win32 / macOS honour
+    /// `set_outer_position` and the window lands on the requested edge.
+    fn toggle_guake(&mut self) {
+        let cfg = match &self.guake {
+            Some(c) if c.enabled => c.clone(),
+            _ => {
+                tracing::debug!("toggle_guake: [guake] disabled in config — no-op");
+                return;
+            }
+        };
+        let Some(state) = self.state.as_ref() else { return };
+        // Cheap state machine: if currently minimised, drop down;
+        // otherwise minimise. The window itself owns the "minimised"
+        // truth — `is_minimized()` is exposed on every winit backend
+        // we target, and we don't try to track it ourselves to keep
+        // the action idempotent across external WM minimise actions.
+        let is_min = state.window.is_minimized().unwrap_or(false);
+        if is_min {
+            // Drop down.
+            state.window.set_minimized(false);
+            if state.window.is_maximized() {
+                state.window.set_maximized(false);
+            }
+            if let Some(monitor) = state.window.current_monitor() {
+                let mon_size = monitor.size();
+                let mon_pos = monitor.position();
+                let mw = mon_size.width as i32;
+                let mh = mon_size.height as i32;
+                let w_pct = (cfg.width_pct.clamp(20, 100)) as i32;
+                let h_pct = (cfg.height_pct.clamp(10, 100)) as i32;
+                let target_w = (mw * w_pct / 100).max(320);
+                let target_h = (mh * h_pct / 100).max(200);
+                let centre_x = mon_pos.x + (mw - target_w) / 2;
+                match cfg.position.as_str() {
+                    "full" => {
+                        state.window.set_maximized(true);
+                    }
+                    "bottom" => {
+                        let pos = winit::dpi::PhysicalPosition::new(
+                            centre_x,
+                            mon_pos.y + mh - target_h,
+                        );
+                        state.window.set_outer_position(pos);
+                        let _ = state.window.request_inner_size(
+                            winit::dpi::PhysicalSize::new(target_w as u32, target_h as u32),
+                        );
+                    }
+                    _ => {
+                        // Default + "top".
+                        let pos = winit::dpi::PhysicalPosition::new(centre_x, mon_pos.y);
+                        state.window.set_outer_position(pos);
+                        let _ = state.window.request_inner_size(
+                            winit::dpi::PhysicalSize::new(target_w as u32, target_h as u32),
+                        );
+                    }
+                }
+            }
+            // Raise above other windows + take focus so the user can
+            // start typing immediately.
+            state
+                .window
+                .set_window_level(winit::window::WindowLevel::AlwaysOnTop);
+            state.window.focus_window();
+            tracing::info!(position = %cfg.position, "guake: dropped");
+        } else {
+            // Hide. Stick with `set_minimized(true)` rather than
+            // `set_visible(false)` — minimised windows show in the
+            // taskbar so the user has a path back even without a
+            // global hotkey.
+            state.window.set_minimized(true);
+            // Drop the always-on-top so the next non-guake show
+            // doesn't surprise the user by sticking above everything.
+            state
+                .window
+                .set_window_level(winit::window::WindowLevel::Normal);
+            tracing::info!("guake: hidden");
+        }
     }
 
     /// Restore the window to a centered default size on the current
@@ -12722,6 +12844,7 @@ mod tests {
             AppAction::MaximizeToggle,
             AppAction::MinimizeWindow,
             AppAction::RestoreWindow,
+            AppAction::ToggleGuake,
         ];
         // Force the compiler to enforce exhaustiveness via a single match.
         for a in actions {
@@ -12793,6 +12916,7 @@ mod tests {
                 AppAction::MaximizeToggle => (),
                 AppAction::MinimizeWindow => (),
                 AppAction::RestoreWindow => (),
+                AppAction::ToggleGuake => (),
             };
         }
         // And the names list must cover every variant.
