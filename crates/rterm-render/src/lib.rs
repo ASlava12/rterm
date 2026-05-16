@@ -12325,6 +12325,13 @@ pub fn run(cfg: RunConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serialise env-mutating tests across threads. `cargo test` is
+    /// parallel by default; two tests racing on `HOME` (or any other
+    /// process-wide variable) can observe each other's values and
+    /// produce flaky failures.
+    static ENV_GUARD: Mutex<()> = Mutex::new(());
 
     fn pt(row: u16, col: u16) -> SelectionPoint {
         SelectionPoint { row, col }
@@ -12354,12 +12361,10 @@ mod tests {
 
     #[test]
     fn abbreviate_home_replaces_prefix() {
-        // SAFETY: env::set_var is safe in single-threaded test code; we
-        // restore the prior value via a guard so other tests aren't
-        // affected.
+        let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var_os("HOME");
-        // SAFETY of `set_var`: see std docs — fine in test threads that
-        // don't read env concurrently. Rust 1.65 marked it as `unsafe`.
+        // SAFETY of `set_var`: env mutation serialised by ENV_GUARD so
+        // no other test thread is reading HOME concurrently.
         unsafe { std::env::set_var("HOME", "/home/u"); }
         assert_eq!(abbreviate_home("/home/u"), "~");
         assert_eq!(abbreviate_home("/home/u/projects/x"), "~/projects/x");

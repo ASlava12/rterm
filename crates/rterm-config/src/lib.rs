@@ -284,6 +284,14 @@ fn nonempty_env(name: &str) -> Option<std::ffi::OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serialise tests that mutate process-wide environment variables.
+    /// `cargo test` runs tests in parallel by default; without this
+    /// guard two tests calling `set_var("RTERM_CONFIG_PATH", ...)` on
+    /// different threads can interleave and observe each other's
+    /// values. Acquire it at the top of any test that touches env.
+    static ENV_GUARD: Mutex<()> = Mutex::new(());
 
     #[test]
     fn empty_toml_yields_defaults() {
@@ -301,11 +309,9 @@ mod tests {
 
     #[test]
     fn nonempty_env_treats_blank_as_unset() {
-        // The serial guard isn't worth dragging in — pick env var names
-        // that are unlikely to be set in any CI environment, set them
-        // briefly, observe, unset.
+        let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let key = "RTERM_TEST_NONEMPTY_PROBE";
-        // SAFETY: tests run single-threaded by default here; this key is
+        // SAFETY: env mutation serialised by ENV_GUARD; this key is
         // ours, no race with other code.
         unsafe { std::env::set_var(key, "") };
         assert!(nonempty_env(key).is_none(), "empty string must look unset");
@@ -369,9 +375,9 @@ mod tests {
 
     #[test]
     fn rterm_config_path_env_overrides_default_lookup() {
-        // SAFETY: env mutation in single-threaded test code; restore via
-        // guard so other tests aren't affected. Same pattern as
-        // `abbreviate_home_replaces_prefix` over in rterm-render.
+        let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: env mutation serialised by ENV_GUARD; restore via
+        // guard so other tests aren't affected.
         let saved = std::env::var_os("RTERM_CONFIG_PATH");
         unsafe { std::env::set_var("RTERM_CONFIG_PATH", "/etc/rterm-special.toml"); }
         let path = Config::default_path().expect("override yields a path");
@@ -393,6 +399,7 @@ mod tests {
 
     #[test]
     fn default_path_returns_sensible_location() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         // Whatever the host env: if either XDG_CONFIG_HOME, HOME, or
         // APPDATA is set (true on every supported platform / CI), the
         // path must end in `rterm/config.toml` so the watcher and the
