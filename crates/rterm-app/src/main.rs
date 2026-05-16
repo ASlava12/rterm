@@ -1857,15 +1857,18 @@ fn closest_font_match(want: &str, installed: &[String]) -> Option<String> {
     if want_l.is_empty() {
         return None;
     }
-    let mut hits: Vec<&String> = installed
+    // Pre-lowercase each installed name ONCE so the per-pair check
+    // does substring-find on cached strings instead of re-lowering
+    // the same name for every haystack pass. The list is short
+    // (~tens to low hundreds), allocation is fine and one-shot.
+    let installed_l: Vec<(usize, String)> =
+        installed.iter().map(|f| (f.len(), f.to_lowercase())).collect();
+    installed
         .iter()
-        .filter(|f| {
-            let fl = f.to_lowercase();
-            fl.contains(&want_l) || want_l.contains(&fl)
-        })
-        .collect();
-    hits.sort_by_key(|f| f.len());
-    hits.first().map(|s| s.to_string())
+        .zip(installed_l.iter())
+        .filter(|(_, (_, fl))| fl.contains(&want_l) || want_l.contains(fl))
+        .min_by_key(|(_, (len, _))| *len)
+        .map(|(orig, _)| orig.clone())
 }
 
 /// Return human-readable warnings for any `Config` values that fall
