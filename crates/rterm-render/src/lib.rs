@@ -1560,12 +1560,23 @@ impl GpuState {
             adapter = %info.name,
             "GPU adapter selected; requesting device",
         );
+        // Take the adapter's full limits rather than `downlevel_defaults`.
+        // The downlevel preset caps `max_texture_dimension_2d` at 2048,
+        // which immediately fails `Surface::configure` when the user
+        // maximises / fullscreens on any modern monitor (a 2560×1440
+        // surface won't fit a 2048×2048 texture limit). Using the
+        // adapter's own limits lets us track real hardware capability
+        // (typically 8192–16384 on dGPU and 4096+ on iGPU); the surface
+        // size is also clamped to those limits below, so a downlevel-
+        // only adapter still gets a working — if letterboxed — surface
+        // instead of a crash.
+        let adapter_limits = adapter.limits();
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("rterm-device"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::downlevel_defaults(),
+                    required_limits: adapter_limits.clone(),
                     memory_hints: wgpu::MemoryHints::Performance,
                 },
                 None,
@@ -1633,17 +1644,31 @@ impl GpuState {
             caps.present_modes.first().copied().unwrap_or(wgpu::PresentMode::Fifo)
         };
         tracing::info!(?present_mode, "selected present mode");
+        // Clamp the requested surface size to the adapter's
+        // max_texture_dimension_2d. Some GPUs (and especially
+        // virtualised Wayland/llvmpipe setups) advertise only 2048,
+        // which means a 2560×1440 fullscreen surface would fail
+        // validation. The clamp keeps configure() valid; the small
+        // letterbox on hyper-conservative hardware is far better than
+        // a crash.
+        let max_dim = device.limits().max_texture_dimension_2d.max(1);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
-            width: size.width.max(1),
-            height: size.height.max(1),
+            width: size.width.clamp(1, max_dim),
+            height: size.height.clamp(1, max_dim),
             present_mode,
             alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
-        tracing::info!(format = ?format, "configuring surface");
+        tracing::info!(
+            format = ?format,
+            requested = ?(size.width, size.height),
+            configured = ?(config.width, config.height),
+            max_dim,
+            "configuring surface",
+        );
         surface.configure(&device, &config);
         tracing::info!("building text layer");
         let mut text = TextLayer::new(&device, &queue, format, font_size, font_family);
@@ -1683,11 +1708,27 @@ impl GpuState {
         if w == 0 || h == 0 {
             return;
         }
-        self.config.width = w;
-        self.config.height = h;
+        // Same clamp as the initial configure(): keep the surface size
+        // within the adapter's max_texture_dimension_2d, otherwise
+        // wgpu's validator rejects fullscreen / maximise transitions on
+        // downlevel adapters with a hard crash (observed on Wayland +
+        // GNOME with mesa-software / llvmpipe-style 2048 limits).
+        let max_dim = self.device.limits().max_texture_dimension_2d.max(1);
+        let cw = w.min(max_dim);
+        let ch = h.min(max_dim);
+        if cw != w || ch != h {
+            tracing::warn!(
+                requested = ?(w, h),
+                configured = ?(cw, ch),
+                max_dim,
+                "resize clamped to adapter max texture dimension",
+            );
+        }
+        self.config.width = cw;
+        self.config.height = ch;
         self.surface.configure(&self.device, &self.config);
-        self.text.resize(&self.queue, w, h);
-        self.bg.resize(w, h);
+        self.text.resize(&self.queue, cw, ch);
+        self.bg.resize(cw, ch);
     }
 
     pub fn window(&self) -> &Arc<Window> {
