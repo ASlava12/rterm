@@ -244,23 +244,32 @@ impl Config {
     /// lets a user pin a specific file (multi-profile setups, CI runs,
     /// sandboxes) without having to pass `--config` to every invocation.
     pub fn default_path() -> Option<PathBuf> {
-        if let Some(override_path) = std::env::var_os("RTERM_CONFIG_PATH") {
-            if !override_path.is_empty() {
-                return Some(PathBuf::from(override_path));
-            }
+        if let Some(p) = nonempty_env("RTERM_CONFIG_PATH") {
+            return Some(PathBuf::from(p));
         }
-        let base = std::env::var_os("XDG_CONFIG_HOME")
+        let base = nonempty_env("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .or_else(|| {
-                std::env::var_os("HOME").map(|h| {
+                nonempty_env("HOME").map(|h| {
                     let mut p = PathBuf::from(h);
                     p.push(".config");
                     p
                 })
             })
-            .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))?;
+            .or_else(|| nonempty_env("APPDATA").map(PathBuf::from))?;
         Some(base.join("rterm").join("config.toml"))
     }
+}
+
+/// Read an environment variable and return it only when set AND non-empty.
+/// XDG and POSIX both treat empty values as "unset" for path-prefix vars
+/// (e.g. `XDG_CONFIG_HOME=` should mean "use the default", not "use the
+/// current working directory") — `std::env::var_os` returns `Some("")`
+/// in that case, which would otherwise become `PathBuf::from("")` and
+/// produce a relative path like `rterm/config.toml`.
+fn nonempty_env(name: &str) -> Option<std::ffi::OsString> {
+    let v = std::env::var_os(name)?;
+    if v.is_empty() { None } else { Some(v) }
 }
 
 #[cfg(test)]
@@ -279,6 +288,22 @@ mod tests {
         // names not in `list_monospace_families()`, so the wrong
         // default would flag every config-less user.
         assert_eq!(cfg.font.family, "");
+    }
+
+    #[test]
+    fn nonempty_env_treats_blank_as_unset() {
+        // The serial guard isn't worth dragging in — pick env var names
+        // that are unlikely to be set in any CI environment, set them
+        // briefly, observe, unset.
+        let key = "RTERM_TEST_NONEMPTY_PROBE";
+        // SAFETY: tests run single-threaded by default here; this key is
+        // ours, no race with other code.
+        unsafe { std::env::set_var(key, "") };
+        assert!(nonempty_env(key).is_none(), "empty string must look unset");
+        unsafe { std::env::set_var(key, "x") };
+        assert_eq!(nonempty_env(key).map(|s| s.into_string().unwrap()), Some("x".into()));
+        unsafe { std::env::remove_var(key) };
+        assert!(nonempty_env(key).is_none(), "absent must look unset");
     }
 
     #[test]
