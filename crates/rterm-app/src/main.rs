@@ -1612,7 +1612,22 @@ fn spawn_reader_thread(
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let mut t = terminal.lock().expect("terminal mutex poisoned");
+                    // If the renderer thread panicked while holding the
+                    // terminal mutex, the lock is poisoned. Earlier this
+                    // hard-crashed the reader; instead, log + exit the
+                    // thread cleanly so the panel can be reaped via the
+                    // usual `alive = false` path. Matches the renderer's
+                    // own `lock().ok()` discipline on the other side of
+                    // the same mutex.
+                    let mut t = match terminal.lock() {
+                        Ok(g) => g,
+                        Err(e) => {
+                            tracing::warn!(
+                                "pty reader exiting: terminal mutex poisoned: {e}"
+                            );
+                            break;
+                        }
+                    };
                     t.advance(&buf[..n]);
                     activity.store(true, Ordering::Relaxed);
                     last_output_ms.store(now_ms(), Ordering::Relaxed);
