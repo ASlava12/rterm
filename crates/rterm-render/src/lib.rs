@@ -7125,6 +7125,18 @@ impl App {
                         .or_else(|| t.detect_url_at(offset, p.row, p.col))
                 });
                 if let Some(url) = url {
+                    // Scheme whitelist: OSC 8 lets a shell embed an
+                    // arbitrary URI under any visible text, including
+                    // `javascript:`, `data:`, `file:///...`. Run every
+                    // URL — auto-detected OR OSC 8 — through the same
+                    // safety filter before invoking xdg-open / start /
+                    // open. Detection already filtered; the OSC 8 path
+                    // previously did not.
+                    if !rterm_core::is_safe_url(&url) {
+                        tracing::warn!(url = %url, "blocked URL with disallowed scheme");
+                        self.events.emit("link.blocked", &url);
+                        return false;
+                    }
                     // `that_detached` so a slow-launching browser doesn't
                     // block the UI thread (matches the plugin-driven
                     // `rterm.open_url` path).
@@ -7536,6 +7548,11 @@ impl App {
     /// for the mouse just to follow a link.
     fn open_hovered_url(&self) {
         let Some(url) = self.hover_url.clone() else { return };
+        if !rterm_core::is_safe_url(&url) {
+            tracing::warn!(url = %url, "blocked URL with disallowed scheme");
+            self.events.emit("link.blocked", &url);
+            return;
+        }
         if let Err(e) = open::that_detached(&url) {
             tracing::warn!("open URL failed: {e}");
         } else {
@@ -11045,8 +11062,18 @@ impl ApplicationHandler for App {
                     self.split_active_pane_in(dir, cwd.as_deref());
                 }
 
-                // Plugin-requested URL opens.
+                // Plugin-requested URL opens. Same scheme whitelist as
+                // mouse / keyboard hover-open: plugins are user-authored
+                // and trusted, but the URL inside `rterm.open_url(...)`
+                // might be assembled from shell output — applying the
+                // same filter keeps the trust boundary at the system
+                // handler, not at the plugin author.
                 for url in self.events.drain_pending_open_urls() {
+                    if !rterm_core::is_safe_url(&url) {
+                        tracing::warn!(url = %url, "blocked plugin open_url with disallowed scheme");
+                        self.events.emit("link.blocked", &url);
+                        continue;
+                    }
                     match open::that_detached(&url) {
                         Ok(_) => self.events.emit("link.open", &url),
                         Err(e) => tracing::warn!(url = %url, "open_url failed: {e}"),

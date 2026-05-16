@@ -59,6 +59,36 @@ fn shift_marks_after_scrollback_drop(marks: &mut VecDeque<usize>, dropped: usize
     }
 }
 
+/// Whitelist of URL schemes the terminal is allowed to invoke via the
+/// system handler (`open::that_detached`). The terminal sees URLs from
+/// TWO sources: auto-detected (`detect_url_at`) and shell-supplied via
+/// OSC 8 (`hyperlink_at`). The auto-detector applies this filter
+/// inline; OSC 8 was previously trusted blindly, which let a malicious
+/// shell embed `javascript:`, `file:///etc/...`, or `data:` URLs under
+/// arbitrary visible text — a click would invoke them through
+/// xdg-open / start / open without any scheme validation.
+///
+/// Allowed schemes:
+/// - `http`, `https` — the overwhelming majority of practical URLs
+/// - `ftp` — legacy but legitimate
+/// - `mailto:` — non-`://` form, validated separately
+/// - `ssh` — terminal users have a legitimate need (e.g. wezterm/iterm2
+///   pattern of `ssh://user@host`)
+/// - `file://` is INTENTIONALLY excluded — a shell that can write OSC 8
+///   can also already read files. The risk is the click giving the
+///   *user's browser* the URL and triggering content-disposition /
+///   script-side side effects.
+pub fn is_safe_url(s: &str) -> bool {
+    if let Some(scheme_end) = s.find("://") {
+        let scheme = &s[..scheme_end];
+        return matches!(scheme, "http" | "https" | "ftp" | "ssh");
+    }
+    if let Some(rest) = s.strip_prefix("mailto:") {
+        return rest.contains('@');
+    }
+    false
+}
+
 fn default_tab_stops(cols: u16) -> Vec<bool> {
     let n = cols as usize;
     let mut stops = vec![false; n];
@@ -556,18 +586,8 @@ impl Terminal {
         let raw: String = cells[start..end].iter().map(|c| c.ch).collect();
         // Trim trailing punctuation that is rarely part of a URL.
         let trimmed = raw.trim_end_matches(|c: char| ".,;:!?".contains(c));
-        if let Some(scheme_end) = trimmed.find("://") {
-            let scheme = &trimmed[..scheme_end];
-            if matches!(scheme, "http" | "https" | "file" | "ftp" | "ssh") {
-                return Some(trimmed.to_string());
-            }
-        }
-        // mailto:user@host has no `://`. Accept when the literal scheme is
-        // present and the rest contains an `@`.
-        if let Some(rest) = trimmed.strip_prefix("mailto:") {
-            if rest.contains('@') {
-                return Some(trimmed.to_string());
-            }
+        if is_safe_url(trimmed) {
+            return Some(trimmed.to_string());
         }
         None
     }
@@ -4223,6 +4243,33 @@ mod tests {
         let mut t2 = term(40, 1);
         t2.advance(b"alice@example.org");
         assert!(t2.detect_url_at(0, 0, 5).is_none());
+    }
+
+    #[test]
+    fn is_safe_url_passes_http_https_ftp_ssh_mailto() {
+        assert!(is_safe_url("http://example.org"));
+        assert!(is_safe_url("https://example.org/path?q=1"));
+        assert!(is_safe_url("ftp://files.example.org/"));
+        assert!(is_safe_url("ssh://user@host"));
+        assert!(is_safe_url("mailto:alice@example.org"));
+    }
+
+    #[test]
+    fn is_safe_url_blocks_dangerous_schemes() {
+        // Schemes a malicious shell could embed under OSC 8 to make a
+        // user Ctrl+click into a privilege boundary. xdg-open / start /
+        // open will happily route these to the user's browser / shell,
+        // so the gate is layered HERE before invocation.
+        assert!(!is_safe_url("javascript:alert(1)"));
+        assert!(!is_safe_url("data:text/html,<script>1</script>"));
+        assert!(!is_safe_url("file:///etc/passwd"));
+        assert!(!is_safe_url("vbscript:msgbox"));
+        // `mailto:` is allowed but only with an `@` in the body —
+        // `mailto:not-an-email` is a typo, not a useful action.
+        assert!(!is_safe_url("mailto:no-at-sign"));
+        // Nothing at all → not a URL → blocked.
+        assert!(!is_safe_url(""));
+        assert!(!is_safe_url("plain text"));
     }
 
     #[test]

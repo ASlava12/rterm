@@ -10,4 +10,4 @@ pub mod terminal;
 
 pub use color::{Color, NamedColor};
 pub use grid::{Cell, CellAttrs, Grid, Position, Size};
-pub use terminal::{CommandFinish, CursorShape, MouseTracking, PaletteUpdate, Terminal};
+pub use terminal::{is_safe_url, CommandFinish, CursorShape, MouseTracking, PaletteUpdate, Terminal};
