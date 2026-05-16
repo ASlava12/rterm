@@ -417,7 +417,17 @@ impl BgLayer {
                                 let w = (cell_w * 0.15).clamp(2.0, 3.0);
                                 (cell_x, cell_y, w, line_h)
                             }
-                            CursorShape::Block => unreachable!(),
+                            // `Block` is excluded by the outer `if
+                            // !matches!(.., Block)` gate; any future
+                            // CursorShape variant added to rterm-core
+                            // would land here. Render it as a thin
+                            // underline (the closest unobtrusive shape)
+                            // rather than `unreachable!()`, which would
+                            // panic in the render hot path.
+                            _ => {
+                                let h = (line_h * 0.15).clamp(2.0, 3.0);
+                                (cell_x, cell_y + line_h - h, cell_w, h)
+                            }
                         };
                         instances.push(Instance::sharp([cx, cy], [cw, ch], color));
                     }

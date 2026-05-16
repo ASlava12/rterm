@@ -720,7 +720,11 @@ pub struct PaneDraw<'a> {
 pub struct TextLayer {
     font_system: FontSystem,
     swash_cache: SwashCache,
-    _cache: Cache,
+    /// glyphon's shared cache. Not read directly, but its `Drop` is
+    /// load-bearing: it owns GPU buffers / atlas pages that the
+    /// `TextRenderer`s alias. Don't remove this field "because it's
+    /// unused" — the `Drop` order pin matters on Wayland shutdown.
+    _glyph_cache: Cache,
     viewport: Viewport,
     atlas: TextAtlas,
     /// Pane / header glyph pass — drawn BEFORE the overlay backdrop so
@@ -993,7 +997,7 @@ impl TextLayer {
         Self {
             font_system,
             swash_cache,
-            _cache: cache,
+            _glyph_cache: cache,
             viewport,
             atlas,
             renderer,
@@ -3561,14 +3565,6 @@ impl App {
         })
     }
 
-    /// Single-row tab strip rect — the hamburger, tab chips, `+`, and
-    /// window controls all share the same row. Kept as a thin alias of
-    /// `header_rect()` so callers that conceptually deal with "the tab
-    /// strip" don't have to know it equals the whole header.
-    fn tab_strip_rect(&self) -> Option<PaneRect> {
-        self.header_rect()
-    }
-
     /// Bottom-of-window status / search bar rect. Returns `None`
     /// when the bar is disabled (no search active and no status
     /// content) or the window is too short to host it.
@@ -3698,7 +3694,7 @@ impl App {
     /// True when (x, y) is over the `≡` hamburger button at the start
     /// of the tab strip (bottom row of the header).
     fn hamburger_at(&self, x: f64, y: f64) -> bool {
-        let Some(rect) = self.tab_strip_rect() else { return false };
+        let Some(rect) = self.header_rect() else { return false };
         let yf = y as f32;
         if yf < rect.top || yf >= rect.top + rect.height {
             return false;
@@ -3867,7 +3863,7 @@ impl App {
     }
 
     fn tab_layout(&self) -> Option<TabLayoutInfo> {
-        let rect = self.tab_strip_rect()?;
+        let rect = self.header_rect()?;
         let state = self.state.as_ref()?;
         let cell_w = state.text.cell_width() as f64;
         if cell_w <= 0.0 {
@@ -4191,12 +4187,6 @@ impl App {
         })
     }
 
-    /// Settings overlay rectangle — same geometry as the help overlay so
-    /// they feel symmetric (Ctrl+Shift+H ↔ Ctrl+Shift+,).
-    fn settings_rect(&self) -> Option<PaneRect> {
-        self.help_rect()
-    }
-
     /// Build the live-settings overlay text. Shows the current theme,
     /// font size, opacity, and the keys that adjust them.
     ///
@@ -4218,7 +4208,7 @@ impl App {
         // Pixel metrics for the upcoming hit-zone math. Done up front so
         // every "what row are we on now?" calculation uses the same
         // origin as the rendered text.
-        let (rect, cell_w, line_h) = match (self.settings_rect(), self.state.as_ref()) {
+        let (rect, cell_w, line_h) = match (self.help_rect(), self.state.as_ref()) {
             (Some(r), Some(s)) => (r, s.text.cell_width(), s.text.line_height()),
             _ => (PaneRect { left: 0.0, top: 0.0, width: 0.0, height: 0.0 }, 0.0, 0.0),
         };
@@ -4397,7 +4387,7 @@ impl App {
                 // Click outside any hit zone — but did the click stay
                 // within the overlay rect? If yes, keep it open (user
                 // missed a button); if outside, close it.
-                if let Some(rect) = self.settings_rect() {
+                if let Some(rect) = self.help_rect() {
                     if !(xf >= rect.left
                         && xf < rect.left + rect.width
                         && yf >= rect.top
@@ -11959,7 +11949,7 @@ impl ApplicationHandler for App {
                 // 2) Render frame.
                 let rects = self.layout_active_tab();
                 let header_rect = self.header_rect();
-                let tab_strip_rect_for_draw = self.tab_strip_rect();
+                let tab_strip_rect_for_draw = self.header_rect();
                 let mut label_storage: Vec<String> = Vec::new();
                 let header_spans = self.header_spans(&mut label_storage);
                 let mut header_right_storage: Vec<String> = Vec::new();
@@ -12029,7 +12019,7 @@ impl ApplicationHandler for App {
                             None => (Vec::new(), None),
                         }
                     } else if self.show_settings {
-                        (self.settings_spans(&mut help_storage), self.settings_rect())
+                        (self.settings_spans(&mut help_storage), self.help_rect())
                     } else if self.show_help {
                         (self.help_spans(&mut help_storage), self.help_rect())
                     } else {
