@@ -753,9 +753,21 @@ pub struct TextLayer {
     font_family: &'static str,
 }
 
+/// A run of styled text fed to the GPU text renderer. The triple is
+/// `(text, foreground RGB, bold)`. Borrowed-against-storage so the
+/// renderer doesn't allocate per-span strings on the hot path.
+pub type SpanList<'a> = Vec<(&'a str, [u8; 3], bool)>;
+
+/// A span list anchored to a specific pixel rect — what every chrome
+/// builder (`*_spans`) hands back. `None` means the caller has nothing
+/// to render for this frame. Using one alias here also kills the
+/// `#[allow(clippy::type_complexity)]` boilerplate that previously
+/// wrapped every `*_spans` signature.
+type AnchoredSpans<'a> = Option<(SpanList<'a>, PaneRect)>;
+
 /// Tab-bar style header rendered above the panes.
 pub struct HeaderDraw<'a> {
-    pub spans: Vec<(&'a str, [u8; 3], bool)>, // (text, fg rgb, bold)
+    pub spans: SpanList<'a>, // (text, fg rgb, bold)
     pub rect: PaneRect,
 }
 
@@ -764,7 +776,7 @@ pub struct HeaderDraw<'a> {
 /// passed separately so positioning never depends on the variable-width
 /// text in the main header buffer.
 pub struct HeaderRightDraw<'a> {
-    pub spans: Vec<(&'a str, [u8; 3], bool)>,
+    pub spans: SpanList<'a>,
     pub rect: PaneRect,
 }
 
@@ -772,19 +784,19 @@ pub struct HeaderRightDraw<'a> {
 /// header. Lives in its own buffer to position independently of the
 /// tab strip.
 pub struct TitleBarDraw<'a> {
-    pub spans: Vec<(&'a str, [u8; 3], bool)>,
+    pub spans: SpanList<'a>,
     pub rect: PaneRect,
 }
 
 /// Bottom-of-window status bar text (shell, cwd, pane info).
 pub struct StatusBarDraw<'a> {
-    pub spans: Vec<(&'a str, [u8; 3], bool)>,
+    pub spans: SpanList<'a>,
     pub rect: PaneRect,
 }
 
 /// Modal overlay (e.g. help cheat-sheet) — rendered after panes + header.
 pub struct OverlayDraw<'a> {
-    pub spans: Vec<(&'a str, [u8; 3], bool)>,
+    pub spans: SpanList<'a>,
     pub rect: PaneRect,
 }
 
@@ -5234,11 +5246,10 @@ impl App {
     /// Bottom status-bar spans: shell program, focused pane cwd, pane
     /// count, exit code. Mirrors VSCode's "shell + cwd + indicators"
     /// strip but condensed to one short line.
-    #[allow(clippy::type_complexity)]
     fn status_bar_spans<'a>(
         &self,
         storage: &'a mut Vec<String>,
-    ) -> Option<(Vec<(&'a str, [u8; 3], bool)>, PaneRect)> {
+    ) -> AnchoredSpans<'a> {
         storage.clear();
         let rect = self.status_bar_rect()?;
         let tab = self.active_tab()?;
@@ -5272,18 +5283,13 @@ impl App {
         Some((spans, rect))
     }
 
-    /// Search prompt spans: same content the old in-header search
-    /// status line had, but anchored to the bottom-bar rect so the
-    /// tab strip stays visible during search.
-    #[allow(clippy::type_complexity)]
     /// Bottom-bar spans for the scrollback position indicator —
     /// `↑ off / total  (Shift+End to live)`. Rendered when the focused
     /// pane has `scroll_offset > 0` and search isn't holding the bar.
-    #[allow(clippy::type_complexity)]
     fn scrollback_bar_spans<'a>(
         &self,
         storage: &'a mut Vec<String>,
-    ) -> Option<(Vec<(&'a str, [u8; 3], bool)>, PaneRect)> {
+    ) -> AnchoredSpans<'a> {
         storage.clear();
         let rect = self.status_bar_rect()?;
         let tab = self.active_tab()?;
@@ -5309,11 +5315,13 @@ impl App {
         Some((spans, rect))
     }
 
-    #[allow(clippy::type_complexity)]
+    /// Search prompt spans: same content the old in-header search
+    /// status line had, but anchored to the bottom-bar rect so the
+    /// tab strip stays visible during search.
     fn search_bar_spans<'a>(
         &self,
         storage: &'a mut Vec<String>,
-    ) -> Option<(Vec<(&'a str, [u8; 3], bool)>, PaneRect)> {
+    ) -> AnchoredSpans<'a> {
         storage.clear();
         let rect = self.status_bar_rect()?;
         let state = self.search.as_ref()?;
@@ -5349,11 +5357,10 @@ impl App {
     /// span list + pixel rect. Rendered via `HeaderRightDraw` so the
     /// glyphs don't depend on the (variable) length of the main header
     /// text — fixes the "controls drift when cwd/url changes" bug.
-    #[allow(clippy::type_complexity)]
     fn header_right_spans<'a>(
         &self,
         storage: &'a mut Vec<String>,
-    ) -> Option<(Vec<(&'a str, [u8; 3], bool)>, PaneRect)> {
+    ) -> AnchoredSpans<'a> {
         storage.clear();
         let rect = self.header_rect()?;
         let state = self.state.as_ref()?;
@@ -11789,8 +11796,7 @@ impl ApplicationHandler for App {
                 // header design (window controls live next to tabs,
                 // there's no separate title row to render). Keep the
                 // status bar at the bottom unchanged.
-                #[allow(clippy::type_complexity)]
-                let title_bar: Option<(Vec<(&str, [u8; 3], bool)>, PaneRect)> = None;
+                let title_bar: AnchoredSpans = None;
                 let mut status_bar_storage: Vec<String> = Vec::new();
                 // Bottom-bar dispatch: search prompt wins over the
                 // scrollback indicator (rare case: user opens search
