@@ -97,8 +97,9 @@ Two surfaces, both at `~/.config/rterm/` (`%APPDATA%\rterm\` on Windows):
 Both surfaces hot-reload — edit the file and changes apply on save without
 restarting rterm.
 
-See [docs/config.md](docs/config.md) for the full schema and
-[docs/plugins.md](docs/plugins.md) for the plugin API.
+See [docs/README.md](docs/README.md) for the documentation index —
+configuration schema, keybindings, themes, UI tour, and the Lua plugin
+API are split across focused files.
 
 ## Default keybindings
 
