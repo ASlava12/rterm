@@ -500,12 +500,23 @@ pub struct SelectionPoint {
 pub struct NormSelection {
     pub start: SelectionPoint,
     pub end: SelectionPoint,
+    /// `true` for rectangular (block) selection — `Alt+drag`. Each
+    /// row inside `[start.row, end.row]` is independently clipped to
+    /// `[min(start.col, end.col), max(start.col, end.col)]`. `false`
+    /// = the usual linear (char/word/line) flow.
+    pub block: bool,
 }
 
 impl NormSelection {
     pub fn contains(&self, row: u16, col: u16) -> bool {
         if row < self.start.row || row > self.end.row {
             return false;
+        }
+        if self.block {
+            // Rect bounds: the inclusive column range is independent
+            // of which row we're on. `start.col <= end.col` is held
+            // by every constructor (normalised on creation).
+            return col >= self.start.col && col < self.end.col;
         }
         if row == self.start.row && col < self.start.col {
             return false;
@@ -2466,6 +2477,11 @@ enum SelectionMode {
     Char,
     Word,
     Line,
+    /// Rectangular / block selection — `Alt+drag`. Same as `Char`
+    /// in terms of where the anchor / focus points live, but the
+    /// selection rect runs as a literal `min..=max` rect rather than
+    /// the usual "linear from anchor to focus across rows."
+    Block,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2484,10 +2500,33 @@ struct ActiveSelection {
 
 impl ActiveSelection {
     fn normalized(&self) -> NormSelection {
+        if matches!(self.mode, SelectionMode::Block) {
+            // Block mode normalises rows and cols INDEPENDENTLY so
+            // the resulting rect is `[min_row, max_row] × [min_col,
+            // max_col]` regardless of which corner the user
+            // anchored / focused on. `end.col` stays *exclusive*
+            // (one past the last selected column) to match
+            // `contains`'s comparison.
+            let (r_start, r_end) = if self.anchor.row <= self.focus.row {
+                (self.anchor.row, self.focus.row)
+            } else {
+                (self.focus.row, self.anchor.row)
+            };
+            let (c_min, c_max) = if self.anchor.col <= self.focus.col {
+                (self.anchor.col, self.focus.col)
+            } else {
+                (self.focus.col, self.anchor.col)
+            };
+            return NormSelection {
+                start: SelectionPoint { row: r_start, col: c_min },
+                end: SelectionPoint { row: r_end, col: c_max + 1 },
+                block: true,
+            };
+        }
         let a = (self.anchor.row, self.anchor.col);
         let f = (self.focus.row, self.focus.col);
         let (s, e) = if a <= f { (self.anchor, self.focus) } else { (self.focus, self.anchor) };
-        NormSelection { start: s, end: e }
+        NormSelection { start: s, end: e, block: false }
     }
 
     fn is_empty(&self) -> bool {
@@ -6137,11 +6176,24 @@ impl App {
 
         match count {
             1 => {
+                // `Alt+drag` triggers rectangular (block) selection —
+                // matches Terminator / iTerm2 / kitty. `Ctrl` is
+                // reserved for "open URL under cursor" (single click)
+                // so it can't double as the block modifier. The mode
+                // sticks until mouse-up; if the user is still holding
+                // Alt when they later double-click, the second click
+                // dispatches through the `count == 2` arm above and
+                // we drop back into Word mode — same as Terminator.
+                let mode = if self.modifiers.contains(ModifiersState::ALT) {
+                    SelectionMode::Block
+                } else {
+                    SelectionMode::Char
+                };
                 self.selection = Some(ActiveSelection {
                     pane_idx: i,
                     anchor: p,
                     focus: p,
-                    mode: SelectionMode::Char,
+                    mode,
                     pivot: None,
                 });
                 self.mouse_dragging = true;
@@ -6224,6 +6276,7 @@ impl App {
             return Some(NormSelection {
                 start: SelectionPoint { row: p.row, col: p.col },
                 end: SelectionPoint { row: p.row, col: p.col + 1 },
+                block: false,
             });
         }
         let mut left = p.col;
@@ -6237,6 +6290,7 @@ impl App {
         Some(NormSelection {
             start: SelectionPoint { row: p.row, col: left },
             end: SelectionPoint { row: p.row, col: right as u16 },
+            block: false,
         })
     }
 
@@ -6254,6 +6308,7 @@ impl App {
         Some(NormSelection {
             start: SelectionPoint { row: p.row, col: 0 },
             end: SelectionPoint { row: p.row, col: last_nonblank.max(1) },
+            block: false,
         })
     }
 
@@ -6354,7 +6409,11 @@ impl App {
             None => return,
         };
         let snapped = match mode {
-            SelectionMode::Char => None,
+            // Char and Block both move the focus directly to the
+            // cursor position — Block doesn't snap to anything (the
+            // rect math happens later in `normalized()`), so it
+            // shares the no-snap branch with Char.
+            SelectionMode::Char | SelectionMode::Block => None,
             SelectionMode::Word => pivot.map(|piv| {
                 let (drag_start, drag_end_incl) = self
                     .word_selection_at(pane_idx, p)
@@ -6452,11 +6511,23 @@ impl App {
         if let Ok(term) = pane.terminal.lock() {
             for r in norm.start.row..=norm.end.row {
                 let Some(row) = term.visible_row(offset, r) else { continue };
-                let lo = if r == norm.start.row { norm.start.col as usize } else { 0 };
-                let hi = if r == norm.end.row {
-                    (norm.end.col as usize).min(row.len())
+                // Block mode: every row uses the same rect-derived
+                // `[start.col, end.col)` range. Linear mode uses the
+                // historical "open-ended on intermediate rows" rule
+                // so the copied text reads like a stream.
+                let (lo, hi) = if norm.block {
+                    (
+                        (norm.start.col as usize).min(row.len()),
+                        (norm.end.col as usize).min(row.len()),
+                    )
                 } else {
-                    row.len()
+                    let lo = if r == norm.start.row { norm.start.col as usize } else { 0 };
+                    let hi = if r == norm.end.row {
+                        (norm.end.col as usize).min(row.len())
+                    } else {
+                        row.len()
+                    };
+                    (lo, hi)
                 };
                 if lo < hi {
                     for cell in &row[lo..hi] {
@@ -7452,6 +7523,7 @@ impl App {
             NormSelection {
                 start: SelectionPoint { row, col: start },
                 end: SelectionPoint { row, col: end },
+                block: false,
             },
         ))
     }
@@ -12135,7 +12207,7 @@ mod tests {
 
     #[test]
     fn norm_selection_contains_basic() {
-        let s = NormSelection { start: pt(1, 2), end: pt(3, 5) };
+        let s = NormSelection { start: pt(1, 2), end: pt(3, 5), block: false };
         // First row: cells from col 2 onward.
         assert!(!s.contains(1, 1));
         assert!(s.contains(1, 2));
@@ -12153,11 +12225,70 @@ mod tests {
 
     #[test]
     fn norm_selection_single_row() {
-        let s = NormSelection { start: pt(2, 3), end: pt(2, 7) };
+        let s = NormSelection { start: pt(2, 3), end: pt(2, 7), block: false };
         assert!(!s.contains(2, 2));
         assert!(s.contains(2, 3));
         assert!(s.contains(2, 6));
         assert!(!s.contains(2, 7));
+    }
+
+    #[test]
+    fn norm_selection_block_contains_rect_only() {
+        // Block selection: rect bounds, NOT linear. Cells inside the
+        // rect on every row are selected; cells outside the column
+        // range are NOT, even on intermediate rows (the linear mode's
+        // "open-ended" rule does not apply).
+        let s = NormSelection {
+            start: pt(1, 3),
+            end: pt(4, 7), // exclusive — selected cols are 3..7 → 3,4,5,6
+            block: true,
+        };
+        // Top-left corner of the rect.
+        assert!(s.contains(1, 3));
+        // Bottom-right INSIDE the inclusive range.
+        assert!(s.contains(4, 6));
+        // Just past the right edge — NOT selected.
+        assert!(!s.contains(4, 7));
+        // Just before the left edge — NOT selected on any row.
+        assert!(!s.contains(2, 2));
+        // Inside the rect on the middle row.
+        assert!(s.contains(2, 5));
+        // Way to the right on a middle row would be selected in
+        // *linear* mode but must NOT be in block mode.
+        assert!(!s.contains(2, 100));
+        // Outside the row range.
+        assert!(!s.contains(0, 5));
+        assert!(!s.contains(5, 5));
+    }
+
+    #[test]
+    fn active_selection_block_normalizes_rect_corners() {
+        // Anchor + focus pinned diagonally; the resulting rect must
+        // be `[min_row..=max_row] × [min_col..=max_col]` regardless
+        // of which corner the user anchored on. Catches the "user
+        // dragged up-and-to-the-left" case where naive endpoint
+        // swap on the (row, col) lexicographic tuple would produce a
+        // diagonal-shaped selection.
+        let s = ActiveSelection {
+            pane_idx: 0,
+            anchor: pt(5, 10),
+            focus: pt(2, 3),
+            mode: SelectionMode::Block,
+            pivot: None,
+        };
+        let n = s.normalized();
+        assert!(n.block);
+        assert_eq!(n.start, pt(2, 3));
+        // end.col is exclusive (= max_col + 1).
+        assert_eq!(n.end, pt(5, 11));
+        // Sanity-check via contains: corners and interior cells.
+        assert!(n.contains(2, 3));
+        assert!(n.contains(5, 10));
+        assert!(!n.contains(5, 11));
+        assert!(n.contains(3, 7));
+        // Outside the rect on the same row range.
+        assert!(!n.contains(3, 2));
+        assert!(!n.contains(3, 100));
     }
 
     #[test]
