@@ -759,7 +759,14 @@ pub struct TextLayer {
     font_size: f32,
     line_height: f32,
     cell_width: f32,
-    /// Leaked at TextLayer::new so we can hand out 'static Family::Name refs.
+    /// Leaked at `TextLayer::new` so we can hand out `&'static str` to
+    /// `glyphon::Family::Name(...)` — `Attrs<'static>` flows into
+    /// `Buffer::set_rich_text` which stores spans of `Attrs<'static>`.
+    /// We tried switching to `Arc<str>` but every span call site
+    /// resists the lifetime relaxation (over 40 cascade errors), and
+    /// rebuilding the spans + attrs API is well past LOW-priority
+    /// scope. A hot-reload of `font.family` leaks the previous name —
+    /// on the order of tens of bytes per change.
     font_family: &'static str,
 }
 
