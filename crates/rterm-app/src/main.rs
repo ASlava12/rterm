@@ -314,6 +314,13 @@ impl EventSink for PluginBridge {
                         position,
                         height_pct,
                         width_pct,
+                        // Plugin-driven hot-reload of `[guake]` doesn't
+                        // touch the global hotkey today — the worker
+                        // is registered once at startup against the
+                        // initial config. A Lua plugin that wants to
+                        // change the spec on the fly can rewrite
+                        // config.toml instead.
+                        global_hotkey: String::new(),
                     }
                 })
             },
@@ -1434,6 +1441,7 @@ fn run_gui(
                 position: config.guake.position.clone(),
                 height_pct: config.guake.height_pct,
                 width_pct: config.guake.width_pct,
+                global_hotkey: config.guake.global_hotkey.clone(),
             })
         } else {
             None

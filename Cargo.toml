@@ -69,6 +69,16 @@ open = "5"
 base64 = "0.22"
 regex = "1"
 
+# Win32 imports for the global-hotkey worker thread (RegisterHotKey +
+# its message-pump cousins). Pulled in only on Windows targets via the
+# per-crate `[target.'cfg(windows)'.dependencies]` glue. The crate
+# vendors generated bindings, so version bumps are routine.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [profile.dev]
 opt-level = 1            # Лучше отзывчивость TUI/PTY в dev-сборке
 debug = true

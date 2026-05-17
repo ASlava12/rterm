@@ -9,6 +9,7 @@ pub mod events;
 pub use events::{EventSink, NullSink};
 mod clipboard;
 use clipboard::clipboard_set;
+mod global_hotkey;
 mod keybind;
 mod layout;
 mod window_ops;
@@ -2494,6 +2495,24 @@ impl ActiveSelection {
     }
 }
 
+/// Side-channel events the renderer's `EventLoop` can receive from
+/// background threads via [`winit::event_loop::EventLoopProxy`].
+///
+/// Today the only producer is the optional Windows global-hotkey
+/// worker (see `global_hotkey::install_global_hotkey`). The variant
+/// stays `non_exhaustive` so we can add more out-of-band wake-up
+/// sources (cron-like timers, IPC bridge) without breaking external
+/// match arms.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub enum UserEvent {
+    /// Fires when the OS-level global hotkey configured in
+    /// `[guake].global_hotkey` is pressed (`WM_HOTKEY` on Windows).
+    /// The main thread responds by calling `toggle_guake` and forcing
+    /// the window to the foreground if it was unfocused.
+    GuakeGlobalHotkey,
+}
+
 /// Guake-style drop-down snapshot. Mirrors `rterm_config::GuakeConfig`
 /// but lives in the render crate so the renderer doesn't depend on the
 /// config crate.
@@ -2509,6 +2528,12 @@ pub struct GuakeRunConfig {
     pub height_pct: u8,
     /// 20..=100, width fraction of the current monitor.
     pub width_pct: u8,
+    /// Optional OS-level global hotkey spec (same syntax as
+    /// `[[keybindings]].keys`). When set and the worker can register
+    /// it, the action fires even with the window unfocused. Empty =
+    /// no global hotkey. Currently implemented on Windows; other
+    /// platforms parse-but-warn-and-skip.
+    pub global_hotkey: String,
 }
 
 /// Bundle of construction parameters for [`App::new`] / [`run`]. Replaces a
@@ -2736,6 +2761,13 @@ pub struct App {
     /// should drop the window down rather than minimise it, regardless
     /// of the current minimise state.
     guake_dropped: bool,
+    /// RAII handle for the optional OS-level global hotkey worker.
+    /// `None` when `[guake].global_hotkey` was empty / unparseable /
+    /// rejected by the OS. Held here so its `Drop` runs at the same
+    /// time as `App::drop` — unregistering the hotkey and joining
+    /// the worker thread before the EventLoopProxy is dropped.
+    #[allow(dead_code)] // held purely for its Drop side effect
+    global_hotkey: Option<global_hotkey::GlobalHotkeyHandle>,
     /// Set after the FIRST `RedrawRequested` has issued a clear-only frame
     /// to kick the Wayland compositor's `configure` → `Resized` chain.
     /// Until then we render `render_clear_only` rather than the full
@@ -2792,6 +2824,23 @@ const CURSOR_BLINK_PERIOD_MS: u128 = 1000;
 const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 
 impl App {
+    /// Install the optional OS-level global hotkey from
+    /// `[guake].global_hotkey`. Called once after `App::new`, before
+    /// the event loop starts. Idempotent: a second call replaces the
+    /// previous handle (the old one's `Drop` unregisters cleanly).
+    /// No-op when the spec is empty or unparseable — the in-app
+    /// keybind path still works.
+    pub fn install_global_hotkey(
+        &mut self,
+        spec: &str,
+        proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    ) {
+        if spec.trim().is_empty() {
+            return;
+        }
+        self.global_hotkey = Some(global_hotkey::install_global_hotkey(spec, proxy));
+    }
+
     pub fn new(cfg: RunConfig) -> Self {
         let RunConfig {
             title,
@@ -2907,6 +2956,7 @@ impl App {
             allow_osc52,
             guake,
             guake_dropped: false,
+            global_hotkey: None,
             first_frame_done: false,
             render_test_only,
             last_frame_tick: None,
@@ -8818,7 +8868,7 @@ fn ctrl_byte(b: u8) -> Option<u8> {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_some() {
             return;
@@ -8928,6 +8978,27 @@ impl ApplicationHandler for App {
     /// Last call before the event loop tears down. Used to give plugins a
     /// chance to clean up (write state to disk, etc.) via a `"shutdown"`
     /// event handler.
+    /// Side-channel event from a background thread (see [`UserEvent`]).
+    /// Dispatches in the same scope as a window event so plugin
+    /// handlers fire identically to the in-app keybind path.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::GuakeGlobalHotkey => {
+                // Bring the window forward before flipping the
+                // drop-down state. If the hotkey fired while a
+                // different app owned focus, `toggle_guake` alone
+                // would reshape the window but leave keyboard input
+                // going to the previously-focused window — opposite
+                // of Guake's classic UX.
+                if let Some(state) = self.state.as_ref() {
+                    state.window.set_minimized(false);
+                    state.window.focus_window();
+                }
+                self.toggle_guake();
+            }
+        }
+    }
+
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         if self.save_scrollback_on_exit {
             self.save_scrollback();
@@ -11232,9 +11303,29 @@ impl ApplicationHandler for App {
 }
 
 pub fn run(cfg: RunConfig) -> Result<()> {
-    let event_loop = EventLoop::new().context("EventLoop::new")?;
+    // Build an `EventLoop<UserEvent>` so background threads (notably
+    // the Windows global-hotkey worker) can wake the main loop via
+    // `EventLoopProxy::send_event`. The fallback path stays unchanged
+    // for builds where the worker isn't wired (Linux / macOS today):
+    // the channel is just never used.
+    let event_loop = EventLoop::<UserEvent>::with_user_event()
+        .build()
+        .context("EventLoop::with_user_event")?;
     event_loop.set_control_flow(ControlFlow::Poll);
+    let proxy = event_loop.create_proxy();
+    let global_hotkey_spec = cfg
+        .guake
+        .as_ref()
+        .map(|g| g.global_hotkey.clone())
+        .unwrap_or_default();
     let mut app = App::new(cfg);
+    // Spawn the global-hotkey worker AFTER `App::new` so the worker
+    // never fires before the App is in a state ready to handle it.
+    // The handle is owned by the App so its `Drop` unregisters
+    // cleanly on shutdown.
+    if !global_hotkey_spec.trim().is_empty() {
+        app.install_global_hotkey(&global_hotkey_spec, proxy.clone());
+    }
     // Don't propagate `EventLoopError::ExitFailure` as a fatal error
     // from `main`. winit emits it when the event loop's panic catcher
     // fires, when the display server connection dies during a rapid

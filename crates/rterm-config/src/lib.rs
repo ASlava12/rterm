@@ -62,6 +62,22 @@ pub struct GuakeConfig {
     /// Fraction of the monitor's width. Default `100`. Clamped to
     /// `[20, 100]`.
     pub width_pct: u8,
+    /// OS-level global hotkey that fires `toggle_guake` even when the
+    /// rterm window is NOT focused. Uses the same syntax as
+    /// `[[keybindings]].keys` (`"F11"`, `"Ctrl+Shift+`"`, ...).
+    ///
+    /// Currently implemented on Windows via `RegisterHotKey`. On
+    /// Linux / macOS the field is parsed and stored but the
+    /// hot-key worker logs `warn!` once at startup and falls back to
+    /// the in-app-only binding — the system surfaces (XGrabKey,
+    /// composer-specific Wayland protocol, RegisterEventHotKey)
+    /// require separate per-platform backends that are not yet
+    /// wired up.
+    ///
+    /// Empty / unset = no global hotkey; the in-app binding from
+    /// `[[keybindings]]` still works.
+    #[serde(default)]
+    pub global_hotkey: String,
 }
 
 impl Default for GuakeConfig {
@@ -71,6 +87,7 @@ impl Default for GuakeConfig {
             position: "top".to_string(),
             height_pct: 50,
             width_pct: 100,
+            global_hotkey: String::new(),
         }
     }
 }
@@ -883,6 +900,7 @@ mod tests {
         assert_eq!(parsed.guake.position, baseline.guake.position);
         assert_eq!(parsed.guake.height_pct, baseline.guake.height_pct);
         assert_eq!(parsed.guake.width_pct, baseline.guake.width_pct);
+        assert_eq!(parsed.guake.global_hotkey, baseline.guake.global_hotkey);
     }
 
     #[test]

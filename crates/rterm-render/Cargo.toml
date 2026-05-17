@@ -23,3 +23,10 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 rterm-core = { workspace = true }
+
+# Win32 globals for the optional Guake global-hotkey worker thread.
+# `RegisterHotKey` is the supported way to receive a system-wide key
+# combo without focus stealing tricks; the bindings come pre-generated
+# so we don't need a build.rs or a heavyweight Win32 crate.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }

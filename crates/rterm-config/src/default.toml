@@ -198,6 +198,18 @@ height_pct = 50
 #   Type:   u8 in 20..=100. Clamped at runtime.
 #   Default: 100.
 width_pct = 100
+# global_hotkey — OS-level shortcut that fires `toggle_guake` even
+# when the rterm window is NOT focused. Uses the same key spec
+# syntax as `[[keybindings]].keys` (`"F11"`, `"Ctrl+Shift+`"`, ...).
+#   Type:   string. Empty `""` = no global hotkey (the in-app
+#           `[[keybindings]]` entry still works while rterm is
+#           focused). Currently implemented on Windows via
+#           `RegisterHotKey`; on Linux / macOS the field is
+#           parsed but the worker only logs `warn!` and falls
+#           back to the in-app binding (X11 / Wayland / Cocoa
+#           backends are TODO).
+#   Default: "".
+global_hotkey = ""
 
 # ── [colors] ──────────────────────────────────────────────────────────
 # Terminal palette overrides. Every entry is an optional `[r, g, b]`
