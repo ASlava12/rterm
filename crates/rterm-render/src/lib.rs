@@ -8739,6 +8739,53 @@ impl App {
         if step == 0 {
             return;
         }
+        // Modal overlays consume the wheel before anything else so
+        // it doesn't bleed through to the panes / tab strip below.
+        // Convention (matches key handlers): wheel UP (step > 0)
+        // moves the viewport up in help, selects the previous palette
+        // item, etc. — i.e. the same direction as Arrow-Up.
+        if self.show_help {
+            if step > 0 {
+                self.help_scroll = self.help_scroll.saturating_sub(step as usize);
+            } else {
+                self.help_scroll =
+                    self.help_scroll.saturating_add((-step) as usize);
+            }
+            if let Some(state) = self.state.as_ref() {
+                state.window.request_redraw();
+            }
+            return;
+        }
+        if self.palette.is_some() {
+            // `palette_step` uses positive delta = move DOWN the list,
+            // matching Arrow-Down. Wheel up (step > 0) is the opposite,
+            // so flip the sign.
+            self.palette_step(-step as isize);
+            if let Some(state) = self.state.as_ref() {
+                state.window.request_redraw();
+            }
+            return;
+        }
+        if self.show_settings || self.rename_tab.is_some() {
+            // Settings is a static overlay (no scroll); rename is a
+            // single line. Consume the wheel anyway so it doesn't
+            // accidentally scroll the pane sitting underneath the modal.
+            return;
+        }
+        if let Some(menu) = self.context_menu.as_mut() {
+            // Move the hover cursor through the menu items.
+            let n = menu.items.len() as isize;
+            if n > 0 {
+                let cur = menu.hovered.map(|h| h as isize).unwrap_or(-1);
+                let delta_i = if step > 0 { -1 } else { 1 };
+                let next = ((cur + delta_i).rem_euclid(n)) as usize;
+                menu.hovered = Some(next);
+                if let Some(state) = self.state.as_ref() {
+                    state.window.request_redraw();
+                }
+            }
+            return;
+        }
         // Wheel over the tab bar switches tabs (Firefox/Chrome
         // convention). Wheel up = previous tab, down = next tab.
         // Falls through to pane-scroll when outside the header.
