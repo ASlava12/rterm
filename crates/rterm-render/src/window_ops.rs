@@ -103,7 +103,21 @@ impl App {
         let cfg = match &self.guake {
             Some(c) if c.enabled => c.clone(),
             _ => {
-                tracing::debug!("toggle_guake: [guake] disabled in config — no-op");
+                // User-facing UX gap: if a binding fires `toggle_guake`
+                // while `[guake]` is disabled, the previous behaviour
+                // was a silent `debug!` (invisible at the default
+                // RUST_LOG=info), so the user pressed the key, nothing
+                // happened, and there was no signal that the action
+                // was being intentionally dropped. Move the diagnostic
+                // up to `info!` so a default-verbosity run surfaces
+                // it, and fire a `guake.disabled` plugin event so a
+                // Lua plugin can convert it into a toast / settings-
+                // overlay nudge / desktop notification on demand.
+                tracing::info!(
+                    "toggle_guake: [guake] enabled = false — set it to \
+                     true in config.toml to use the action",
+                );
+                self.events.emit("guake.disabled", "");
                 return;
             }
         };

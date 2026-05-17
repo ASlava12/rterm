@@ -1968,6 +1968,11 @@ fn builtin_event_names() -> Vec<String> {
         "prompt.jump", "command.jump",
         "bell", "notification", "progress",
         "osc52.write", "osc52.blocked",
+        // Fires when `toggle_guake` is invoked while `[guake] enabled =
+        // false`. Lets a plugin convert what used to be a silent no-op
+        // into a toast / settings-overlay nudge so first-time users
+        // don't think their binding is broken.
+        "guake.disabled",
     ]
     .into_iter()
     .map(String::from)
@@ -2524,6 +2529,11 @@ mod tests {
             "copy", "paste", "osc52.write", "osc52.blocked",
             "frame.tick", "cwd", "title", "resize",
             "bell", "notification",
+            // Surfaced by `toggle_guake` when `[guake] enabled = false`.
+            // Plugins use this to convert what would otherwise be a
+            // silent no-op into a toast / settings-overlay nudge —
+            // dropping the entry would silently break those handlers.
+            "guake.disabled",
         ] {
             assert!(
                 names.iter().any(|n| n == must_have),
