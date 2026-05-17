@@ -531,13 +531,13 @@ fn main() -> Result<()> {
                     } else {
                         "release"
                     };
-                    println!(
-                        "{{\"rterm\":\"{}\",\"target_os\":\"{}\",\"target_arch\":\"{}\",\"profile\":\"{}\"}}",
-                        env!("CARGO_PKG_VERSION"),
-                        std::env::consts::OS,
-                        std::env::consts::ARCH,
-                        profile,
-                    );
+                    let obj = serde_json::json!({
+                        "rterm": env!("CARGO_PKG_VERSION"),
+                        "target_os": std::env::consts::OS,
+                        "target_arch": std::env::consts::ARCH,
+                        "profile": profile,
+                    });
+                    println!("{obj}");
                 } else {
                     println!("rterm {}", env!("CARGO_PKG_VERSION"));
                 }
@@ -619,23 +619,18 @@ fn main() -> Result<()> {
                     })
                     .collect();
                 if json {
-                    // JSON array of objects (`[{ "name": "...", "label": "..." }, ...]`).
-                    // Stable shape for shell completion scripts. The
-                    // canonical name list contains only ASCII snake_case,
-                    // and labels are short hand-written strings — neither
-                    // requires control-byte escaping.
-                    print!("[");
-                    for (i, (name, label)) in filtered.iter().enumerate() {
-                        if i > 0 {
-                            print!(",");
-                        }
-                        print!(
-                            "{{\"name\":\"{}\",\"label\":\"{}\"}}",
-                            name,
-                            json_escape(label),
-                        );
-                    }
-                    println!("]");
+                    // `[{ "name": "...", "label": "..." }, ...]`. Use
+                    // serde_json so control bytes / arbitrary unicode
+                    // in plugin-registered names get the correct
+                    // escapes (the old hand-rolled writer only handled
+                    // `\\` and `"`).
+                    let arr: Vec<_> = filtered
+                        .iter()
+                        .map(|(name, label)| {
+                            serde_json::json!({ "name": name, "label": label })
+                        })
+                        .collect();
+                    println!("{}", serde_json::Value::Array(arr));
                 } else if with_labels {
                     for (name, label) in filtered {
                         println!("{:<22} {}", name, label);
@@ -667,16 +662,9 @@ fn main() -> Result<()> {
                     })
                     .collect();
                 if json {
-                    // Event names are ASCII dotted identifiers — no
-                    // escaping needed.
-                    print!("[");
-                    for (i, e) in filtered.iter().enumerate() {
-                        if i > 0 {
-                            print!(",");
-                        }
-                        print!("\"{}\"", e);
-                    }
-                    println!("]");
+                    println!("{}", serde_json::Value::Array(
+                        filtered.iter().map(|e| serde_json::Value::String(e.clone())).collect(),
+                    ));
                 } else {
                     for e in filtered {
                         println!("{}", e);
@@ -720,23 +708,19 @@ fn main() -> Result<()> {
                 let json = std::env::args().any(|a| a == "--json");
                 if json {
                     // `[{"keys":"Ctrl+T","action":"new_tab","valid":true}, ...]`.
-                    // User-supplied keys / action strings can legitimately
-                    // contain `"` and `\` in pathological configs, so
-                    // route them through `json_escape`.
-                    print!("[");
-                    for (i, kb) in matches.iter().enumerate() {
-                        if i > 0 {
-                            print!(",");
-                        }
-                        let valid = UserBinding::from_config(&kb.keys, &kb.action).is_some();
-                        print!(
-                            "{{\"keys\":\"{}\",\"action\":\"{}\",\"valid\":{}}}",
-                            json_escape(&kb.keys),
-                            json_escape(&kb.action),
-                            valid,
-                        );
-                    }
-                    println!("]");
+                    let arr: Vec<_> = matches
+                        .iter()
+                        .map(|kb| {
+                            let valid =
+                                UserBinding::from_config(&kb.keys, &kb.action).is_some();
+                            serde_json::json!({
+                                "keys": kb.keys,
+                                "action": kb.action,
+                                "valid": valid,
+                            })
+                        })
+                        .collect();
+                    println!("{}", serde_json::Value::Array(arr));
                     return Ok(());
                 }
                 if cfg.keybindings.is_empty() {
@@ -779,18 +763,11 @@ fn main() -> Result<()> {
                     })
                     .collect();
                 if json {
-                    let default_json = chosen
-                        .as_deref()
-                        .map(|c| format!("\"{}\"", json_escape(c)))
-                        .unwrap_or_else(|| "null".to_string());
-                    print!("{{\"default\":{},\"families\":[", default_json);
-                    for (i, f) in filtered.iter().enumerate() {
-                        if i > 0 {
-                            print!(",");
-                        }
-                        print!("\"{}\"", json_escape(f));
-                    }
-                    println!("]}}");
+                    let obj = serde_json::json!({
+                        "default": chosen,
+                        "families": filtered,
+                    });
+                    println!("{obj}");
                     return Ok(());
                 }
                 match chosen.as_deref() {
@@ -1003,20 +980,17 @@ fn main() -> Result<()> {
                 // labelled lines. Bare flag is the default text form.
                 let json = std::env::args().any(|a| a == "--json");
                 if json {
-                    let q = |p: Option<&std::path::Path>| {
-                        p.map(|p| {
-                            format!("\"{}\"", json_escape(&p.display().to_string()))
-                        })
-                        .unwrap_or_else(|| "null".to_string())
+                    let to_str = |p: Option<&std::path::Path>| {
+                        p.map(|p| p.display().to_string())
                     };
-                    println!(
-                        "{{\"config\":{},\"init_lua\":{},\"plugins\":{},\"cache\":{},\"session\":{}}}",
-                        q(resolved_config.as_deref()),
-                        q(init_lua.as_deref()),
-                        q(plugins.as_deref()),
-                        q(cache.as_deref()),
-                        q(session.as_deref()),
-                    );
+                    let obj = serde_json::json!({
+                        "config": to_str(resolved_config.as_deref()),
+                        "init_lua": to_str(init_lua.as_deref()),
+                        "plugins": to_str(plugins.as_deref()),
+                        "cache": to_str(cache.as_deref()),
+                        "session": to_str(session.as_deref()),
+                    });
+                    println!("{obj}");
                 } else {
                     let show = |label: &str, p: Option<&std::path::Path>| {
                         let s = p
@@ -1837,18 +1811,17 @@ fn run_smoke(_config: &Config) -> Result<()> {
     // pipelines can assert on individual fields without parsing the
     // labelled text form.
     if std::env::args().any(|a| a == "--json") {
-        println!(
-            "{{\"cols\":{},\"rows\":{},\"cursor\":[{},{}],\"font\":\"{}\",\"exit\":\"{}\",\"shell\":\"{}\",\"payload\":\"{}\",\"row0\":\"{}\"}}",
-            term.size().cols,
-            term.size().rows,
-            cursor.row,
-            cursor.col,
-            json_escape(&font),
-            json_escape(&exit_repr),
-            json_escape(&program),
-            json_escape(&payload),
-            json_escape(first_line.trim_end()),
-        );
+        let obj = serde_json::json!({
+            "cols": term.size().cols,
+            "rows": term.size().rows,
+            "cursor": [cursor.row, cursor.col],
+            "font": font,
+            "exit": exit_repr,
+            "shell": program,
+            "payload": payload,
+            "row0": first_line.trim_end(),
+        });
+        println!("{obj}");
         return Ok(());
     }
     println!(
@@ -1887,17 +1860,6 @@ fn arg_after_flag_in<I: IntoIterator<Item = String>>(
 
 fn arg_after_flag(flag: &str) -> Option<String> {
     arg_after_flag_in(std::env::args(), flag)
-}
-
-/// Escape a string for embedding inside a JSON double-quoted value.
-/// We only ship single-line JSON output and the strings flowing through
-/// (paths / font names / event names / action labels / shell payloads)
-/// never contain control bytes on supported platforms, so escaping just
-/// `\\` and `"` is sufficient. Centralised so all six `--json` CLI
-/// modes use identical semantics — a future refactor adds escaping in
-/// one spot instead of five.
-fn json_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Cheap "did you mean?" suggestion for a misspelled font family. Walks
@@ -2323,26 +2285,26 @@ mod tests {
     }
 
     #[test]
-    fn json_escape_handles_backslash_and_quote() {
-        // The six `--json` CLI modes all funnel user-facing strings
-        // through this helper. Pin the two characters it actually
-        // escapes (`\\` first so the subsequent `"` substitution
-        // doesn't double-escape) and confirm other punctuation passes
-        // through verbatim.
-        assert_eq!(json_escape("plain"), "plain");
-        assert_eq!(json_escape("a\\b"), "a\\\\b");
-        assert_eq!(json_escape("a\"b"), "a\\\"b");
-        // Order matters: `\\"` must become `\\\\\\"` (escape backslash
-        // first, then the quote). A regression that escapes `"` first
-        // would produce `\\\\\\"` indirectly too — pin the exact form
-        // so the rule is fixed regardless of the implementation.
-        assert_eq!(json_escape("\\\""), "\\\\\\\"");
-        // Newline / tab / unicode are NOT escaped by this minimal
-        // helper. Callers must ensure their strings don't contain
-        // control bytes (paths / font names / payload don't on the
-        // supported platforms — see the call-site comments).
-        assert_eq!(json_escape("a\nb"), "a\nb");
-        assert_eq!(json_escape("\u{1F600}"), "\u{1F600}");
+    fn cli_json_modes_escape_control_bytes_correctly() {
+        // After the switch to `serde_json`, every `--json` CLI mode
+        // routes user-supplied strings through `serde_json::json!`
+        // which DOES escape control bytes. Pin the contract for the
+        // smoke-mode struct so a regression to hand-rolled escaping
+        // can't sneak in.
+        let obj = serde_json::json!({
+            "payload": "line\nwith\ttabs\"and quotes",
+            "shell":   "back\\slash",
+            "emoji":   "\u{1F600}",
+        });
+        let s = obj.to_string();
+        // Round-trip via the parser — it MUST accept the string we
+        // just produced. The old hand-rolled helper only escaped
+        // `\\` and `"`, so `\n`/`\t` would have produced invalid
+        // JSON and this `from_str` would fail.
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("valid JSON");
+        assert_eq!(parsed["payload"], "line\nwith\ttabs\"and quotes");
+        assert_eq!(parsed["shell"], "back\\slash");
+        assert_eq!(parsed["emoji"], "\u{1F600}");
     }
 
     #[test]
