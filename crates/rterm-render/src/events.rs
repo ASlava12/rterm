@@ -131,11 +131,6 @@ pub trait EventSink: Send + Sync {
     fn drain_pending_commands(&self) -> Vec<rterm_core::PluginCmd> {
         Vec::new()
     }
-    /// Drain built-in action names queued by `rterm.run_action(name)`. The
-    /// App resolves and dispatches each in order.
-    fn drain_pending_actions(&self) -> Vec<String> {
-        Vec::new()
-    }
     /// Latest `(tab, pane)` focus request (0-based) from `rterm.focus_pane`.
     fn take_pending_focus(&self) -> Option<(usize, usize)> {
         None
@@ -197,24 +192,10 @@ pub trait EventSink: Send + Sync {
     fn drain_pending_paste(&self) -> Vec<Vec<u8>> {
         Vec::new()
     }
-    /// Drain URLs from `rterm.open_url(url)`. The App opens each via the
-    /// platform's default handler.
-    fn drain_pending_open_urls(&self) -> Vec<String> {
-        Vec::new()
-    }
     /// Drain `(tab, pane)` kill targets from `rterm.kill_pane`. The App
     /// flips the target pane's `alive` flag so `prune_dead_panes` closes
     /// it on the next frame.
-    fn drain_pending_kills_by_uid(&self) -> Vec<u64> {
-        Vec::new()
-    }
     fn drain_pending_kills(&self) -> Vec<(usize, usize)> {
-        Vec::new()
-    }
-    /// Drain 0-based tab indices to close from `rterm.kill_tab(idx)`. The
-    /// App marks every pane in those tabs dead so the regular pane-prune
-    /// pass tears the tab down.
-    fn drain_pending_tab_kills(&self) -> Vec<usize> {
         Vec::new()
     }
     /// True if `rterm.bell()` was called since the last drain — App fires

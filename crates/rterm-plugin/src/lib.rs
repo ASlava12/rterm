@@ -321,10 +321,6 @@ pub struct PluginHost {
     /// Set when `rterm.attention()` is called. The App drains it once per
     /// frame and asks the window manager to ping the taskbar.
     pending_attention: Arc<Mutex<bool>>,
-    /// Action names queued via `rterm.run_action(name)`. Each entry is one
-    /// of the built-in AppAction names (e.g. "new_tab", "zoom_pane"). The
-    /// App drains and dispatches them once per frame.
-    pending_actions: Arc<Mutex<VecDeque<String>>>,
     /// Most recent `(tab, pane)` focus request (0-based) from
     /// `rterm.focus_pane(...)`.
     pending_focus: Arc<Mutex<Option<(usize, usize)>>>,
@@ -389,18 +385,9 @@ pub struct PluginHost {
     /// `ESC [ 200 ~ … ESC [ 201 ~` only when the destination pane has
     /// bracketed paste enabled.
     pending_paste: Arc<Mutex<VecDeque<Vec<u8>>>>,
-    /// URLs requested by `rterm.open_url(url)`. App hands them to the OS
-    /// via the `open` crate.
-    pending_open_urls: Arc<Mutex<VecDeque<String>>>,
     /// `(tab, pane)` 0-based targets to kill, queued from
     /// `rterm.kill_pane(tab, pane)`.
     pending_kills: Arc<Mutex<VecDeque<(usize, usize)>>>,
-    /// Pane uids queued by `rterm.kill_pane_by_uid(uid)`. App resolves
-    /// each uid to a live `(tab, pane)` at drain time before flipping
-    /// `alive` on the matching Pane.
-    pending_kills_by_uid: Arc<Mutex<VecDeque<u64>>>,
-    /// 0-based tab indices to close, queued from `rterm.kill_tab(idx)`.
-    pending_tab_kills: Arc<Mutex<VecDeque<usize>>>,
     /// `rterm.bell()` was called — App fires the same visual flash and
     /// attention ping a terminal BEL byte triggers.
     pending_bell: Arc<Mutex<bool>>,
@@ -1242,13 +1229,11 @@ impl PluginHost {
             })?,
         )?;
 
-        let pending_actions: Arc<Mutex<VecDeque<String>>> =
-            Arc::new(Mutex::new(VecDeque::new()));
-        let actions_for_run = Arc::clone(&pending_actions);
+        let run_action_tx = cmd_tx.clone();
         rterm.set(
             "run_action",
             lua.create_function(move |_, name: String| {
-                actions_for_run.lock().unwrap().push_back(name);
+                let _ = run_action_tx.send(rterm_core::PluginCmd::RunAction(name));
                 Ok(())
             })?,
         )?;
@@ -1717,13 +1702,11 @@ impl PluginHost {
             })?,
         )?;
 
-        let pending_open_urls: Arc<Mutex<VecDeque<String>>> =
-            Arc::new(Mutex::new(VecDeque::new()));
-        let open_for_call = Arc::clone(&pending_open_urls);
+        let open_url_tx = cmd_tx.clone();
         rterm.set(
             "open_url",
             lua.create_function(move |_, url: String| {
-                open_for_call.lock().unwrap().push_back(url);
+                let _ = open_url_tx.send(rterm_core::PluginCmd::OpenUrl(url));
                 Ok(())
             })?,
         )?;
@@ -1744,25 +1727,21 @@ impl PluginHost {
         // `rterm.kill_pane_by_uid(uid)` — sibling of `kill_pane(tab, pane)`
         // that addresses by stable uid. Same dispose-not-found behaviour
         // (uid no longer pointing at a live pane is silently dropped).
-        let pending_kills_by_uid: Arc<Mutex<VecDeque<u64>>> =
-            Arc::new(Mutex::new(VecDeque::new()));
-        let kills_by_uid_for_call = Arc::clone(&pending_kills_by_uid);
+        let kill_pane_by_uid_tx = cmd_tx.clone();
         rterm.set(
             "kill_pane_by_uid",
             lua.create_function(move |_, uid: u64| {
-                kills_by_uid_for_call.lock().unwrap().push_back(uid);
+                let _ = kill_pane_by_uid_tx.send(rterm_core::PluginCmd::KillPaneByUid(uid));
                 Ok(())
             })?,
         )?;
 
-        let pending_tab_kills: Arc<Mutex<VecDeque<usize>>> =
-            Arc::new(Mutex::new(VecDeque::new()));
-        let tab_kills_for_call = Arc::clone(&pending_tab_kills);
+        let kill_tab_tx = cmd_tx.clone();
         rterm.set(
             "kill_tab",
             lua.create_function(move |_, idx: u32| {
                 let i = idx.saturating_sub(1) as usize;
-                tab_kills_for_call.lock().unwrap().push_back(i);
+                let _ = kill_tab_tx.send(rterm_core::PluginCmd::KillTab(i));
                 Ok(())
             })?,
         )?;
@@ -3896,7 +3875,6 @@ impl PluginHost {
             pending_attention,
             cmd_tx,
             cmd_rx,
-            pending_actions,
             pending_focus,
             pending_focus_by_uid,
             pending_tab_focus,
@@ -3917,10 +3895,7 @@ impl PluginHost {
             pending_font_size,
             pending_opacity,
             pending_paste,
-            pending_open_urls,
             pending_kills,
-            pending_kills_by_uid,
-            pending_tab_kills,
             pending_bell,
             pending_palette,
             pending_theme,
@@ -3970,34 +3945,11 @@ impl PluginHost {
             .unwrap_or_default()
     }
 
-    /// Drain queued URLs from `rterm.open_url(url)`.
-    pub fn drain_pending_open_urls(&self) -> Vec<String> {
-        self.pending_open_urls
-            .lock()
-            .map(|mut q| q.drain(..).collect())
-            .unwrap_or_default()
-    }
-
     /// Drain queued `(tab, pane)` kill targets from `rterm.kill_pane`.
-    /// Drain queued pane uids from `rterm.kill_pane_by_uid(uid)`. App
-    /// resolves uid → live `(tab, pane)`.
-    pub fn drain_pending_kills_by_uid(&self) -> Vec<u64> {
-        self.pending_kills_by_uid
-            .lock()
-            .map(|mut q| q.drain(..).collect())
-            .unwrap_or_default()
-    }
-
+    /// The by-uid sibling migrated to the unified `PluginCmd` channel;
+    /// this one stays for now (uses indices rather than uid).
     pub fn drain_pending_kills(&self) -> Vec<(usize, usize)> {
         self.pending_kills
-            .lock()
-            .map(|mut q| q.drain(..).collect())
-            .unwrap_or_default()
-    }
-
-    /// Drain queued tab indices to close from `rterm.kill_tab(idx)`.
-    pub fn drain_pending_tab_kills(&self) -> Vec<usize> {
-        self.pending_tab_kills
             .lock()
             .map(|mut q| q.drain(..).collect())
             .unwrap_or_default()
@@ -4205,13 +4157,6 @@ impl PluginHost {
             .and_then(|mut g| g.take())
     }
 
-    /// Drain queued built-in action names from `rterm.run_action(name)`.
-    pub fn drain_pending_actions(&self) -> Vec<String> {
-        self.pending_actions
-            .lock()
-            .map(|mut q| q.drain(..).collect())
-            .unwrap_or_default()
-    }
 
     /// Take the latest plugin-requested attention ping (then clear).
     pub fn take_pending_attention(&self) -> bool {
@@ -4867,7 +4812,14 @@ mod tests {
             .load(r#"rterm.run_action("next_tab"); rterm.run_action("close_pane")"#)
             .exec()
             .unwrap();
-        let queued = host.drain_pending_actions();
+        let queued: Vec<_> = host
+            .drain_pending_commands()
+            .into_iter()
+            .filter_map(|c| match c {
+                rterm_core::PluginCmd::RunAction(s) => Some(s),
+                _ => None,
+            })
+            .collect();
         assert_eq!(queued, vec!["next_tab".to_string(), "close_pane".to_string()]);
     }
 
@@ -5522,10 +5474,17 @@ mod tests {
             )
             .exec()
             .unwrap();
-        let q = host.drain_pending_kills_by_uid();
+        let q: Vec<u64> = host
+            .drain_pending_commands()
+            .into_iter()
+            .filter_map(|c| match c {
+                rterm_core::PluginCmd::KillPaneByUid(u) => Some(u),
+                _ => None,
+            })
+            .collect();
         assert_eq!(q, vec![11, 22, 33]);
         // Drain is destructive; second call is empty.
-        assert!(host.drain_pending_kills_by_uid().is_empty());
+        assert!(host.drain_pending_commands().is_empty());
     }
 
     #[test]
@@ -6381,12 +6340,27 @@ mod tests {
             .unwrap();
         let kills = host.drain_pending_kills();
         assert_eq!(kills, vec![(0, 1), (2, 0)]);
-        let tab_kills = host.drain_pending_tab_kills();
+        let tab_kills: Vec<usize> = host
+            .drain_pending_commands()
+            .into_iter()
+            .filter_map(|c| match c {
+                rterm_core::PluginCmd::KillTab(i) => Some(i),
+                _ => None,
+            })
+            .collect();
         assert_eq!(tab_kills, vec![3]);
         // Saturating-sub guards against an accidental 0 — clamped to 0,
         // not a usize underflow.
         host.lua.load(r#"rterm.kill_tab(0); rterm.kill_pane(0, 0)"#).exec().unwrap();
-        assert_eq!(host.drain_pending_tab_kills(), vec![0]);
+        let tab_kills_zero: Vec<usize> = host
+            .drain_pending_commands()
+            .into_iter()
+            .filter_map(|c| match c {
+                rterm_core::PluginCmd::KillTab(i) => Some(i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tab_kills_zero, vec![0]);
         assert_eq!(host.drain_pending_kills(), vec![(0, 0)]);
     }
 
@@ -6716,7 +6690,14 @@ mod tests {
             .unwrap();
         let scrolls = host.drain_pending_scroll();
         assert_eq!(scrolls, vec![-3, 5]);
-        let urls = host.drain_pending_open_urls();
+        let urls: Vec<String> = host
+            .drain_pending_commands()
+            .into_iter()
+            .filter_map(|c| match c {
+                rterm_core::PluginCmd::OpenUrl(u) => Some(u),
+                _ => None,
+            })
+            .collect();
         assert_eq!(
             urls,
             vec!["https://example.com".to_string(), "file:///tmp/x".to_string()],

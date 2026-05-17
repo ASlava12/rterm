@@ -173,13 +173,6 @@ impl EventSink for PluginBridge {
             .unwrap_or_default()
     }
 
-    fn drain_pending_actions(&self) -> Vec<String> {
-        self.0
-            .lock()
-            .map(|h| h.drain_pending_actions())
-            .unwrap_or_default()
-    }
-
     fn take_pending_focus_by_uid(&self) -> Option<u64> {
         self.0
             .lock()
@@ -271,31 +264,10 @@ impl EventSink for PluginBridge {
             .unwrap_or_default()
     }
 
-    fn drain_pending_open_urls(&self) -> Vec<String> {
-        self.0
-            .lock()
-            .map(|h| h.drain_pending_open_urls())
-            .unwrap_or_default()
-    }
-
-    fn drain_pending_kills_by_uid(&self) -> Vec<u64> {
-        self.0
-            .lock()
-            .map(|h| h.drain_pending_kills_by_uid())
-            .unwrap_or_default()
-    }
-
     fn drain_pending_kills(&self) -> Vec<(usize, usize)> {
         self.0
             .lock()
             .map(|h| h.drain_pending_kills())
-            .unwrap_or_default()
-    }
-
-    fn drain_pending_tab_kills(&self) -> Vec<usize> {
-        self.0
-            .lock()
-            .map(|h| h.drain_pending_tab_kills())
             .unwrap_or_default()
     }
 

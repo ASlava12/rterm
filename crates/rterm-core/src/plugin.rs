@@ -29,4 +29,21 @@ pub enum PluginCmd {
     /// drains these and routes to the OS notification surface
     /// (`notify-send` on Linux, `NSUserNotification` on macOS, etc.).
     Notify(String),
+    /// `rterm.run_action(name)` — fire a built-in `AppAction` by its
+    /// canonical / alias name. Unknown names are dropped with a
+    /// debug log; valid names dispatch through the same handler the
+    /// keybind path uses.
+    RunAction(String),
+    /// `rterm.open_url(url)` — open in the OS default handler.
+    /// Renderer applies the safe-scheme whitelist
+    /// (`rterm_core::is_safe_url`) before invoking
+    /// `open::that_detached`.
+    OpenUrl(String),
+    /// `rterm.kill_pane_by_uid(uid)` — close the pane whose stable
+    /// uid matches, regardless of its current `(tab, pane)` indices.
+    /// Unknown uids drop silently (the pane may have already exited).
+    KillPaneByUid(u64),
+    /// `rterm.kill_tab(idx)` — close the tab at 0-based index. The
+    /// App treats this like clicking the tab's `×` button.
+    KillTab(usize),
 }

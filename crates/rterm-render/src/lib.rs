@@ -9805,12 +9805,14 @@ impl ApplicationHandler for App {
                 // once per frame; match per variant. New variants
                 // land here as their legacy `drain_pending_X` queues
                 // get folded into the channel.
-                // `non_exhaustive` PluginCmd is matched here with
-                // explicit arms. As legacy queues migrate, new arms
-                // get added. Clippy's single-arm-match lint is
-                // suppressed because every additional variant will
-                // expand this block.
-                #[allow(clippy::single_match)]
+                // Unified plugin → app/renderer command bus. Drain
+                // once per frame and match per variant. As more
+                // legacy `drain_pending_X` queues migrate, the arm
+                // list grows. Order across variants is preserved by
+                // the channel — a plugin firing
+                // `RunAction("split")` immediately followed by
+                // `Notify("done")` sees them dispatched in order.
+                let mut plugin_exit = false;
                 for cmd in self.events.drain_pending_commands() {
                     match cmd {
                         rterm_core::PluginCmd::Notify(msg) => {
@@ -9826,21 +9828,59 @@ impl ApplicationHandler for App {
                                 }
                             }
                         }
-                        _ => {}
-                    }
-                }
-
-                // Built-in actions invoked from Lua via `rterm.run_action`.
-                // We resolve each name; unknown names get a debug log and
-                // are dropped. The exit signal still bubbles up.
-                let mut plugin_exit = false;
-                for name in self.events.drain_pending_actions() {
-                    if let Some(act) = AppAction::from_name(&name) {
-                        if self.dispatch_action(act) {
-                            plugin_exit = true;
+                        rterm_core::PluginCmd::RunAction(name) => {
+                            if let Some(act) = AppAction::from_name(&name) {
+                                if self.dispatch_action(act) {
+                                    plugin_exit = true;
+                                }
+                            } else {
+                                tracing::debug!(action = %name, "run_action: unknown");
+                            }
                         }
-                    } else {
-                        tracing::debug!(action = %name, "run_action: unknown");
+                        rterm_core::PluginCmd::OpenUrl(url) => {
+                            // Same scheme whitelist as mouse / keyboard
+                            // hover-open — plugins are user-authored and
+                            // trusted, but the URL inside
+                            // `rterm.open_url(...)` might be assembled
+                            // from shell output, so we keep the trust
+                            // boundary at the system handler.
+                            if !rterm_core::is_safe_url(&url) {
+                                tracing::warn!(
+                                    url = %url,
+                                    "blocked plugin open_url with disallowed scheme",
+                                );
+                                self.events.emit("link.blocked", &url);
+                                continue;
+                            }
+                            match open::that_detached(&url) {
+                                Ok(_) => self.events.emit("link.open", &url),
+                                Err(e) => {
+                                    tracing::warn!(url = %url, "open_url failed: {e}")
+                                }
+                            }
+                        }
+                        rterm_core::PluginCmd::KillPaneByUid(uid) => {
+                            // Walk live panes for the matching uid;
+                            // flip `alive` so the prune pass collapses
+                            // it next frame. Unknown uid is silently
+                            // dropped (pane may have already exited).
+                            'outer: for tab in &self.tabs {
+                                for pane in tab.panes() {
+                                    if pane.uid == uid {
+                                        pane.alive.store(false, Ordering::Release);
+                                        break 'outer;
+                                    }
+                                }
+                            }
+                        }
+                        rterm_core::PluginCmd::KillTab(tab_idx) => {
+                            if let Some(tab) = self.tabs.get(tab_idx) {
+                                for pane in tab.panes() {
+                                    pane.alive.store(false, Ordering::Release);
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 if plugin_exit {
@@ -9900,39 +9940,6 @@ impl ApplicationHandler for App {
                     self.split_active_pane_in(dir, cwd.as_deref());
                 }
 
-                // Plugin-requested URL opens. Same scheme whitelist as
-                // mouse / keyboard hover-open: plugins are user-authored
-                // and trusted, but the URL inside `rterm.open_url(...)`
-                // might be assembled from shell output — applying the
-                // same filter keeps the trust boundary at the system
-                // handler, not at the plugin author.
-                for url in self.events.drain_pending_open_urls() {
-                    if !rterm_core::is_safe_url(&url) {
-                        tracing::warn!(url = %url, "blocked plugin open_url with disallowed scheme");
-                        self.events.emit("link.blocked", &url);
-                        continue;
-                    }
-                    match open::that_detached(&url) {
-                        Ok(_) => self.events.emit("link.open", &url),
-                        Err(e) => tracing::warn!(url = %url, "open_url failed: {e}"),
-                    }
-                }
-
-                // Plugin-requested pane kills by stable uid. Walk live
-                // panes for each uid, flip `alive` on the match — same
-                // prune path as the index-based kills below. Unknown
-                // uid silently dropped (plugin may have queued kill on
-                // a pane that already exited).
-                for uid in self.events.drain_pending_kills_by_uid() {
-                    'outer: for tab in &self.tabs {
-                        for pane in tab.panes() {
-                            if pane.uid == uid {
-                                pane.alive.store(false, Ordering::Release);
-                                break 'outer;
-                            }
-                        }
-                    }
-                }
 
                 // Plugin-requested pane kills. Flip the `alive` flag so the
                 // standard prune path closes the leaf next frame.
@@ -9950,13 +9957,6 @@ impl ApplicationHandler for App {
                 // dead so the same prune path collapses it. Doing it via
                 // `alive` keeps a single tear-down code path and preserves
                 // any "save scrollback on exit" hooks per pane.
-                for tab_idx in self.events.drain_pending_tab_kills() {
-                    if let Some(tab) = self.tabs.get(tab_idx) {
-                        for pane in tab.panes() {
-                            pane.alive.store(false, Ordering::Release);
-                        }
-                    }
-                }
 
                 // Plugin-supplied full palette swap from `rterm.set_palette`.
                 if let Some((fg, bg, cur, named)) = self.events.take_pending_palette() {
