@@ -562,6 +562,13 @@ type AnchoredSpans<'a> = Option<(SpanList<'a>, PaneRect)>;
 pub struct HeaderDraw<'a> {
     pub spans: SpanList<'a>, // (text, fg rgb, bold)
     pub rect: PaneRect,
+    /// Right-side clip — header glyphs never paint past this x. Used
+    /// to keep long tab labels from overflowing into the window-
+    /// control strip (the trailing minimize / maximize / close
+    /// cluster shares the same row as the tabs). When `None`, the
+    /// clip falls back to `rect.left + rect.width` (the full header
+    /// width — no extra reserve).
+    pub right_clip: Option<f32>,
 }
 
 /// Right-anchored mini-header that paints the window-control glyphs
@@ -1024,6 +1031,17 @@ impl TextLayer {
             // Chrome-style header bar so the tab labels look anchored
             // rather than top-glued.
             let text_offset = ((h.rect.height - self.line_height) * 0.5).max(0.0);
+            // Hard right-edge clip — tab labels that would otherwise
+            // overflow into the window-control strip (the trailing
+            // minimize / maximize / close cluster sharing the same
+            // row) are pixel-clipped here instead of relying on the
+            // glyph-rendering side to short-circuit. Without this
+            // the very last tab visually overlaps the icons even
+            // after `tab_layout` reserved cells for them — glyphon
+            // would happily paint beyond `tabs_right` since its
+            // bounds were the full header rect.
+            let right_px = h.right_clip
+                .unwrap_or(h.rect.left + h.rect.width) as i32;
             main_areas.push(TextArea {
                 buffer: &self.header_buffer,
                 left: h.rect.left,
@@ -1032,7 +1050,7 @@ impl TextLayer {
                 bounds: TextBounds {
                     left: h.rect.left as i32,
                     top: h.rect.top as i32,
-                    right: (h.rect.left + h.rect.width) as i32,
+                    right: right_px,
                     bottom: (h.rect.top + h.rect.height) as i32,
                 },
                 default_color: GlyphColor::rgb(220, 220, 220),
@@ -10659,6 +10677,17 @@ impl ApplicationHandler for App {
                 // so the after-panes assembly inside the state borrow
                 // can just move-extend them.
                 let resize_marker_quads = self.resize_marker_quads();
+                // Cell width for header right-clip computation —
+                // captured here so it's available inside the
+                // `self.state.as_mut()` block below without re-
+                // borrowing `self.state` immutably (would conflict
+                // with the mutable borrow held by the outer `if let`).
+                let header_clip_cell_w = self
+                    .state
+                    .as_ref()
+                    .map(|s| s.text.cell_width())
+                    .unwrap_or(8.0);
+                let header_clip_os_decorations = self.os_decorations;
                 {
                     static R_PRELAY: std::sync::Once = std::sync::Once::new();
                     R_PRELAY.call_once(|| tracing::debug!("redraw: about to enter state branch"));
@@ -10746,9 +10775,26 @@ impl ApplicationHandler for App {
                     // `tab_strip_rect` so vertical centering inside the
                     // text buffer lands on the right strip.
                     let _ = header_rect;
-                    let header_draw = tab_strip_rect_for_draw.map(|rect| HeaderDraw {
-                        spans: header_spans,
-                        rect,
+                    let header_draw = tab_strip_rect_for_draw.map(|rect| {
+                        // Same right boundary `tab_layout` uses
+                        // (rect.right minus the window-control
+                        // reserve plus the breathing gap). The
+                        // TextLayer pixel-clips glyph rendering here
+                        // so a long tab label can't paint over the
+                        // minimize / maximize / close cluster.
+                        let controls_cells = if header_clip_os_decorations {
+                            0.0
+                        } else {
+                            (WINDOW_CONTROLS_WIDTH_CELLS + TAB_CONTROLS_GAP_CELLS)
+                                as f32
+                        };
+                        let right_clip =
+                            rect.left + rect.width - controls_cells * header_clip_cell_w;
+                        HeaderDraw {
+                            spans: header_spans,
+                            rect,
+                            right_clip: Some(right_clip),
+                        }
                     });
                     let header_right_draw =
                         header_right.map(|(spans, rect)| HeaderRightDraw { spans, rect });
