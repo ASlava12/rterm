@@ -166,10 +166,10 @@ impl EventSink for PluginBridge {
             .unwrap_or(false)
     }
 
-    fn drain_pending_notify(&self) -> Vec<String> {
+    fn drain_pending_commands(&self) -> Vec<rterm_core::PluginCmd> {
         self.0
             .lock()
-            .map(|h| h.drain_pending_notify())
+            .map(|h| h.drain_pending_commands())
             .unwrap_or_default()
     }
 

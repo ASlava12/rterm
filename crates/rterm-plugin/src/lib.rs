@@ -257,6 +257,24 @@ pub struct PluginHost {
     /// User-registered actions exposed in the command palette.
     /// Map: action name → Lua callback (registered as RegistryKey).
     actions: Arc<Mutex<HashMap<String, RegistryKey>>>,
+    /// Unified plugin → app/renderer command channel. The audit
+    /// (rounds 2 and 3) flagged the per-purpose `pending_*: Arc<
+    /// Mutex<VecDeque<T>>>` shape; this `Sender<PluginCmd>` is the
+    /// migration destination. New variants land here first; legacy
+    /// queues are folded in as their semantics get matched in
+    /// `rterm_core::PluginCmd`. The `Receiver` lives behind a
+    /// `Mutex` so the App can drain from any thread (in practice
+    /// it's always the render thread).
+    ///
+    /// `cmd_tx` is intentionally held even though it isn't read
+    /// directly from `&self` — Lua closures captured clones at
+    /// `new()` time. Keeping the master sender alive gives future
+    /// in-process producers (e.g. a Rust-side `enqueue_cmd` API
+    /// when more queues migrate) a path that doesn't require
+    /// re-plumbing through every closure.
+    #[allow(dead_code)]
+    cmd_tx: std::sync::mpsc::Sender<rterm_core::PluginCmd>,
+    cmd_rx: Arc<Mutex<std::sync::mpsc::Receiver<rterm_core::PluginCmd>>>,
     //
     // === Plugin command queues — architecture note ===
     //
@@ -303,8 +321,6 @@ pub struct PluginHost {
     /// Set when `rterm.attention()` is called. The App drains it once per
     /// frame and asks the window manager to ping the taskbar.
     pending_attention: Arc<Mutex<bool>>,
-    /// Plugin-emitted notification messages queued via `rterm.notify(msg)`.
-    pending_notify: Arc<Mutex<VecDeque<String>>>,
     /// Action names queued via `rterm.run_action(name)`. Each entry is one
     /// of the built-in AppAction names (e.g. "new_tab", "zoom_pane"). The
     /// App drains and dispatches them once per frame.
@@ -652,6 +668,12 @@ impl PluginHost {
         let lua = Lua::new();
         let handlers: Arc<Mutex<HashMap<String, Vec<RegistryKey>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+
+        // Unified plugin-command channel. Lua callbacks send variants
+        // here instead of pushing onto per-purpose queues. Cloned
+        // `cmd_tx` handles flow into each `lua.create_function` body.
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<rterm_core::PluginCmd>();
+        let cmd_rx = Arc::new(Mutex::new(cmd_rx));
 
         let rterm: Table = lua.create_table()?;
 
@@ -1207,17 +1229,15 @@ impl PluginHost {
             })?,
         )?;
 
-        // `rterm.notify(message)` — fires a `notification` plugin event and
-        // requests taskbar attention if the window is unfocused. Convenience
-        // wrapper around the OSC 9 path so plugins don't have to combine
-        // `emit_event("notification", ...)` with `attention()`.
-        let pending_notify: Arc<Mutex<VecDeque<String>>> =
-            Arc::new(Mutex::new(VecDeque::new()));
-        let notify_for_set = Arc::clone(&pending_notify);
+        // `rterm.notify(message)` — fires a `notification` plugin event
+        // and requests taskbar attention if the window is unfocused.
+        // First queue migrated to the unified `cmd_tx` channel (the
+        // legacy `Arc<Mutex<VecDeque<String>>>` field is gone).
+        let notify_tx = cmd_tx.clone();
         rterm.set(
             "notify",
             lua.create_function(move |_, msg: String| {
-                notify_for_set.lock().unwrap().push_back(msg);
+                let _ = notify_tx.send(rterm_core::PluginCmd::Notify(msg));
                 Ok(())
             })?,
         )?;
@@ -3874,7 +3894,8 @@ impl PluginHost {
             pending_routed_input,
             pending_routed_input_by_uid,
             pending_attention,
-            pending_notify,
+            cmd_tx,
+            cmd_rx,
             pending_actions,
             pending_focus,
             pending_focus_by_uid,
@@ -4200,11 +4221,19 @@ impl PluginHost {
             .unwrap_or(false)
     }
 
-    /// Drain plugin-emitted notification messages from `rterm.notify(msg)`.
-    pub fn drain_pending_notify(&self) -> Vec<String> {
-        self.pending_notify
+    /// Drain every pending plugin → app/renderer command from the
+    /// unified channel. Callers `match` on `PluginCmd` variants to
+    /// dispatch — there's no per-variant `drain_pending_X` anymore
+    /// (those queues are being folded into this channel one at a
+    /// time; matched arms grow as the migration progresses).
+    ///
+    /// Order across variants is preserved: a plugin that fires
+    /// `RunAction("split")` immediately followed by `Notify("done")`
+    /// will see them in that order at the renderer side.
+    pub fn drain_pending_commands(&self) -> Vec<rterm_core::PluginCmd> {
+        self.cmd_rx
             .lock()
-            .map(|mut q| q.drain(..).collect())
+            .map(|rx| rx.try_iter().collect())
             .unwrap_or_default()
     }
 
@@ -4815,7 +4844,14 @@ mod tests {
         assert!(host.take_pending_copy().is_none(), "copy is one-shot");
         let pastes = host.drain_pending_paste();
         assert_eq!(pastes, vec![b"incoming".to_vec()]);
-        let notifications = host.drain_pending_notify();
+        let cmds = host.drain_pending_commands();
+        let notifications: Vec<_> = cmds
+            .into_iter()
+            .filter_map(|c| match c {
+                rterm_core::PluginCmd::Notify(s) => Some(s),
+                _ => None,
+            })
+            .collect();
         assert_eq!(notifications, vec!["ping".to_string()]);
     }
 

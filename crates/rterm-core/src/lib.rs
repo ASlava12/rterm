@@ -6,8 +6,10 @@
 pub mod color;
 pub mod grid;
 pub mod parser;
+pub mod plugin;
 pub mod terminal;
 
 pub use color::{Color, NamedColor};
 pub use grid::{Cell, CellAttrs, Grid, Position, Size};
+pub use plugin::PluginCmd;
 pub use terminal::{is_safe_url, CommandFinish, CursorShape, MouseTracking, PaletteUpdate, Terminal};

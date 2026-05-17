@@ -122,9 +122,13 @@ pub trait EventSink: Send + Sync {
     fn take_pending_attention(&self) -> bool {
         false
     }
-    /// Drain plugin-emitted notification messages from `rterm.notify(msg)`.
-    /// The App routes them through the same path as OSC 9 notifications.
-    fn drain_pending_notify(&self) -> Vec<String> {
+    /// Drain plugin-emitted commands from the unified channel.
+    /// Callers `match` on `PluginCmd` variants — there's no
+    /// per-purpose `drain_pending_X` anymore (the legacy queues
+    /// are being folded into this channel; new variants land here
+    /// as their queues migrate). Order across variants is
+    /// preserved in `PluginHost`'s sender.
+    fn drain_pending_commands(&self) -> Vec<rterm_core::PluginCmd> {
         Vec::new()
     }
     /// Drain built-in action names queued by `rterm.run_action(name)`. The

@@ -9801,17 +9801,32 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                // Plugin-emitted notifications (`rterm.notify(msg)`). Same
-                // path OSC 9 takes: fire the `notification` event and ping
-                // the taskbar when the window is unfocused.
-                for msg in self.events.drain_pending_notify() {
-                    self.events.emit("notification", &msg);
-                    if !self.window_focused {
-                        if let Some(s) = self.state.as_ref() {
-                            s.window.request_user_attention(Some(
-                                winit::window::UserAttentionType::Informational,
-                            ));
+                // Unified plugin → app/renderer command bus. Drain
+                // once per frame; match per variant. New variants
+                // land here as their legacy `drain_pending_X` queues
+                // get folded into the channel.
+                // `non_exhaustive` PluginCmd is matched here with
+                // explicit arms. As legacy queues migrate, new arms
+                // get added. Clippy's single-arm-match lint is
+                // suppressed because every additional variant will
+                // expand this block.
+                #[allow(clippy::single_match)]
+                for cmd in self.events.drain_pending_commands() {
+                    match cmd {
+                        rterm_core::PluginCmd::Notify(msg) => {
+                            // Same path OSC 9 takes: fire the
+                            // `notification` event and ping the
+                            // taskbar when the window is unfocused.
+                            self.events.emit("notification", &msg);
+                            if !self.window_focused {
+                                if let Some(s) = self.state.as_ref() {
+                                    s.window.request_user_attention(Some(
+                                        winit::window::UserAttentionType::Informational,
+                                    ));
+                                }
+                            }
                         }
+                        _ => {}
                     }
                 }
 
