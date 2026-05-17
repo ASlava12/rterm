@@ -233,8 +233,6 @@ pub struct PaneInfo {
 pub type ClipboardReader = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 type RoutedInputQueue = Arc<Mutex<VecDeque<((usize, usize), Vec<u8>)>>>;
 type RoutedInputByUidQueue = Arc<Mutex<VecDeque<(u64, Vec<u8>)>>>;
-type SplitQueue = Arc<Mutex<VecDeque<(String, Option<String>)>>>;
-type EventQueue = Arc<Mutex<VecDeque<(String, String)>>>;
 type TabTitleQueue = Arc<Mutex<VecDeque<(Option<usize>, String)>>>;
 
 /// A pattern Lua plugins can register via `rterm.add_match(name, pattern, opts)`.
@@ -349,23 +347,12 @@ pub struct PluginHost {
     builtin_action_labels: Arc<Mutex<HashMap<String, String>>>,
     /// Surfaced through `rterm.builtin_events()`.
     builtin_events: Arc<Mutex<Vec<String>>>,
-    /// Queue of plugin-emitted custom events from `rterm.emit_event(name, body)`.
-    /// The App drains and re-dispatches via `emit()` once per frame so the
-    /// effect is identical to a native event but free of re-entrancy.
-    pending_custom_events: EventQueue,
     /// Absolute scroll target from `rterm.scroll_to_line(line)`. 0-based
     /// logical line index (scrollback first, then grid).
     pending_scroll_to_line: Arc<Mutex<Option<usize>>>,
     /// `(query, regex_mode)` from `rterm.start_search`. Empty query opens
     /// the overlay blank — same as the `search` action.
     pending_start_search: Arc<Mutex<Option<(String, bool)>>>,
-    /// Queued `rterm.new_tab(opt_cwd)` requests. `None` means use the
-    /// focused pane's cwd (matching the `new_tab` action default).
-    pending_new_tabs: Arc<Mutex<VecDeque<Option<String>>>>,
-    /// Queued `rterm.split(dir, opt_cwd)` requests. `dir` is one of
-    /// `"horizontal"`, `"vertical"`, or `"auto"`; the App resolves and
-    /// dispatches each.
-    pending_splits: SplitQueue,
     /// Latest absolute font size requested by `rterm.set_font_size(size)`.
     pending_font_size: Arc<Mutex<Option<f32>>>,
     /// Latest window-opacity request from `rterm.set_opacity(value)`. App
@@ -1496,15 +1483,12 @@ impl PluginHost {
         )?;
 
 
-        let pending_custom_events: EventQueue = Arc::new(Mutex::new(VecDeque::new()));
-        let events_for_emit = Arc::clone(&pending_custom_events);
+        let emit_event_tx = cmd_tx.clone();
         rterm.set(
             "emit_event",
             lua.create_function(move |_, (name, body): (String, Option<String>)| {
-                events_for_emit
-                    .lock()
-                    .unwrap()
-                    .push_back((name, body.unwrap_or_default()));
+                let _ = emit_event_tx
+                    .send(rterm_core::PluginCmd::EmitEvent(name, body.unwrap_or_default()));
                 Ok(())
             })?,
         )?;
@@ -1619,23 +1603,20 @@ impl PluginHost {
             )?,
         )?;
 
-        let pending_new_tabs: Arc<Mutex<VecDeque<Option<String>>>> =
-            Arc::new(Mutex::new(VecDeque::new()));
-        let new_tabs_for_call = Arc::clone(&pending_new_tabs);
+        let new_tab_tx = cmd_tx.clone();
         rterm.set(
             "new_tab",
             lua.create_function(move |_, cwd: Option<String>| {
-                new_tabs_for_call.lock().unwrap().push_back(cwd);
+                let _ = new_tab_tx.send(rterm_core::PluginCmd::NewTab(cwd));
                 Ok(())
             })?,
         )?;
 
-        let pending_splits: SplitQueue = Arc::new(Mutex::new(VecDeque::new()));
-        let splits_for_call = Arc::clone(&pending_splits);
+        let split_tx = cmd_tx.clone();
         rterm.set(
             "split",
             lua.create_function(move |_, (dir, cwd): (String, Option<String>)| {
-                splits_for_call.lock().unwrap().push_back((dir, cwd));
+                let _ = split_tx.send(rterm_core::PluginCmd::Split(dir, cwd));
                 Ok(())
             })?,
         )?;
@@ -3861,11 +3842,8 @@ impl PluginHost {
             builtin_actions,
             builtin_action_labels,
             builtin_events,
-            pending_custom_events,
             pending_scroll_to_line,
             pending_start_search,
-            pending_new_tabs,
-            pending_splits,
             pending_font_size,
             pending_opacity,
             pending_bell,
@@ -3985,32 +3963,6 @@ impl PluginHost {
             .lock()
             .ok()
             .and_then(|mut g| g.take())
-    }
-
-    /// Drain queued `rterm.new_tab(opt_cwd)` requests. `None` entries inherit
-    /// the focused pane's cwd at apply time.
-    pub fn drain_pending_new_tabs(&self) -> Vec<Option<String>> {
-        self.pending_new_tabs
-            .lock()
-            .map(|mut q| q.drain(..).collect())
-            .unwrap_or_default()
-    }
-
-    /// Drain queued `rterm.split(dir, opt_cwd)` requests. Each entry is
-    /// `(dir_string, optional_cwd)`; the App resolves the direction.
-    pub fn drain_pending_splits(&self) -> Vec<(String, Option<String>)> {
-        self.pending_splits
-            .lock()
-            .map(|mut q| q.drain(..).collect())
-            .unwrap_or_default()
-    }
-
-    /// Drain plugin-queued custom events from `rterm.emit_event(...)`.
-    pub fn drain_pending_custom_events(&self) -> Vec<(String, String)> {
-        self.pending_custom_events
-            .lock()
-            .map(|mut q| q.drain(..).collect())
-            .unwrap_or_default()
     }
 
     /// Install the clipboard reader used by `rterm.read_clipboard()`. Called
@@ -4942,11 +4894,24 @@ mod tests {
             )
             .exec()
             .unwrap();
-        let new_tabs = host.drain_pending_new_tabs();
+        let cmds = host.drain_pending_commands();
+        let new_tabs: Vec<Option<String>> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                rterm_core::PluginCmd::NewTab(cwd) => Some(cwd.clone()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(new_tabs.len(), 2);
         assert_eq!(new_tabs[0].as_deref(), Some("/tmp/a"));
         assert_eq!(new_tabs[1], None);
-        let splits = host.drain_pending_splits();
+        let splits: Vec<(String, Option<String>)> = cmds
+            .into_iter()
+            .filter_map(|c| match c {
+                rterm_core::PluginCmd::Split(d, cwd) => Some((d, cwd)),
+                _ => None,
+            })
+            .collect();
         assert_eq!(splits.len(), 2);
         assert_eq!(splits[0].0, "h");
         assert_eq!(splits[0].1.as_deref(), Some("/tmp/b"));

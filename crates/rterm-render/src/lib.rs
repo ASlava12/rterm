@@ -9929,6 +9929,30 @@ impl ApplicationHandler for App {
                                 self.events.emit("scroll", &next.to_string());
                             }
                         }
+                        rterm_core::PluginCmd::NewTab(cwd) => {
+                            self.new_tab_in(cwd.as_deref());
+                        }
+                        rterm_core::PluginCmd::Split(dir_str, cwd) => {
+                            let dir = match dir_str.as_str() {
+                                "h" | "horizontal" => SplitDir::Horizontal,
+                                "v" | "vertical" => SplitDir::Vertical,
+                                "auto" | "smart" => self.split_auto_direction(),
+                                other => {
+                                    tracing::debug!(
+                                        dir = %other,
+                                        "rterm.split: unknown direction",
+                                    );
+                                    continue;
+                                }
+                            };
+                            self.split_active_pane_in(dir, cwd.as_deref());
+                        }
+                        rterm_core::PluginCmd::EmitEvent(name, body) => {
+                            // Re-emit the plugin event on the App's
+                            // event loop so registered handlers fire
+                            // identically to a native source.
+                            self.events.emit(&name, &body);
+                        }
                         _ => {}
                     }
                 }
@@ -9946,17 +9970,9 @@ impl ApplicationHandler for App {
                     self.events.emit("copy", &text);
                 }
 
-                // Custom events relayed back through the App so registered
-                // handlers fire normally.
-                for (name, body) in self.events.drain_pending_custom_events() {
-                    self.events.emit(&name, &body);
-                }
-
-                // Plugin-requested new tabs with optional cwd override.
-                let new_tabs = self.events.drain_pending_new_tabs();
-                for cwd in new_tabs {
-                    self.new_tab_in(cwd.as_deref());
-                }
+                // `rterm.emit_event` / `rterm.new_tab` migrated to the
+                // PluginCmd channel (EmitEvent / NewTab variants) —
+                // handled in the main command-match block above.
 
                 // Plugin-requested live font-size change.
                 if let Some(size) = self.events.take_pending_font_size() {
@@ -9975,20 +9991,9 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                // Plugin-requested splits with optional cwd override.
-                for (dir_str, cwd) in self.events.drain_pending_splits() {
-                    let dir = match dir_str.as_str() {
-                        "h" | "horizontal" => SplitDir::Horizontal,
-                        "v" | "vertical" => SplitDir::Vertical,
-                        "auto" | "smart" => self.split_auto_direction(),
-                        other => {
-                            tracing::debug!(dir = %other, "rterm.split: unknown direction");
-                            continue;
-                        }
-                    };
-                    self.split_active_pane_in(dir, cwd.as_deref());
-                }
-
+                // `rterm.split` migrated to the PluginCmd channel
+                // (Split variant) — handled in the main command-match
+                // block above.
 
                 // `rterm.kill_pane` / `rterm.kill_tab` migrated to the
                 // PluginCmd channel (KillPane / KillTab variants) —

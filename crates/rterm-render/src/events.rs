@@ -143,12 +143,6 @@ pub trait EventSink: Send + Sync {
     fn take_pending_copy(&self) -> Option<String> {
         None
     }
-    /// Custom events queued by plugins via `rterm.emit_event(name, body)`.
-    /// Each `(name, body)` is re-emitted by the App so registered handlers
-    /// fire as if the event came from a native source.
-    fn drain_pending_custom_events(&self) -> Vec<(String, String)> {
-        Vec::new()
-    }
     /// Latest logical line target from `rterm.scroll_to_line(line)`.
     fn take_pending_scroll_to_line(&self) -> Option<usize> {
         None
@@ -156,17 +150,6 @@ pub trait EventSink: Send + Sync {
     /// Latest `(query, regex_mode)` from `rterm.start_search`.
     fn take_pending_start_search(&self) -> Option<(String, bool)> {
         None
-    }
-    /// Drain new-tab requests from `rterm.new_tab(opt_cwd)`. `None` means
-    /// "use the focused pane's cwd" at apply time.
-    fn drain_pending_new_tabs(&self) -> Vec<Option<String>> {
-        Vec::new()
-    }
-    /// Drain split requests from `rterm.split(dir, opt_cwd)`. Direction is
-    /// one of "h"/"horizontal", "v"/"vertical", "auto"; unknown values
-    /// are ignored.
-    fn drain_pending_splits(&self) -> Vec<(String, Option<String>)> {
-        Vec::new()
     }
     /// Latest absolute font size from `rterm.set_font_size(size)`.
     fn take_pending_font_size(&self) -> Option<f32> {

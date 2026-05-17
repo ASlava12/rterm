@@ -194,13 +194,6 @@ impl EventSink for PluginBridge {
             .and_then(|h| h.take_pending_copy())
     }
 
-    fn drain_pending_custom_events(&self) -> Vec<(String, String)> {
-        self.0
-            .lock()
-            .map(|h| h.drain_pending_custom_events())
-            .unwrap_or_default()
-    }
-
     fn take_pending_scroll_to_line(&self) -> Option<usize> {
         self.0
             .lock()
@@ -213,20 +206,6 @@ impl EventSink for PluginBridge {
             .lock()
             .ok()
             .and_then(|h| h.take_pending_start_search())
-    }
-
-    fn drain_pending_new_tabs(&self) -> Vec<Option<String>> {
-        self.0
-            .lock()
-            .map(|h| h.drain_pending_new_tabs())
-            .unwrap_or_default()
-    }
-
-    fn drain_pending_splits(&self) -> Vec<(String, Option<String>)> {
-        self.0
-            .lock()
-            .map(|h| h.drain_pending_splits())
-            .unwrap_or_default()
     }
 
     fn take_pending_font_size(&self) -> Option<f32> {

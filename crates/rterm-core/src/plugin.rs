@@ -63,4 +63,15 @@ pub enum PluginCmd {
     /// Positive = into history (scroll up); negative = toward live
     /// output (scroll down). Magnitude is in cells.
     Scroll(i32),
+    /// `rterm.new_tab(opt_cwd)` — open a new tab. `None` cwd means
+    /// "use the default" (typically the rterm process's cwd).
+    NewTab(Option<String>),
+    /// `rterm.split(dir, opt_cwd)` — split the focused pane.
+    /// `dir` is `"h" | "horizontal" | "v" | "vertical" | "auto" |
+    /// "smart" | "split"`; unknown values get a debug log and drop.
+    Split(String, Option<String>),
+    /// `rterm.emit_event(name, body)` — re-fire a plugin event on
+    /// the same dispatch loop the App uses for native events.
+    /// `body` is opaque to the plugin host — passed through as-is.
+    EmitEvent(String, String),
 }
