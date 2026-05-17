@@ -2228,9 +2228,19 @@ const NEW_TAB_WIDTH_CELLS: usize = 3;
 /// factors, where the previous 5-cell layout left so much padding
 /// around each glyph that the cluster looked "floating" in the middle
 /// of the header.
-const WINDOW_CONTROL_MIN: &str = " ─ ";
-const WINDOW_CONTROL_MAX: &str = " ▢ ";
-const WINDOW_CONTROL_CLOSE: &str = " ✕ ";
+///
+/// Glyph choice notes: each character is from the BMP and present in
+/// every common monospace face (Consolas / Cascadia Code / Cascadia
+/// Mono on Windows, DejaVu / JetBrains Mono on Linux, Menlo / SF Mono
+/// on macOS). The previous set (`─` U+2500, `▢` U+25A2, `✕` U+2715)
+/// rendered with bad cell-alignment on Windows defaults — `▢` and `✕`
+/// in particular have inconsistent widths/baselines across Cascadia
+/// variants, leaving the icons visibly off-centre inside the cell.
+/// `−` / `□` / `×` are part of Latin-1 supplement / basic geometric
+/// shapes and have uniformly-sized monospace glyphs everywhere.
+const WINDOW_CONTROL_MIN: &str = " − ";
+const WINDOW_CONTROL_MAX: &str = " □ ";
+const WINDOW_CONTROL_CLOSE: &str = " × ";
 const WINDOW_CONTROL_BUTTON_CELLS: usize = 3;
 /// Cells of breathing room rendered as plain strip between adjacent
 /// control chips (visual gap between the three glyphs).
