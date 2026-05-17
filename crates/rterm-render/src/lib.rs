@@ -526,6 +526,14 @@ pub struct TextLayer {
     /// main header text with spaces and hoping cosmic-text's widths
     /// match `unicode_width`.
     header_right_buffer: Buffer,
+    /// Tab-strip glyph buffer. Lives separately from `header_buffer`
+    /// (which carries the hamburger + new-tab chrome that DOESN'T
+    /// scroll) so we can position its TextArea independently and
+    /// have the tab labels physically slide with `tab_scroll_offset`.
+    /// Without this split, scrolling moved the chip-fill quads but
+    /// left the glyph text anchored to the header left — labels and
+    /// chips drifted apart visibly.
+    header_tabs_buffer: Buffer,
     /// Window-title text in the centre of the top-row title bar
     /// (VSCode pattern). Separate from `header_buffer` so its position
     /// can be derived independently of the tab strip's width.
@@ -570,6 +578,33 @@ pub struct HeaderDraw<'a> {
     /// clip falls back to `rect.left + rect.width` (the full header
     /// width — no extra reserve).
     pub right_clip: Option<f32>,
+}
+
+/// Tab-label glyphs rendered as a separate buffer so their horizontal
+/// position can slide with the user's wheel scroll, independent of
+/// the static header chrome (hamburger / new-tab `+`). Without this
+/// split the chip-fill quads moved while the label glyphs stayed
+/// anchored at `header.left`, drifting noticeably as the strip
+/// scrolled.
+pub struct HeaderTabsDraw<'a> {
+    pub spans: SpanList<'a>,
+    /// Pixel x of the left edge of the FIRST tab chip (already
+    /// shifted by `-tab_scroll_offset`).
+    pub left: f32,
+    pub top: f32,
+    /// Layout width the buffer can use before truncation (= the
+    /// strip's visible span between hamburger and the controls
+    /// reserve; `right_clip - left`).
+    pub width: f32,
+    pub height: f32,
+    /// Hard pixel clip on the right — same boundary used by
+    /// `HeaderDraw.right_clip` so labels don't paint over the
+    /// window-control cluster.
+    pub right_clip: f32,
+    /// Hard pixel clip on the LEFT — set to `hamburger_end` so a
+    /// tab that's scrolled off-screen-left doesn't paint over the
+    /// hamburger glyph.
+    pub left_clip: f32,
 }
 
 /// Right-anchored mini-header that paints the window-control glyphs
@@ -789,6 +824,9 @@ impl TextLayer {
         header_buffer.set_wrap(&mut font_system, Wrap::None);
         let mut header_right_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_height));
         header_right_buffer.set_monospace_width(&mut font_system, Some(cell_width));
+        let mut header_tabs_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_height));
+        header_tabs_buffer.set_monospace_width(&mut font_system, Some(cell_width));
+        header_tabs_buffer.set_wrap(&mut font_system, Wrap::None);
         let mut title_bar_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_height));
         title_bar_buffer.set_monospace_width(&mut font_system, Some(cell_width));
         let mut status_bar_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_height));
@@ -807,6 +845,7 @@ impl TextLayer {
             buffers: Vec::new(),
             header_buffer,
             header_right_buffer,
+            header_tabs_buffer,
             title_bar_buffer,
             status_bar_buffer,
             overlay_buffer,
@@ -896,6 +935,7 @@ impl TextLayer {
         for b in [
             &mut self.header_buffer,
             &mut self.header_right_buffer,
+            &mut self.header_tabs_buffer,
             &mut self.title_bar_buffer,
             &mut self.status_bar_buffer,
             &mut self.overlay_buffer,
@@ -955,6 +995,7 @@ impl TextLayer {
         panes: &[PaneDraw<'_>],
         header: Option<&HeaderDraw<'_>>,
         header_right: Option<&HeaderRightDraw<'_>>,
+        header_tabs: Option<&HeaderTabsDraw<'_>>,
         title_bar: Option<&TitleBarDraw<'_>>,
         status_bar: Option<&StatusBarDraw<'_>>,
         overlay: Option<&OverlayDraw<'_>>,
@@ -1021,6 +1062,26 @@ impl TextLayer {
             );
             self.header_buffer.shape_until_scroll(&mut self.font_system, false);
         }
+        if let Some(h) = header_tabs {
+            self.header_tabs_buffer.set_size(
+                &mut self.font_system,
+                Some(h.width.max(1.0)),
+                Some(h.height),
+            );
+            self.header_tabs_buffer.set_rich_text(
+                &mut self.font_system,
+                h.spans.iter().map(|(s, fg, bold)| {
+                    let mut a = default_attrs.color(GlyphColor::rgb(fg[0], fg[1], fg[2]));
+                    if *bold {
+                        a = a.weight(Weight::BOLD);
+                    }
+                    (*s, a)
+                }),
+                default_attrs,
+                Shaping::Advanced,
+            );
+            self.header_tabs_buffer.shape_until_scroll(&mut self.font_system, false);
+        }
 
         self.viewport.update(
             queue,
@@ -1072,6 +1133,26 @@ impl TextLayer {
                     top: h.rect.top as i32,
                     right: right_px,
                     bottom: (h.rect.top + h.rect.height) as i32,
+                },
+                default_color: GlyphColor::rgb(220, 220, 220),
+                custom_glyphs: &[],
+            });
+        }
+        if let Some(h) = header_tabs {
+            // Vertically center the tab labels in the strip — same
+            // offset the static `header_buffer` uses, so the two
+            // rows align on the same baseline.
+            let text_offset = ((h.height - self.line_height) * 0.5).max(0.0);
+            main_areas.push(TextArea {
+                buffer: &self.header_tabs_buffer,
+                left: h.left,
+                top: h.top + text_offset,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: h.left_clip as i32,
+                    top: h.top as i32,
+                    right: h.right_clip as i32,
+                    bottom: (h.top + h.height) as i32,
                 },
                 default_color: GlyphColor::rgb(220, 220, 220),
                 custom_glyphs: &[],
@@ -1628,11 +1709,13 @@ impl GpuState {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         panes: &[PaneDraw<'_>],
         header: Option<&HeaderDraw<'_>>,
         header_right: Option<&HeaderRightDraw<'_>>,
+        header_tabs: Option<&HeaderTabsDraw<'_>>,
         title_bar: Option<&TitleBarDraw<'_>>,
         status_bar: Option<&StatusBarDraw<'_>>,
         overlay: Option<&OverlayDraw<'_>>,
@@ -1666,6 +1749,7 @@ impl GpuState {
             panes,
             header,
             header_right,
+            header_tabs,
             title_bar,
             status_bar,
             overlay,
@@ -4152,18 +4236,15 @@ impl App {
         }
     }
 
-    /// Build the tab-bar text + per-span colour. Active tab is rendered bold
-    /// in a brighter colour; others muted. The search prompt has its own
-    /// bottom bar — the tab strip stays visible during search.
+    /// Build the STATIC header chrome (hamburger only). Tab labels
+    /// live in `header_tabs_spans` and are rendered into a separate
+    /// buffer so they can slide with `tab_scroll_offset` without
+    /// dragging the hamburger glyph along. The hover-URL / cwd hint
+    /// that previously sat to the right of the tab strip is now
+    /// surfaced via the bottom status bar.
     fn header_spans<'a>(&self, storage: &'a mut Vec<String>) -> Vec<(&'a str, [u8; 3], bool)> {
         storage.clear();
-        let muted = palette::default_fg().map(|c| c.saturating_sub(80));
-        let activity_accent: [u8; 3] = [255, 204, 102]; // warm yellow
         let mut spans: Vec<(usize, [u8; 3], bool)> = Vec::new();
-        // Hamburger `≡` button at the very start of the header bar.
-        // Clicking it opens the app menu (a context-menu populated with
-        // every common action). Width pinned to `HAMBURGER_WIDTH_CELLS`
-        // so `tab_hit_at` knows where the tabs actually begin.
         storage.push(HAMBURGER_GLYPH.to_string());
         let hb_color = if self.show_app_menu {
             palette::default_fg()
@@ -4171,6 +4252,24 @@ impl App {
             palette::default_fg().map(|c| c.saturating_sub(40))
         };
         spans.push((storage.len() - 1, hb_color, self.show_app_menu));
+        spans
+            .into_iter()
+            .map(|(idx, color, bold)| (storage[idx].as_str(), color, bold))
+            .collect()
+    }
+
+    /// Build the tab-label text + per-span colour. Active tab is
+    /// rendered bold in a brighter colour; others muted. Lives in a
+    /// dedicated span list so the renderer can shape these into a
+    /// scroll-tracking buffer (see `HeaderTabsDraw`).
+    fn header_tabs_spans<'a>(
+        &self,
+        storage: &'a mut Vec<String>,
+    ) -> Vec<(&'a str, [u8; 3], bool)> {
+        storage.clear();
+        let muted = palette::default_fg().map(|c| c.saturating_sub(80));
+        let activity_accent: [u8; 3] = [255, 204, 102]; // warm yellow
+        let mut spans: Vec<(usize, [u8; 3], bool)> = Vec::new();
         for (i, tab) in self.tabs.iter().enumerate() {
             let info = self.tab_label(i, tab);
             let (active, activity) = (info.active, info.activity);
@@ -4228,38 +4327,6 @@ impl App {
             };
             spans.push((storage.len() - 1, close_color, false));
         }
-        // Reserve the trailing N cells for the `+` new-tab button so
-        // cosmic-text's monospace layout leaves the glyph slot empty —
-        // the `+` itself is drawn as two centered bg quads in
-        // `tab_bar_quads`, sidestepping font-specific glyph centering
-        // drift that the old text-flow approach suffered from.
-        storage.push(" ".repeat(NEW_TAB_WIDTH_CELLS));
-        spans.push((storage.len() - 1, muted, false));
-        // While hovering over a link, surface the URL; otherwise fall back to
-        // the focused pane's cwd as a soft status hint.
-        if let Some(url) = self.hover_url.as_ref() {
-            let trimmed = trim_label(url, 80);
-            storage.push(format!("  🔗 {}", trimmed));
-            let accent: [u8; 3] = [120, 180, 240];
-            spans.push((storage.len() - 1, accent, false));
-        } else if let Some(tab) = self.active_tab() {
-            if let Some(p) = tab.focused_pane() {
-                let cwd = p
-                    .terminal
-                    .lock()
-                    .ok()
-                    .and_then(|t| t.cwd().map(|s| s.to_string()));
-                if let Some(c) = cwd {
-                    let abbreviated = abbreviate_home(&c);
-                    storage.push(format!("  ▸ {}", abbreviated));
-                    spans.push((storage.len() - 1, muted, false));
-                }
-            }
-        }
-        // The scrollback position chip used to render here as
-        // `  ↑ off/total`. Moved to the bottom status bar via
-        // `scroll_status_spans` so it doesn't compete with tab labels
-        // and window controls for the limited top-row real estate.
         spans
             .into_iter()
             .map(|(idx, color, bold)| (storage[idx].as_str(), color, bold))
@@ -10603,6 +10670,9 @@ impl ApplicationHandler for App {
                 let tab_strip_rect_for_draw = self.header_rect();
                 let mut label_storage: Vec<String> = Vec::new();
                 let header_spans = self.header_spans(&mut label_storage);
+                let mut tabs_storage: Vec<String> = Vec::new();
+                let header_tabs_spans = self.header_tabs_spans(&mut tabs_storage);
+                let header_tabs_layout = self.tab_layout();
                 let mut header_right_storage: Vec<String> = Vec::new();
                 let header_right = self.header_right_spans(&mut header_right_storage);
                 // Title bar text is folded back into the single-row
@@ -10816,6 +10886,40 @@ impl ApplicationHandler for App {
                             right_clip: Some(right_clip),
                         }
                     });
+                    // Compute the scroll-aware position of the tab-
+                    // label buffer. `header_tabs_layout` was captured
+                    // before the `&mut state` borrow above.
+                    let header_tabs_draw = tab_strip_rect_for_draw.and_then(|rect| {
+                        let layout = header_tabs_layout.as_ref()?;
+                        let controls_cells = if header_clip_os_decorations {
+                            0.0
+                        } else {
+                            (WINDOW_CONTROLS_WIDTH_CELLS + TAB_CONTROLS_GAP_CELLS)
+                                as f32
+                        };
+                        let right_clip =
+                            rect.left + rect.width - controls_cells * header_clip_cell_w;
+                        // `layout.entries[0].left` is the pixel x of
+                        // the first tab AFTER subtracting the scroll
+                        // offset. Use it directly as the buffer's
+                        // anchor so the glyphs slide in lock-step
+                        // with the chip-fill quads in `tab_bar_quads`.
+                        let first_left = layout
+                            .entries
+                            .first()
+                            .map(|e| e.left as f32)
+                            .unwrap_or(layout.hamburger_end as f32);
+                        let left_clip = layout.hamburger_end as f32;
+                        Some(HeaderTabsDraw {
+                            spans: header_tabs_spans,
+                            left: first_left,
+                            top: rect.top,
+                            width: (right_clip - first_left).max(1.0),
+                            height: rect.height,
+                            right_clip,
+                            left_clip,
+                        })
+                    });
                     let header_right_draw =
                         header_right.map(|(spans, rect)| HeaderRightDraw { spans, rect });
                     let title_bar_draw =
@@ -10953,6 +11057,7 @@ impl ApplicationHandler for App {
                         &draws,
                         header_draw.as_ref(),
                         header_right_draw.as_ref(),
+                        header_tabs_draw.as_ref(),
                         title_bar_draw.as_ref(),
                         status_bar_draw.as_ref(),
                         overlay_draw.as_ref(),
