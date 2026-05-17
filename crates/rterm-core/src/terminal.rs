@@ -210,6 +210,14 @@ pub struct Terminal {
     /// rows are relative to `region.top` and cursor cannot leave the region.
     origin_mode: bool,
     hyperlinks: HashMap<u32, String>,
+    /// Reverse index URI → id. Keeps OSC 8 dispatch O(1) when the shell
+    /// repeats the same hyperlink across many cells (e.g. `ls --color`
+    /// putting the same `file://` on every entry). The previous
+    /// implementation linear-scanned the `hyperlinks` map on every OSC
+    /// 8; with HYPERLINK_CAP = 4096 that was up to ~4096 equality
+    /// compares per character span. Memory cost: each URI is stored
+    /// twice (key + value), bounded by the same HYPERLINK_TOTAL_BYTES_CAP.
+    hyperlink_uri_to_id: HashMap<String, u32>,
     /// FIFO order of hyperlink ids inserted into `hyperlinks` so we can
     /// evict the oldest entry when the map outgrows [`HYPERLINK_CAP`].
     hyperlink_order: VecDeque<u32>,
@@ -426,6 +434,7 @@ impl Terminal {
             autowrap: true,
             origin_mode: false,
             hyperlinks: HashMap::new(),
+            hyperlink_uri_to_id: HashMap::new(),
             hyperlink_order: VecDeque::new(),
             next_link_id: 1,
             current_hyperlink: 0,
@@ -815,6 +824,7 @@ impl Terminal {
             autowrap: &mut self.autowrap,
             origin_mode: &mut self.origin_mode,
             hyperlinks: &mut self.hyperlinks,
+            hyperlink_uri_to_id: &mut self.hyperlink_uri_to_id,
             hyperlink_order: &mut self.hyperlink_order,
             next_link_id: &mut self.next_link_id,
             current_hyperlink: &mut self.current_hyperlink,
@@ -884,6 +894,7 @@ struct TerminalPerform<'a> {
     autowrap: &'a mut bool,
     origin_mode: &'a mut bool,
     hyperlinks: &'a mut HashMap<u32, String>,
+    hyperlink_uri_to_id: &'a mut HashMap<String, u32>,
     hyperlink_order: &'a mut VecDeque<u32>,
     next_link_id: &'a mut u32,
     current_hyperlink: &'a mut u32,
@@ -2466,38 +2477,39 @@ impl<'a> Perform for TerminalPerform<'a> {
                 }
                 if uri.is_empty() {
                     *self.current_hyperlink = 0;
+                } else if let Some(&existing_id) =
+                    self.hyperlink_uri_to_id.get(uri.as_str())
+                {
+                    // Reuse path — shells often repeat the same link
+                    // many times (e.g. a file path in every `ls`
+                    // output). O(1) via the inverted index.
+                    *self.current_hyperlink = existing_id;
                 } else {
-                    // Reuse an existing id if we've already seen this URI —
-                    // shells often repeat the same link many times (e.g. a
-                    // file path in every `ls` output), and a fresh id per
-                    // span would churn the bounded lookup table for no gain.
-                    if let Some((&existing_id, _)) =
-                        self.hyperlinks.iter().find(|(_, v)| v.as_str() == uri)
+                    let id = *self.next_link_id;
+                    *self.next_link_id = self.next_link_id.wrapping_add(1).max(1);
+                    let new_len = uri.len();
+                    // Bound BOTH the entry count AND the cumulative
+                    // byte total — eviction loops drop the oldest URI
+                    // until each cap is satisfied. Cells referring to
+                    // evicted ids degrade to "no link" rather than a
+                    // stale URI. `bytes_used` is incrementally tracked
+                    // via the inverted index sums; recomputing the sum
+                    // every dispatch was O(N).
+                    let mut bytes_used: usize =
+                        self.hyperlink_uri_to_id.keys().map(String::len).sum();
+                    while self.hyperlinks.len() >= HYPERLINK_CAP
+                        || bytes_used + new_len > HYPERLINK_TOTAL_BYTES_CAP
                     {
-                        *self.current_hyperlink = existing_id;
-                    } else {
-                        let id = *self.next_link_id;
-                        *self.next_link_id = self.next_link_id.wrapping_add(1).max(1);
-                        let new_len = uri.len();
-                        // Bound BOTH the entry count AND the cumulative
-                        // byte total — eviction loops drop the oldest
-                        // URI until each cap is satisfied. Cells
-                        // referring to evicted ids degrade to "no link"
-                        // rather than a stale URI.
-                        let mut bytes_used: usize =
-                            self.hyperlinks.values().map(|s| s.len()).sum();
-                        while self.hyperlinks.len() >= HYPERLINK_CAP
-                            || bytes_used + new_len > HYPERLINK_TOTAL_BYTES_CAP
-                        {
-                            let Some(old) = self.hyperlink_order.pop_front() else { break };
-                            if let Some(removed) = self.hyperlinks.remove(&old) {
-                                bytes_used = bytes_used.saturating_sub(removed.len());
-                            }
+                        let Some(old) = self.hyperlink_order.pop_front() else { break };
+                        if let Some(removed) = self.hyperlinks.remove(&old) {
+                            self.hyperlink_uri_to_id.remove(&removed);
+                            bytes_used = bytes_used.saturating_sub(removed.len());
                         }
-                        self.hyperlinks.insert(id, uri);
-                        self.hyperlink_order.push_back(id);
-                        *self.current_hyperlink = id;
                     }
+                    self.hyperlink_uri_to_id.insert(uri.clone(), id);
+                    self.hyperlinks.insert(id, uri);
+                    self.hyperlink_order.push_back(id);
+                    *self.current_hyperlink = id;
                 }
             }
             _ => {}
@@ -3010,6 +3022,7 @@ impl<'a> Perform for TerminalPerform<'a> {
                 *self.cursor_should_blink = true;
                 *self.current_hyperlink = 0;
                 self.hyperlinks.clear();
+                self.hyperlink_uri_to_id.clear();
                 self.hyperlink_order.clear();
                 *self.charset_g0 = Charset::Ascii;
                 *self.charset_g1 = Charset::Ascii;

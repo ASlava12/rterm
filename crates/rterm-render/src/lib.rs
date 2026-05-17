@@ -9796,7 +9796,27 @@ fn clipboard_set(text: &str) {
                 }
                 g.take().unwrap_or_default()
             };
-            let Ok(mut cb) = arboard::Clipboard::new() else { continue };
+            let mut cb = match arboard::Clipboard::new() {
+                Ok(cb) => cb,
+                Err(e) => {
+                    // We already took `text` out of the slot. Surface
+                    // the failure — silently dropping the user's copy
+                    // because the display server connection refused
+                    // would otherwise look like the keystroke had no
+                    // effect. Truncate the dropped payload to avoid
+                    // logging a megabyte selection at warn level.
+                    let preview_len = text.chars().take(80).count();
+                    let preview: String = text.chars().take(preview_len).collect();
+                    let elided = if text.chars().nth(80).is_some() { "…" } else { "" };
+                    tracing::warn!(
+                        error = %e,
+                        dropped_bytes = text.len(),
+                        preview = %format!("{preview}{elided}"),
+                        "clipboard owner: Clipboard::new() failed; dropping queued copy",
+                    );
+                    continue;
+                }
+            };
             // wait() blocks until another client takes the selection.
             // While we block here, fresh `clipboard_set` calls keep
             // overwriting `pending` — the next loop iteration will
