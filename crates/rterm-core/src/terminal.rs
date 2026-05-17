@@ -36,9 +36,11 @@ fn decode_hex_ascii(s: &str) -> Option<String> {
 /// Encode an ASCII string as upper-case hex pairs. Counterpart to
 /// `decode_hex_ascii`; used for XTGETTCAP reply values.
 fn encode_hex_ascii(s: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(s.len() * 2);
     for &b in s.as_bytes() {
-        out.push_str(&format!("{:02X}", b));
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
     }
     out
 }
@@ -5444,5 +5446,44 @@ mod tests {
         let row = t.grid().row(0).unwrap();
         assert_eq!(row[0].ch, 'a');
         assert!(row[0].attrs.contains(CellAttrs::BOLD));
+    }
+
+    #[test]
+    fn encode_hex_ascii_uses_uppercase_pairs_and_handles_empty() {
+        // Pin the format that XTGETTCAP replies depend on: every byte
+        // becomes exactly two upper-case hex digits, in big-endian
+        // nibble order. Sourced from RFC 4648 §8 but more practically
+        // from what xterm expects in the field.
+        assert_eq!(encode_hex_ascii(""), "");
+        assert_eq!(encode_hex_ascii("TN"), "544E");
+        assert_eq!(encode_hex_ascii("rterm"), "7274 65726D".replace(' ', ""));
+        // 0x00 and 0x7f are the ASCII range edges; pin the
+        // big-endian-nibble formatting for both.
+        assert_eq!(encode_hex_ascii("\x00\x7f"), "007F");
+    }
+
+    #[test]
+    fn decode_hex_ascii_round_trips_with_encode_for_nonempty() {
+        // The decode side is more permissive (lower- AND upper-case
+        // hex digits) but for any non-empty input the round trip
+        // encode → decode must reproduce the original ASCII bytes.
+        // This pins the contract XTGETTCAP relies on: send cap "TN"
+        // → reply hex "544E" → the requesting client decodes "TN"
+        // back. Empty input is special: encode returns "" and decode
+        // treats that as "no payload" → None; tested separately below.
+        for s in ["TN", "rterm", "ABCdef0123", "  ", "\x01\x7f"] {
+            let hex = encode_hex_ascii(s);
+            assert_eq!(decode_hex_ascii(&hex).as_deref(), Some(s), "round-trip {s:?}");
+        }
+        // Mixed case input still decodes — the encoder uses upper,
+        // but the decoder tolerates lower-case digits some clients
+        // send (e.g. older XTGETTCAP implementations).
+        assert_eq!(decode_hex_ascii("544e").as_deref(), Some("TN"));
+        // Malformed → None. The XTGETTCAP dispatcher relies on this:
+        // a malformed cap hex falls through to the "unknown cap" reply
+        // instead of panicking on a hostile shell-supplied payload.
+        assert!(decode_hex_ascii("ABC").is_none(), "odd length must fail");
+        assert!(decode_hex_ascii("ZZ").is_none(), "non-hex digits must fail");
+        assert!(decode_hex_ascii("").is_none(), "empty input rejected");
     }
 }
