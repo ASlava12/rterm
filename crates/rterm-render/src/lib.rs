@@ -5611,7 +5611,16 @@ impl App {
             state.window.set_title(&self.title);
             return;
         }
-        let tab = self.active_tab().expect("tab guarded above");
+        // `active_tab()` should be `Some` after the empty guard above,
+        // but a stale `self.active_tab` index (set by a bug elsewhere)
+        // would still return `None` and the original `.expect` would
+        // panic. Take the first tab as a last-resort fallback — the
+        // title may be slightly stale for one frame but the window
+        // stays up.
+        let Some(tab) = self.active_tab().or_else(|| self.tabs.first()) else {
+            state.window.set_title(&self.title);
+            return;
+        };
         let pane_title = tab
             .focused_pane()
             .map(|p| p.display_title())
@@ -12200,11 +12209,29 @@ impl ApplicationHandler for App {
                         state.window.request_redraw();
                         return;
                     };
-                    let guards: Vec<_> = tab
+                    // If a pane's terminal mutex is poisoned (PTY reader
+                    // or plugin host panicked with it held), skip the
+                    // whole frame and request another redraw. The
+                    // App-level prune path runs the next tick and reaps
+                    // the dead pane via its `alive` flag; rendering
+                    // half the panes is jarring, and panicking here
+                    // takes the whole window down for a bug confined
+                    // to one pane. Symmetric with `spawn_reader_thread`.
+                    let guards: Vec<_> = match tab
                         .panes()
                         .iter()
-                        .map(|p| p.terminal.lock().expect("terminal mutex poisoned"))
-                        .collect();
+                        .map(|p| p.terminal.lock())
+                        .collect::<Result<Vec<_>, _>>()
+                    {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(
+                                "render skipped: terminal mutex poisoned: {e}",
+                            );
+                            state.window.request_redraw();
+                            return;
+                        }
+                    };
                     let sel_normalized = self.selection.map(|s| (s.pane_idx, s.normalized()));
                     // While searching, the active match takes priority over
                     // any user-drawn selection.

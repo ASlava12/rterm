@@ -109,7 +109,11 @@ impl Pty {
     }
 
     pub fn try_clone_reader(&self) -> Result<Box<dyn std::io::Read + Send>> {
-        let master = self.master.lock().unwrap();
+        // Use the same `expect("...poisoned")` label as `write_input` /
+        // `resize` for consistent panic messages — caller is the App's
+        // pane-spawn path, where a poisoned master mutex means the PTY
+        // is unusable anyway.
+        let master = self.master.lock().expect("pty master mutex poisoned");
         master.try_clone_reader().context("clone reader")
     }
 
