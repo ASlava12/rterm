@@ -100,25 +100,39 @@ impl App {
     /// `full` and warns once for `bottom`. X11 / Win32 / macOS honour
     /// `set_outer_position` and the window lands on the requested edge.
     pub(crate) fn toggle_guake(&mut self) {
+        // Binding fired → user wants the drop-down. Two previous
+        // iterations of this code gated everything behind
+        // `[guake] enabled = true`, which meant first-time users
+        // bound the action, pressed the key, saw nothing happen, and
+        // had to dig through `RUST_LOG=info` to find the hint. Now
+        // we honour the action unconditionally and fall back to
+        // sensible defaults when `[guake]` is absent / disabled —
+        // the flag becomes "use the [guake]-section settings from
+        // config" rather than a hard gate.
         let cfg = match &self.guake {
             Some(c) if c.enabled => c.clone(),
-            _ => {
-                // User-facing UX gap: if a binding fires `toggle_guake`
-                // while `[guake]` is disabled, the previous behaviour
-                // was a silent `debug!` (invisible at the default
-                // RUST_LOG=info), so the user pressed the key, nothing
-                // happened, and there was no signal that the action
-                // was being intentionally dropped. Move the diagnostic
-                // up to `info!` so a default-verbosity run surfaces
-                // it, and fire a `guake.disabled` plugin event so a
-                // Lua plugin can convert it into a toast / settings-
-                // overlay nudge / desktop notification on demand.
+            Some(c) => {
                 tracing::info!(
-                    "toggle_guake: [guake] enabled = false — set it to \
-                     true in config.toml to use the action",
+                    "toggle_guake: [guake] enabled = false — running anyway \
+                     with the [guake]-section layout; set enabled = true \
+                     to silence this message",
                 );
                 self.events.emit("guake.disabled", "");
-                return;
+                crate::GuakeRunConfig { enabled: true, ..c.clone() }
+            }
+            None => {
+                tracing::info!(
+                    "toggle_guake: no [guake] section in config — using \
+                     defaults (position = top, height = 50%, width = 100%)",
+                );
+                self.events.emit("guake.disabled", "");
+                crate::GuakeRunConfig {
+                    enabled: true,
+                    position: "top".to_string(),
+                    height_pct: 50,
+                    width_pct: 100,
+                    global_hotkey: String::new(),
+                }
             }
         };
         let Some(state) = self.state.as_ref() else { return };

@@ -49,7 +49,13 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GuakeConfig {
-    /// Master toggle. `false` (default) makes `toggle_guake` a no-op.
+    /// When `true`, `toggle_guake` runs without a warning. When
+    /// `false` (the default), the action still runs the first time it
+    /// is invoked but the renderer logs one `info!` line nudging the
+    /// user to flip the flag — this preserves the explicit opt-in
+    /// signal without leaving a bound action silently no-op'd. The
+    /// `[guake]` layout settings (`position`, `height_pct`,
+    /// `width_pct`, `global_hotkey`) are honoured regardless.
     pub enabled: bool,
     /// Which edge the dropped window anchors to. `"top"` (default),
     /// `"bottom"`, or `"full"` (full-screen overlay).

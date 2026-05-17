@@ -1435,17 +1435,21 @@ fn run_gui(
         on_theme_change,
         os_decorations: config.window.os_decorations,
         allow_osc52: config.terminal.allow_osc52,
-        guake: if config.guake.enabled {
-            Some(rterm_render::GuakeRunConfig {
-                enabled: true,
-                position: config.guake.position.clone(),
-                height_pct: config.guake.height_pct,
-                width_pct: config.guake.width_pct,
-                global_hotkey: config.guake.global_hotkey.clone(),
-            })
-        } else {
-            None
-        },
+        // Pass the [guake] snapshot through unconditionally. The
+        // renderer's `toggle_guake` now honours the action regardless
+        // of `enabled`, so withholding the user's `[guake]`-section
+        // settings here would strand them on hardcoded defaults
+        // whenever they bound the action without flipping the flag.
+        // The renderer still distinguishes "enabled = true" (silent
+        // use) from "enabled = false" (one-time info log on first
+        // press) so it stays an opt-in signal.
+        guake: Some(rterm_render::GuakeRunConfig {
+            enabled: config.guake.enabled,
+            position: config.guake.position.clone(),
+            height_pct: config.guake.height_pct,
+            width_pct: config.guake.width_pct,
+            global_hotkey: config.guake.global_hotkey.clone(),
+        }),
     })
 }
 

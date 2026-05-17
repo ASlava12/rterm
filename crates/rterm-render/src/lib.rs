@@ -2518,7 +2518,10 @@ pub enum UserEvent {
 /// config crate.
 #[derive(Debug, Clone)]
 pub struct GuakeRunConfig {
-    /// Master toggle. When `false`, `toggle_guake` is a no-op.
+    /// Opt-in signal. When `true`, `toggle_guake` runs silently.
+    /// When `false`, the action still runs but the renderer logs an
+    /// `info!` line on the first invocation — preserves the
+    /// `enabled = true` cue without leaving a bound action no-op'd.
     pub enabled: bool,
     /// `"top"` | `"bottom"` | `"full"`. Other values fall back to
     /// `"top"`.

@@ -179,9 +179,15 @@ theme = ""
 # `enabled = false` mid-session also drops any AlwaysOnTop level the
 # renderer had applied during a prior drop.
 [guake]
-# enabled — master toggle.
+# enabled — opt-in flag. When false (the default), the first
+# `toggle_guake` invocation still runs but the renderer logs a
+# one-time `info!` line so users who bound the action via
+# `[[keybindings]]` see why nothing else changed. Flip to true to
+# silence that message. The layout settings below
+# (`position`, `height_pct`, `width_pct`, `global_hotkey`) are
+# honoured regardless.
 #   Type:   bool.
-#   Default: false (`toggle_guake` is a no-op).
+#   Default: false.
 enabled = false
 # position — edge the dropped window anchors to.
 #   Type:   one of "top" | "bottom" | "full". On Wayland the compositor
