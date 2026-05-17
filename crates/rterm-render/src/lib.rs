@@ -982,9 +982,23 @@ impl TextLayer {
         }
 
         if let Some(h) = header {
+            // Sized to the CLIPPED width (right_clip - rect.left)
+            // rather than the full header rect. Without this cosmic-
+            // text uses the buffer width as its wrap boundary —
+            // when the combined tab labels are longer than the
+            // window-controls reserve allows, the overflow wraps
+            // onto a phantom second row visible below the tab strip.
+            // Setting `set_size` to the clipped width tells cosmic-
+            // text the actual horizontal budget so it truncates
+            // (with `right_clip` doing the final pixel-level clip
+            // for stragglers that round up at glyph edges).
+            let clip_w = h
+                .right_clip
+                .map(|r| (r - h.rect.left).max(0.0))
+                .unwrap_or(h.rect.width);
             self.header_buffer.set_size(
                 &mut self.font_system,
-                Some(h.rect.width),
+                Some(clip_w),
                 Some(h.rect.height),
             );
             self.header_buffer.set_rich_text(
