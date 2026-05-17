@@ -2035,7 +2035,7 @@ impl<'a> Perform for TerminalPerform<'a> {
             }
             // OSC 10 / 11 — query default fg / bg colour. Format: "?" as
             // payload → respond with `rgb:RRRR/GGGG/BBBB` (16-bit channels).
-            "10" if params.get(1).map(|p| p == b"?").unwrap_or(false) => {
+            "10" if params.get(1).is_some_and(|p| p == b"?") => {
                 let s = format!(
                     "\x1b]10;rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x1b\\",
                     self.default_fg_rgb[0], self.default_fg_rgb[0],
@@ -2044,7 +2044,7 @@ impl<'a> Perform for TerminalPerform<'a> {
                 );
                 self.osc_responses.push_back(s);
             }
-            "11" if params.get(1).map(|p| p == b"?").unwrap_or(false) => {
+            "11" if params.get(1).is_some_and(|p| p == b"?") => {
                 let s = format!(
                     "\x1b]11;rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x1b\\",
                     self.default_bg_rgb[0], self.default_bg_rgb[0],
@@ -2071,7 +2071,7 @@ impl<'a> Perform for TerminalPerform<'a> {
             }
             // OSC 12 — query the cursor colour. Falls back to default fg
             // (xterm convention) when no explicit cursor colour is set.
-            "12" if params.get(1).map(|p| p == b"?").unwrap_or(false) => {
+            "12" if params.get(1).is_some_and(|p| p == b"?") => {
                 let [r, g, b] = self.cursor_rgb.unwrap_or(*self.default_fg_rgb);
                 let s = format!(
                     "\x1b]12;rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x1b\\",

@@ -3133,7 +3133,7 @@ impl PluginHost {
                     // status-line plugin signal ("vim is open, dim my
                     // git indicator" / "shell prompt, show command
                     // history"). False when no pane is focused.
-                    let focused_alt = focused_pane.map(|p| p.alt_screen).unwrap_or(false);
+                    let focused_alt = focused_pane.is_some_and(|p| p.alt_screen);
                     t.set("alt_screen", focused_alt)?;
                 }
                 Ok(t)
@@ -3596,7 +3596,7 @@ impl PluginHost {
                         }
                     }
                     if let Some(q) = cwd_q.as_deref() {
-                        if !p.cwd.as_deref().map(|c| matches(c, q)).unwrap_or(false) {
+                        if !p.cwd.as_deref().is_some_and(|c| matches(c, q)) {
                             return false;
                         }
                     }
