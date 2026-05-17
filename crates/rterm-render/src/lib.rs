@@ -24,8 +24,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use glyphon::{
-    Attrs, Buffer, Cache, Color as GlyphColor, Family, FontSystem, Metrics, Resolution, Shaping,
-    Style, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
+    cosmic_text::Wrap, Attrs, Buffer, Cache, Color as GlyphColor, Family, FontSystem, Metrics,
+    Resolution, Shaping, Style, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer,
+    Viewport, Weight,
 };
 use rterm_core::{Cell, CellAttrs, Color as TermColor, MouseTracking, Size as TermSize, Terminal};
 
@@ -781,6 +782,11 @@ impl TextLayer {
 
         let mut header_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_height));
         header_buffer.set_monospace_width(&mut font_system, Some(cell_width));
+        // Header is strictly single-line — disable cosmic-text's
+        // default Word/Glyph wrap so overflow beyond the clipped
+        // buffer width doesn't spawn a phantom second row underneath
+        // the tab strip.
+        header_buffer.set_wrap(&mut font_system, Wrap::None);
         let mut header_right_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_height));
         header_right_buffer.set_monospace_width(&mut font_system, Some(cell_width));
         let mut title_bar_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_height));
