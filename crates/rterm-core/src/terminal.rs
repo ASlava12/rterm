@@ -86,16 +86,31 @@ pub fn is_safe_url(s: &str) -> bool {
     // (cmd.exe `start`, older xterm-style scripts) preserve upper /
     // mixed case. The whitelist itself stays the canonical lower form.
     if let Some(scheme_end) = s.find("://") {
+        // `find("://")` returns a byte index at a UTF-8 boundary
+        // (the matched substring is pure ASCII), so this slice is
+        // always safe even when `s` contains multi-byte text after
+        // the scheme.
         let scheme = &s[..scheme_end];
         return ["http", "https", "ftp", "ssh"]
             .iter()
             .any(|allowed| scheme.eq_ignore_ascii_case(allowed));
     }
     // `mailto:` (no `://`) — match the literal scheme case-insensitively
-    // by slicing after the first colon when the prefix matches in ASCII.
-    let mailto = "mailto:";
-    if s.len() >= mailto.len() && s[..mailto.len()].eq_ignore_ascii_case(mailto) {
-        return s[mailto.len()..].contains('@');
+    // on the underlying ASCII bytes so we don't accidentally slice into
+    // a multi-byte char. The auto-URL detector hands every cell run that
+    // looks vaguely URL-shaped to this function, including pure Cyrillic
+    // / CJK text where the first 7 bytes can span a char boundary —
+    // a plain `s[..7].eq_ignore_ascii_case("mailto:")` panicked there.
+    const MAILTO: &[u8] = b"mailto:";
+    if s.len() >= MAILTO.len()
+        && s.as_bytes()[..MAILTO.len()]
+            .iter()
+            .zip(MAILTO)
+            .all(|(have, want)| have.eq_ignore_ascii_case(want))
+    {
+        // MAILTO is ASCII, so the byte index is always at a UTF-8
+        // boundary — slicing the rest is safe.
+        return s[MAILTO.len()..].contains('@');
     }
     false
 }
@@ -4269,6 +4284,25 @@ mod tests {
         assert!(is_safe_url("ftp://files.example.org/"));
         assert!(is_safe_url("ssh://user@host"));
         assert!(is_safe_url("mailto:alice@example.org"));
+    }
+
+    #[test]
+    fn is_safe_url_handles_multibyte_input_without_panic() {
+        // Regression: the auto-URL detector calls `is_safe_url` on any
+        // word the user hovers over, including pure Cyrillic / CJK
+        // text. A previous case-insensitive `mailto:` check sliced
+        // `s[..7]`, which panicked when the first seven bytes spanned
+        // a multi-byte UTF-8 character (e.g. `защищены`: 'и' is bytes
+        // 6..8, so the boundary at 7 lands mid-character).
+        assert!(!is_safe_url("защищены"));
+        assert!(!is_safe_url("日本語のテキスト"));
+        // Strings shorter than `mailto:` also must not panic.
+        assert!(!is_safe_url("ма"));
+        assert!(!is_safe_url("a"));
+        assert!(!is_safe_url(""));
+        // A real mailto with non-ASCII local part still passes — the
+        // scheme is pure ASCII so the slice stays UTF-8 safe.
+        assert!(is_safe_url("MAILTO:user@xn--n3h.example"));
     }
 
     #[test]
