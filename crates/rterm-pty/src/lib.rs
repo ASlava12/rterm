@@ -157,9 +157,21 @@ impl PtyControl {
     /// on platforms / backends that don't implement
     /// `MasterPty::process_group_leader` (notably Windows + ConPTY). Cheap
     /// (one ioctl on Unix); safe to call per-frame from the render loop.
+    #[cfg(unix)]
     pub fn foreground_pgid(&self) -> Option<u32> {
         let master = self.master.lock().ok()?;
         master.process_group_leader().and_then(|p| u32::try_from(p).ok())
+    }
+    /// Windows / ConPTY has no `process_group_leader` concept — there's
+    /// no foreground-pgrp on the PTY master side. Return `None` so the
+    /// fallback path (parse `tasklist` / look at `child.pid`) kicks in
+    /// at the caller. portable-pty 0.8 doesn't gate the trait method
+    /// `cfg(unix)`-only — the method just doesn't exist on the Windows
+    /// `MasterPty` impl, which makes a single cross-platform call
+    /// fail to compile on Windows.
+    #[cfg(not(unix))]
+    pub fn foreground_pgid(&self) -> Option<u32> {
+        None
     }
 }
 
