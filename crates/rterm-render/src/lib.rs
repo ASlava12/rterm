@@ -127,6 +127,33 @@ impl StyleKey {
 /// only when `focused` AND `offset == 0` AND the terminal has cursor visible
 /// AND `blink_on` (or the cursor is "steady"). Glyph inversion is applied
 /// only for the Block cursor shape; thin shapes draw on top of the glyph.
+/// Where `query.truncate(...)` should land so that a readline-style
+/// Ctrl+W (delete-the-trailing-word) drops just the last word from
+/// `query`. Returns a byte index that is always on a UTF-8 char
+/// boundary.
+///
+/// Algorithm: trim trailing whitespace (a Ctrl+W on `"foo bar  "`
+/// deletes `bar`, not the empty word after the spaces), then find the
+/// last whitespace char in what's left and keep everything up to and
+/// including that whitespace. If no whitespace remains the whole
+/// query is dropped.
+///
+/// Subtlety: `rfind` returns the byte index of the *first byte* of
+/// the matched whitespace char, and `char::is_whitespace` matches
+/// every Unicode whitespace — including multi-byte ones like NBSP
+/// (U+00A0, 2 bytes) or U+3000 (3 bytes). The old code used `i + 1`,
+/// which on NBSP landed inside the char and made `String::truncate`
+/// panic. `rmatch_indices` hands us the matched substring so its byte
+/// length is exact.
+fn word_back_delete_index(query: &str) -> usize {
+    let trimmed = query.trim_end();
+    trimmed
+        .rmatch_indices(char::is_whitespace)
+        .next()
+        .map(|(i, m)| i + m.len())
+        .unwrap_or(0)
+}
+
 /// Map an unbright named colour to its bright variant. Caller has already
 /// confirmed the input is one of `Black..=White` (indices 0..=7).
 fn brighten_named(n: rterm_core::NamedColor) -> rterm_core::NamedColor {
@@ -7873,14 +7900,7 @@ impl App {
                     }
                     "w" => {
                         if let Some(s) = self.search.as_mut() {
-                            // Trim trailing whitespace, then trim a run of
-                            // non-whitespace word chars.
-                            let trimmed = s.query.trim_end();
-                            let drop_from = trimmed
-                                .rfind(char::is_whitespace)
-                                .map(|i| i + 1)
-                                .unwrap_or(0);
-                            s.query.truncate(drop_from);
+                            s.query.truncate(word_back_delete_index(&s.query));
                         }
                         self.refresh_matches();
                         return;
@@ -11710,6 +11730,54 @@ mod tests {
         }
         // And the names list must cover every variant.
         assert_eq!(names.len(), actions.len(), "names list size mismatch");
+    }
+
+    #[test]
+    fn word_back_delete_index_basic_ascii() {
+        // `"foo bar"` + Ctrl+W → drop `bar`, keep `"foo "`.
+        assert_eq!(word_back_delete_index("foo bar"), 4);
+        // Trailing whitespace is trimmed FIRST, so `"foo bar  "` still
+        // drops `bar` and lands at the trailing space's position.
+        assert_eq!(word_back_delete_index("foo bar  "), 4);
+        // No whitespace → whole query is dropped.
+        assert_eq!(word_back_delete_index("foobar"), 0);
+        // Empty stays empty.
+        assert_eq!(word_back_delete_index(""), 0);
+        // Single word with trailing whitespace → drop the word.
+        assert_eq!(word_back_delete_index("hello   "), 0);
+    }
+
+    #[test]
+    fn word_back_delete_index_respects_multibyte_whitespace() {
+        // Regression: `char::is_whitespace` matches Unicode whitespace
+        // (NBSP U+00A0 is 2 bytes, ideographic space U+3000 is 3
+        // bytes). The old `i + 1` indexed one byte past the first
+        // byte of the matched whitespace, which on NBSP landed
+        // *inside* the char and made `String::truncate` panic at
+        // runtime. The new implementation hands back a byte index
+        // that is always on a UTF-8 char boundary.
+        //
+        // `"foo\u{00A0}bar"` → drop `bar`, keep `"foo<NBSP>"` = 5 bytes.
+        let q = "foo\u{00A0}bar";
+        let idx = word_back_delete_index(q);
+        assert_eq!(idx, 5);
+        // The returned index must be a real char boundary on every
+        // path — String::truncate would panic otherwise.
+        assert!(q.is_char_boundary(idx));
+
+        // Ideographic space (3 bytes).
+        let q = "foo\u{3000}bar";
+        let idx = word_back_delete_index(q);
+        assert_eq!(idx, 6);
+        assert!(q.is_char_boundary(idx));
+
+        // Multi-byte word chars on the *non-whitespace* side, ASCII
+        // whitespace between → keep CJK prefix + the space.
+        let q = "日本 語";
+        let idx = word_back_delete_index(q);
+        assert!(q.is_char_boundary(idx));
+        // "日本" = 6 bytes, " " = 1 byte → idx = 7.
+        assert_eq!(idx, 7);
     }
 
     #[test]
