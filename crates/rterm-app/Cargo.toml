@@ -17,6 +17,7 @@ rterm-pty = { workspace = true }
 rterm-config = { workspace = true }
 rterm-plugin = { workspace = true }
 rterm-render = { workspace = true }
+rterm-history = { workspace = true }
 
 anyhow = { workspace = true }
 arboard = { workspace = true }

@@ -9,6 +9,7 @@ pub mod events;
 pub use events::{EventSink, NullSink};
 mod clipboard;
 use clipboard::clipboard_set;
+mod command_capture;
 mod global_hotkey;
 mod keybind;
 mod layout;
@@ -2018,6 +2019,12 @@ pub struct Pane {
     pub last_foreground_process: Mutex<Option<String>>,
     #[allow(dead_code)]
     keepalive: Box<dyn std::any::Any + Send>,
+    /// Per-pane command-line accumulator. Receives every byte we
+    /// write to the PTY via `send_input`, peels off ESC sequences /
+    /// control bytes, and records cleaned commands into the shared
+    /// `History` store on each `\r` / `\n`. `None` when the App was
+    /// built without a history (tests, `--smoke`).
+    pub(crate) command_capture: command_capture::CommandCapture,
 }
 
 /// Monotonic source for `Pane::uid`. Starts at 1 so `0` can serve as a
@@ -2027,6 +2034,11 @@ pub struct Pane {
 static PANE_UID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Pane {
+    // Builder pattern would be cleaner, but the call sites are
+    // contained (one in App, one in tests) and the eight arguments
+    // are each load-bearing distinct types — collapsing into a
+    // struct just shifts the noise around.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         terminal: SharedTerminal,
         io: Arc<dyn TerminalIo>,
@@ -2035,6 +2047,7 @@ impl Pane {
         activity: Arc<AtomicBool>,
         last_output_ms: Arc<AtomicU64>,
         keepalive: Box<dyn std::any::Any + Send>,
+        history: Option<Arc<Mutex<rterm_history::History>>>,
     ) -> Self {
         let mut uid = PANE_UID_COUNTER.fetch_add(1, Ordering::Relaxed);
         if uid == 0 {
@@ -2066,7 +2079,17 @@ impl Pane {
             progress: Mutex::new(None),
             last_foreground_process: Mutex::new(None),
             keepalive,
+            command_capture: command_capture::CommandCapture::new(history),
         }
+    }
+
+    /// Write `bytes` to the pane's PTY *and* feed them through the
+    /// per-pane command-history capture. Replaces direct
+    /// `pane.send_input(...)` calls so we record what the user
+    /// types without scattering capture hooks across the renderer.
+    pub(crate) fn send_input(&self, bytes: &[u8]) {
+        self.command_capture.feed(bytes);
+        self.io.write_input(bytes);
     }
 
     /// Display title resolution, in priority order:
@@ -6153,7 +6176,7 @@ impl App {
         if let Some(pane) = self.active_tab().and_then(|t| t.pane_at(i)) {
             if let Some((_mode, sgr)) = mouse_mode_for(pane) {
                 let bytes = encode_mouse(sgr, 0, p.col, p.row, true);
-                pane.io.write_input(&bytes);
+                pane.send_input(&bytes);
                 self.mouse_pty_pane = Some(i);
                 self.selection = None;
                 return false;
@@ -6365,7 +6388,7 @@ impl App {
                         if let Some(p) = self.pixel_to_cell(i, x, y) {
                             // Button 0 (left) with +32 motion bit.
                             let bytes = encode_mouse(sgr, 32, p.col, p.row, true);
-                            pane.io.write_input(&bytes);
+                            pane.send_input(&bytes);
                         }
                     }
                 }
@@ -6477,7 +6500,7 @@ impl App {
                 if let Some((_mode, sgr)) = mouse_mode_for(pane) {
                     if let Some(p) = self.pixel_to_cell(i, self.cursor_pos.x, self.cursor_pos.y) {
                         let bytes = encode_mouse(sgr, 0, p.col, p.row, false);
-                        pane.io.write_input(&bytes);
+                        pane.send_input(&bytes);
                     }
                 }
             }
@@ -7644,7 +7667,7 @@ impl App {
             let button = if step > 0 { 64 } else { 65 };
             for _ in 0..step.unsigned_abs() {
                 let bytes = encode_mouse(sgr, button, p.col, p.row, true);
-                pane.io.write_input(&bytes);
+                pane.send_input(&bytes);
             }
             return;
         }
@@ -7735,9 +7758,9 @@ impl App {
             out.extend_from_slice(b"\x1b[200~");
             out.extend_from_slice(to_send.as_bytes());
             out.extend_from_slice(b"\x1b[201~");
-            pane.io.write_input(&out);
+            pane.send_input(&out);
         } else {
-            pane.io.write_input(to_send.as_bytes());
+            pane.send_input(to_send.as_bytes());
         }
         // Ensure the next frame renders the shell's echo even if the
         // continuous-redraw chain was stalled between events — without
@@ -7768,7 +7791,7 @@ impl App {
         if let Key::Named(named) = &event.logical_key {
             if let Some(bytes) = named_key_bytes(*named, self.modifiers, app_cursor) {
                 self.events.emit("key", &format!("{:?}", named));
-                pane.io.write_input(&bytes);
+                pane.send_input(&bytes);
                 return;
             }
         }
@@ -7779,9 +7802,9 @@ impl App {
                 let b = text.as_bytes()[0];
                 if let Some(m) = ctrl_byte(b) {
                     if alt {
-                        pane.io.write_input(&[0x1b, m]);
+                        pane.send_input(&[0x1b, m]);
                     } else {
-                        pane.io.write_input(&[m]);
+                        pane.send_input(&[m]);
                     }
                     return;
                 }
@@ -7790,9 +7813,9 @@ impl App {
                 let mut out = Vec::with_capacity(text.len() + 1);
                 out.push(0x1b);
                 out.extend_from_slice(text.as_bytes());
-                pane.io.write_input(&out);
+                pane.send_input(&out);
             } else {
-                pane.io.write_input(text.as_bytes());
+                pane.send_input(text.as_bytes());
             }
         }
     }
@@ -9158,7 +9181,7 @@ impl ApplicationHandler<UserEvent> for App {
                             .map(|t| t.focus_tracking())
                             .unwrap_or(false);
                         if tracking {
-                            pane.io.write_input(seq);
+                            pane.send_input(seq);
                         }
                     }
                 }
@@ -9512,7 +9535,7 @@ impl ApplicationHandler<UserEvent> for App {
                         // OSC responses go straight back to the PTY of the
                         // pane that asked the question.
                         for resp in took_osc {
-                            pane.io.write_input(resp.as_bytes());
+                            pane.send_input(resp.as_bytes());
                         }
                         if let Some(title) = took_title {
                             let payload = pane_text_payload(tab_idx + 1, i + 1, &title);
@@ -9720,7 +9743,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // after the target pane exited.
                 for (uid, bytes) in self.events.drain_pending_routed_input_by_uid() {
                     match self.find_pane_by_uid(uid) {
-                        Some(p) => p.io.write_input(&bytes),
+                        Some(p) => p.send_input(&bytes),
                         None => tracing::debug!(
                             uid = uid,
                             "send_to_pane_by_uid: target not found"
@@ -9737,7 +9760,7 @@ impl ApplicationHandler<UserEvent> for App {
                         .get(tab_idx)
                         .and_then(|t| t.pane_at(pane_idx))
                     {
-                        pane.io.write_input(&bytes);
+                        pane.send_input(&bytes);
                     } else {
                         tracing::debug!(
                             tab = tab_idx,
@@ -10075,11 +10098,11 @@ impl ApplicationHandler<UserEvent> for App {
                                     .map(|t| t.bracketed_paste())
                                     .unwrap_or(false);
                                 if bracketed {
-                                    pane.io.write_input(b"\x1b[200~");
-                                    pane.io.write_input(&bytes);
-                                    pane.io.write_input(b"\x1b[201~");
+                                    pane.send_input(b"\x1b[200~");
+                                    pane.send_input(&bytes);
+                                    pane.send_input(b"\x1b[201~");
                                 } else {
-                                    pane.io.write_input(&bytes);
+                                    pane.send_input(&bytes);
                                 }
                                 self.events.emit("paste", &String::from_utf8_lossy(&bytes));
                             }
@@ -10088,7 +10111,7 @@ impl ApplicationHandler<UserEvent> for App {
                             // Plugin-injected input as if the user
                             // typed. Goes to the focused pane's PTY.
                             if let Some(pane) = self.focused_pane() {
-                                pane.io.write_input(&bytes);
+                                pane.send_input(&bytes);
                             }
                         }
                         rterm_core::PluginCmd::Scroll(delta) => {
@@ -12436,6 +12459,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU64::new(0)),
             Box::new(()),
+            None, // tests don't need a history store
         )
     }
 

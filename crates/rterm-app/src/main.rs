@@ -43,6 +43,10 @@ impl TerminalIo for PtyAdapter {
 
 struct GuiSpawner {
     config: Config,
+    /// Shared history sink — same Arc the App holds, so every pane
+    /// records into one SQLite file. `None` when history is disabled
+    /// (open-failure or `--smoke`).
+    history: Option<Arc<Mutex<rterm_history::History>>>,
 }
 
 impl PaneSpawner for GuiSpawner {
@@ -89,7 +93,7 @@ impl PaneSpawner for GuiSpawner {
         let io: Arc<dyn TerminalIo> = Arc::new(PtyAdapter(control));
 
         let keepalive: Box<dyn std::any::Any + Send> = Box::new((pty, join));
-        Ok(Pane::new(terminal, io, program, alive, activity, last_output_ms, keepalive))
+        Ok(Pane::new(terminal, io, program, alive, activity, last_output_ms, keepalive, self.history.clone()))
     }
 }
 
@@ -1378,7 +1382,26 @@ fn run_gui(
             }
         })
         .collect();
-    let spawner: Arc<dyn PaneSpawner> = Arc::new(GuiSpawner { config: config.clone() });
+    // Open the persistent command-history database. Failures are
+    // non-fatal — disable the feature and warn, so a corrupted /
+    // unreadable file can't keep rterm from launching at all.
+    let history = cache_dir()
+        .map(|d| d.join("history.sqlite3"))
+        .and_then(|path| match rterm_history::History::open(&path) {
+            Ok(h) => Some(Arc::new(Mutex::new(h))),
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "could not open command history db — feature disabled this session",
+                );
+                None
+            }
+        });
+    let spawner: Arc<dyn PaneSpawner> = Arc::new(GuiSpawner {
+        config: config.clone(),
+        history: history.clone(),
+    });
     let events: Arc<dyn EventSink> = Arc::new(PluginBridge(plugins));
     let session_path = cache_dir().map(|d| d.join("session.toml"));
     let (session_restore, session_active) = if config.terminal.restore_session {

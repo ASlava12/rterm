@@ -23,6 +23,7 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 rterm-core = { workspace = true }
+rterm-history = { workspace = true }
 
 # Win32 globals for the optional Guake global-hotkey worker thread.
 # `RegisterHotKey` is the supported way to receive a system-wide key
