@@ -81,12 +81,21 @@ fn shift_marks_after_scrollback_drop(marks: &mut VecDeque<usize>, dropped: usize
 ///   *user's browser* the URL and triggering content-disposition /
 ///   script-side side effects.
 pub fn is_safe_url(s: &str) -> bool {
+    // Schemes are case-insensitive per RFC 3986 §3.1, so accept any
+    // mix of cases — some clipboard managers and OSC-8 producers
+    // (cmd.exe `start`, older xterm-style scripts) preserve upper /
+    // mixed case. The whitelist itself stays the canonical lower form.
     if let Some(scheme_end) = s.find("://") {
         let scheme = &s[..scheme_end];
-        return matches!(scheme, "http" | "https" | "ftp" | "ssh");
+        return ["http", "https", "ftp", "ssh"]
+            .iter()
+            .any(|allowed| scheme.eq_ignore_ascii_case(allowed));
     }
-    if let Some(rest) = s.strip_prefix("mailto:") {
-        return rest.contains('@');
+    // `mailto:` (no `://`) — match the literal scheme case-insensitively
+    // by slicing after the first colon when the prefix matches in ASCII.
+    let mailto = "mailto:";
+    if s.len() >= mailto.len() && s[..mailto.len()].eq_ignore_ascii_case(mailto) {
+        return s[mailto.len()..].contains('@');
     }
     false
 }
@@ -4260,6 +4269,27 @@ mod tests {
         assert!(is_safe_url("ftp://files.example.org/"));
         assert!(is_safe_url("ssh://user@host"));
         assert!(is_safe_url("mailto:alice@example.org"));
+    }
+
+    #[test]
+    fn is_safe_url_is_case_insensitive_per_rfc_3986() {
+        // RFC 3986 §3.1 says URI schemes are case-insensitive, with
+        // the canonical form lower-case. Clipboard managers and some
+        // OSC-8 emitters preserve whatever case the source typed —
+        // pin so neither end of the case spectrum gets silently
+        // rejected and turns a legitimate Ctrl+click into a no-op.
+        assert!(is_safe_url("HTTP://example.org"));
+        assert!(is_safe_url("Https://example.org"));
+        assert!(is_safe_url("HTTPS://example.org"));
+        assert!(is_safe_url("SSH://user@host"));
+        assert!(is_safe_url("Ftp://example.org/"));
+        assert!(is_safe_url("MailTo:alice@example.org"));
+        assert!(is_safe_url("MAILTO:bob@example.org"));
+        // Case-insensitivity is *only* for the scheme. A blocked
+        // scheme can't be smuggled by varying case.
+        assert!(!is_safe_url("FILE:///etc/passwd"));
+        assert!(!is_safe_url("JavaScript:alert(1)"));
+        assert!(!is_safe_url("DATA:text/html,x"));
     }
 
     #[test]
