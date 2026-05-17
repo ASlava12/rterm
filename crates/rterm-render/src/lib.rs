@@ -515,6 +515,12 @@ pub trait EventSink: Send + Sync {
     fn take_pending_bell_urgent(&self) -> Option<bool> {
         None
     }
+    /// Hot-reloadable `[guake]` snapshot. `Some(None)` means the user
+    /// turned the feature off (`enabled = false`); `Some(Some(...))`
+    /// installs new config. `None` means no change since last drain.
+    fn take_pending_guake(&self) -> Option<Option<GuakeRunConfig>> {
+        None
+    }
     /// Drain `(tab, pane, muted)` requests from
     /// `rterm.set_pane_bell_muted` (0-based indices). The App writes
     /// each entry into the matching pane's `bell_muted` flag so the
@@ -11178,6 +11184,31 @@ impl ApplicationHandler for App {
                 }
                 if let Some(v) = self.events.take_pending_bell_urgent() {
                     self.bell_urgent = v;
+                }
+                if let Some(new_guake) = self.events.take_pending_guake() {
+                    // `None` = feature disabled. If we left the window
+                    // in AlwaysOnTop while previously dropped, restore
+                    // Normal level + clear the dropped flag so the
+                    // next press doesn't try to "hide" a window the
+                    // user has explicitly visible. The guard runs
+                    // regardless of the new state — if guake was
+                    // re-enabled with the window still dropped, the
+                    // next `toggle_guake` correctly toggles to hide.
+                    if new_guake.is_none() {
+                        if let Some(state) = self.state.as_ref() {
+                            if self.guake_dropped {
+                                state.window.set_window_level(
+                                    winit::window::WindowLevel::Normal,
+                                );
+                            }
+                        }
+                        self.guake_dropped = false;
+                    }
+                    self.guake = new_guake;
+                    tracing::info!(
+                        enabled = self.guake.as_ref().is_some_and(|g| g.enabled),
+                        "guake config hot-reloaded",
+                    );
                 }
                 for (tab_idx, pane_idx, muted) in
                     self.events.drain_pending_pane_bell_mute()

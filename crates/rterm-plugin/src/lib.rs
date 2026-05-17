@@ -400,6 +400,14 @@ pub struct PluginHost {
     pending_bell_visual: Arc<Mutex<Option<bool>>>,
     /// Hot-reloadable `terminal.bell_urgent` override.
     pending_bell_urgent: Arc<Mutex<Option<bool>>>,
+    /// Hot-reloadable `[guake]` snapshot. Outer `Option` = "any
+    /// pending change", inner = "new state" (None = disable).
+    /// Plugin crate doesn't know the renderer's `GuakeRunConfig`
+    /// type, so we carry the four primitive fields as a tuple
+    /// `(enabled, position, height_pct, width_pct)`; the App-side
+    /// EventSink adapter converts to the renderer's struct.
+    #[allow(clippy::type_complexity)]
+    pending_guake: Arc<Mutex<Option<Option<(bool, String, u8, u8)>>>>,
     /// Per-pane bell mute toggles queued by `rterm.set_pane_bell_muted`.
     /// Each entry is `(tab_0based, pane_0based, muted)`. The App drains
     /// per frame and writes to the matching `Pane::bell_muted` atomic.
@@ -858,6 +866,13 @@ impl PluginHost {
                 Ok(())
             })?,
         )?;
+
+        // Guake snapshot override. Stored as primitive tuple so the
+        // plugin crate doesn't need to know the renderer's type. App-
+        // side EventSink converts to the GuakeRunConfig struct.
+        #[allow(clippy::type_complexity)]
+        let pending_guake: Arc<Mutex<Option<Option<(bool, String, u8, u8)>>>> =
+            Arc::new(Mutex::new(None));
 
         // Slow-command threshold. Plugins can adjust at runtime to
         // raise/lower the bar without touching the TOML config.
@@ -3777,6 +3792,7 @@ impl PluginHost {
             pending_scroll_on_output,
             pending_bell_visual,
             pending_bell_urgent,
+            pending_guake,
             pending_pane_bell_mute,
             pending_pane_bell_mute_by_uid,
             pending_slow_command_ms,
@@ -4229,6 +4245,27 @@ impl PluginHost {
     pub fn set_bell_urgent_override(&self, v: bool) {
         if let Ok(mut g) = self.pending_bell_urgent.lock() {
             *g = Some(v);
+        }
+    }
+    /// Hot-reloadable `[guake]` snapshot. `Some(None)` = disable;
+    /// `Some(Some((enabled, position, height_pct, width_pct)))` =
+    /// install. The outer Option is what the renderer drains —
+    /// `Some` means "user changed this", `None` means "no change".
+    #[allow(clippy::type_complexity)]
+    pub fn take_pending_guake(
+        &self,
+    ) -> Option<Option<(bool, String, u8, u8)>> {
+        self.pending_guake.lock().ok().and_then(|mut g| g.take())
+    }
+    /// App-side override, normally driven from a config hot-reload.
+    /// Pass `None` to deactivate guake mid-session (e.g. user flipped
+    /// `[guake] enabled = false`).
+    pub fn set_guake_override(
+        &self,
+        guake: Option<(bool, String, u8, u8)>,
+    ) {
+        if let Ok(mut g) = self.pending_guake.lock() {
+            *g = Some(guake);
         }
     }
     /// Drain queued per-pane bell-mute requests from

@@ -379,6 +379,20 @@ impl EventSink for PluginBridge {
     fn take_pending_bell_urgent(&self) -> Option<bool> {
         self.0.lock().ok().and_then(|h| h.take_pending_bell_urgent())
     }
+    fn take_pending_guake(&self) -> Option<Option<rterm_render::GuakeRunConfig>> {
+        self.0.lock().ok().and_then(|h| h.take_pending_guake()).map(
+            |inner| {
+                inner.map(|(enabled, position, height_pct, width_pct)| {
+                    rterm_render::GuakeRunConfig {
+                        enabled,
+                        position,
+                        height_pct,
+                        width_pct,
+                    }
+                })
+            },
+        )
+    }
     fn drain_pending_pane_bell_mute_by_uid(&self) -> Vec<(u64, bool)> {
         self.0
             .lock()
@@ -1333,6 +1347,20 @@ fn spawn_watcher(plugins: Arc<Mutex<PluginHost>>, config_dir: PathBuf, config_to
                             host.set_bell_visual_override(cfg.terminal.bell_visual);
                             host.set_bell_urgent_override(cfg.terminal.bell_urgent);
                             host.set_slow_command_ms_override(cfg.terminal.slow_command_ms);
+                            // Guake snapshot — flip to None when the
+                            // user disables the feature mid-session so
+                            // the renderer drops the AlwaysOnTop level
+                            // it may have left applied.
+                            host.set_guake_override(if cfg.guake.enabled {
+                                Some((
+                                    true,
+                                    cfg.guake.position.clone(),
+                                    cfg.guake.height_pct,
+                                    cfg.guake.width_pct,
+                                ))
+                            } else {
+                                None
+                            });
                             // `set_font_size` reuses the same pending
                             // channel as `rterm.set_font_size(N)` — the
                             // renderer's clamp+NaN guard already

@@ -82,11 +82,10 @@ allow_osc52 = false
 # shortcut to a `wmctrl` / `xdotool` / KWin script that targets the
 # already-running rterm instance.
 #
-# NB: changes to this `[guake]` section require a restart of rterm —
-# unlike most config knobs (font, opacity, bell, scrollback), the
-# guake snapshot is read once at startup and not picked up by the
-# hot-reload watcher. Toggling `enabled` from `false` → `true` mid-
-# session won't activate the action until you exit and relaunch.
+# Hot-reload: changes to `[guake]` are picked up on `config.toml`
+# save without restart (same as font / opacity / bell). Flipping
+# `enabled = false` mid-session also drops any AlwaysOnTop level
+# the renderer may have applied on a prior drop.
 [guake]
 enabled = false
 # "top" | "bottom" | "full". On Wayland positioning is owned by the
