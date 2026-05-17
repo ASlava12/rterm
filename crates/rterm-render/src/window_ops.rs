@@ -100,6 +100,17 @@ impl App {
     /// `full` and warns once for `bottom`. X11 / Win32 / macOS honour
     /// `set_outer_position` and the window lands on the requested edge.
     pub(crate) fn toggle_guake(&mut self) {
+        // Always log on entry. Lets users running `RUST_LOG=info` (or
+        // the default filter, since `info` is the floor) confirm
+        // that the binding actually dispatched into the renderer —
+        // separates "key never arrived" from "key arrived but the
+        // window manager rejected the geometry change" when a user
+        // reports `[guake]`-binding troubles.
+        tracing::info!(
+            guake_enabled = self.guake.as_ref().map(|g| g.enabled),
+            guake_dropped = self.guake_dropped,
+            "toggle_guake: dispatched",
+        );
         // Binding fired → user wants the drop-down. Two previous
         // iterations of this code gated everything behind
         // `[guake] enabled = true`, which meant first-time users
