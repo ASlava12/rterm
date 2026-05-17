@@ -257,6 +257,38 @@ pub struct PluginHost {
     /// User-registered actions exposed in the command palette.
     /// Map: action name → Lua callback (registered as RegistryKey).
     actions: Arc<Mutex<HashMap<String, RegistryKey>>>,
+    //
+    // === Plugin command queues — architecture note ===
+    //
+    // Each plugin → app/renderer command has its own
+    // `Arc<Mutex<VecDeque<T>>>` below. The audit asked whether this
+    // could be a single `Sender<PluginCmd>` channel with one big
+    // enum and per-frame `drain + match`. That refactor was
+    // **investigated and intentionally deferred** in this round.
+    //
+    // The blocker is the type's home. The renderer's `EventSink`
+    // trait is the receiver of these drains; the plugin host is
+    // the producer. `rterm-render` doesn't depend on `rterm-plugin`
+    // and vice versa — both only share `rterm-core`. Defining a
+    // single `PluginCmd` enum forces either:
+    //   - putting plugin-host types into `rterm-core` (breaks
+    //     core's "pure data, no I/O" boundary), or
+    //   - duplicating the enum in both crates with `From`
+    //     conversions at the `rterm-app` seam (ugly twin types).
+    //
+    // Per-queue Mutex<VecDeque<T>> has been audit-clean since
+    // [48c1c07] + [166aa17] (no panics on poison) and the lock
+    // contention is bounded — each queue is touched by at most
+    // one Lua callback push + one frame-drain pop per tick. The
+    // setter batch helper `apply_config_snapshot` [410d612]
+    // already covers the worst contention case (11 config-snapshot
+    // mutations in one call).
+    //
+    // Re-evaluate if any of these become true:
+    //   * we add a 4th workspace member that needs to share the
+    //     command vocabulary (justifies a `rterm-types` crate),
+    //   * lock contention shows up in flamegraphs,
+    //   * a new command can't fit the legacy `pending_*` shape.
     /// Queue of byte payloads to send to the focused pane's PTY. Drained
     /// from the App's render loop and written via the pane's TerminalIo.
     pending_input: Arc<Mutex<VecDeque<Vec<u8>>>>,
