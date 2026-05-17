@@ -3947,28 +3947,33 @@ impl App {
             // the × itself sits in the *left* cell only; centring the
             // highlight over the whole zone would visually offset the
             // marker to the right of the glyph. Centre on the × cell
-            // so the marker sits symmetrically around the cross.
-            // Painted as a sharp rectangle (no corner radius) to match
-            // the user's preferred square outline.
+            // so the marker sits symmetrically around the cross, and
+            // make it a true square (width == height) so the shape
+            // reads the same regardless of the tab-strip height /
+            // cell-width ratio (Windows headers are noticeably taller
+            // than Linux defaults — a fixed `chip_h - 4` height with
+            // a cell-relative width came out rectangular there).
             if hover_close_tab == Some(e.idx) {
                 if let Some(state) = self.state.as_ref() {
                     let cell_w = state.text.cell_width();
                     if cell_w > 0.0 {
                         let glyph_center_x = e.body_end as f32 + cell_w * 0.5;
-                        // Modest horizontal padding around the glyph
-                        // (~4 px each side) without growing past a
-                        // single cell-and-a-half — keeps the marker
-                        // crisp on narrow fonts.
-                        let hl_w = (cell_w + 8.0).min(cell_w * 1.5);
-                        let close_left_px = glyph_center_x - hl_w * 0.5;
+                        // Side: chip height bounds the upper limit
+                        // (the marker can't overflow the tab strip);
+                        // ~1.5 × cell_w caps the lower limit so a
+                        // very tall chip doesn't grow a square wider
+                        // than the × cell itself.
+                        let side = (chip_h - 4.0).min(cell_w * 1.5);
+                        let close_left_px = glyph_center_x - side * 0.5;
+                        let close_top_px = chip_top + (chip_h - side) * 0.5;
                         let highlight = [
                             bg[0].saturating_add(40).min(180),
                             bg[1].saturating_sub(10),
                             bg[2].saturating_sub(10),
                         ];
                         out.push(bg::BgQuad::from_srgb(
-                            [close_left_px, chip_top + 2.0],
-                            [hl_w, chip_h - 4.0],
+                            [close_left_px, close_top_px],
+                            [side, side],
                             highlight,
                             0.85,
                         ));
