@@ -364,32 +364,13 @@ pub struct CommandFinish {
     pub duration_ms: Option<u64>,
 }
 
-/// Built-in default foreground (xterm-ish neutral). Used to seed and to
-/// answer OSC 111 reset.
-const DEFAULT_FG_RGB: [u8; 3] = [220, 220, 220];
-const DEFAULT_BG_RGB: [u8; 3] = [10, 12, 18];
-
-/// Built-in 16-colour palette used to seed OSC 4 query replies before the
-/// renderer pushes its configured values via `set_named_palette`. Mirrors
-/// the xterm-ish defaults the renderer uses out of the box.
-const DEFAULT_NAMED_PALETTE: [[u8; 3]; 16] = [
-    [0, 0, 0],
-    [205, 49, 49],
-    [13, 188, 121],
-    [229, 229, 16],
-    [36, 114, 200],
-    [188, 63, 188],
-    [17, 168, 205],
-    [229, 229, 229],
-    [102, 102, 102],
-    [241, 76, 76],
-    [35, 209, 139],
-    [245, 245, 67],
-    [59, 142, 234],
-    [214, 112, 214],
-    [41, 184, 219],
-    [255, 255, 255],
-];
+// Default-palette constants used to live here as private `const`s.
+// They moved to `rterm_core::color` so `rterm-render`'s renderer-side
+// `DEFAULT_THEME` and this crate's OSC reset paths share one source of
+// truth — otherwise the two could drift on a one-sided edit and a
+// shell-issued OSC 111 / OSC 112 reset would jump the colour to a
+// value that no longer matched what the renderer paints as "Default".
+use crate::color::{DEFAULT_BG, DEFAULT_FG, DEFAULT_NAMED_PALETTE};
 
 fn indexed_palette_rgb(i: u8, named: &[[u8; 3]; 16]) -> [u8; 3] {
     if (i as usize) < 16 {
@@ -2082,14 +2063,14 @@ impl<'a> Perform for TerminalPerform<'a> {
             // built-in xterm defaults. No payload accepted; any body is
             // ignored. These are paired with OSC 10 / 11 / 12 SET.
             "110" => {
-                *self.default_fg_rgb = DEFAULT_FG_RGB;
+                *self.default_fg_rgb = DEFAULT_FG;
                 self.pending_palette_changes
-                    .push_back(PaletteUpdate::DefaultFg(DEFAULT_FG_RGB));
+                    .push_back(PaletteUpdate::DefaultFg(DEFAULT_FG));
             }
             "111" => {
-                *self.default_bg_rgb = DEFAULT_BG_RGB;
+                *self.default_bg_rgb = DEFAULT_BG;
                 self.pending_palette_changes
-                    .push_back(PaletteUpdate::DefaultBg(DEFAULT_BG_RGB));
+                    .push_back(PaletteUpdate::DefaultBg(DEFAULT_BG));
             }
             "112" => {
                 *self.cursor_rgb = None;

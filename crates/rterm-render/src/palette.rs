@@ -7,7 +7,7 @@
 use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use rterm_core::{Color as TermColor, NamedColor};
+use rterm_core::{Color as TermColor, NamedColor, DEFAULT_BG as CORE_DEFAULT_BG, DEFAULT_FG as CORE_DEFAULT_FG, DEFAULT_NAMED_PALETTE as CORE_NAMED};
 
 /// Resolved RGB values for the 16 ANSI colours plus default fg/bg.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,30 +59,15 @@ pub fn theme_by_name(name: &str) -> Option<(&'static str, Palette)> {
         .copied()
 }
 
-/// Built-in xterm-ish dark — same as `Palette::default()`. Kept as a
-/// separate const so the themes table can refer to it by name.
+/// Built-in xterm-ish dark — same as `Palette::default()`. Defined in
+/// terms of `rterm_core::color` constants so the renderer's "factory
+/// default" and the parser's OSC-reset values stay locked together; see
+/// the doc on `rterm_core::DEFAULT_FG` for the rationale.
 const DEFAULT_THEME: Palette = Palette {
-    default_fg: [220, 220, 220],
-    default_bg: [10, 12, 18],
+    default_fg: CORE_DEFAULT_FG,
+    default_bg: CORE_DEFAULT_BG,
     cursor: None,
-    named: [
-        [0, 0, 0],
-        [205, 49, 49],
-        [13, 188, 121],
-        [229, 229, 16],
-        [36, 114, 200],
-        [188, 63, 188],
-        [17, 168, 205],
-        [229, 229, 229],
-        [102, 102, 102],
-        [241, 76, 76],
-        [35, 209, 139],
-        [245, 245, 67],
-        [59, 142, 234],
-        [214, 112, 214],
-        [41, 184, 219],
-        [255, 255, 255],
-    ],
+    named: CORE_NAMED,
 };
 
 const DRACULA: Palette = Palette {
@@ -260,8 +245,10 @@ pub fn cursor_color() -> Option<[u8; 3]> {
 }
 
 /// Constants kept for tests and call sites that took them by value.
-pub const DEFAULT_FG: [u8; 3] = [220, 220, 220];
-pub const DEFAULT_BG: [u8; 3] = [10, 12, 18];
+/// These re-export the canonical pair from `rterm_core::color` so a
+/// single edit in one place propagates to every consumer.
+pub const DEFAULT_FG: [u8; 3] = CORE_DEFAULT_FG;
+pub const DEFAULT_BG: [u8; 3] = CORE_DEFAULT_BG;
 
 pub fn color_to_rgb(c: TermColor, default: [u8; 3]) -> [u8; 3] {
     match c {
@@ -374,6 +361,22 @@ mod tests {
         // ("Default" and "default" rendering differently).
         let (_, dflt) = theme_by_name("default").unwrap();
         assert_eq!(Palette::default(), dflt);
+    }
+
+    #[test]
+    fn default_theme_locks_to_rterm_core_constants() {
+        // The renderer's "factory" theme must equal the OSC-reset
+        // payload that `rterm-core` ships via OSC 110 / 111 / 104.
+        // A drift here would mean `printf '\\e]111\\a'` (default-bg
+        // reset) jumps the bg to a colour the renderer never paints
+        // for plain `Default`-bg cells — a surprising glitch on
+        // shells / TUI apps that rely on the reset semantics.
+        assert_eq!(DEFAULT_THEME.default_fg, rterm_core::DEFAULT_FG);
+        assert_eq!(DEFAULT_THEME.default_bg, rterm_core::DEFAULT_BG);
+        assert_eq!(DEFAULT_THEME.named, rterm_core::DEFAULT_NAMED_PALETTE);
+        // And the back-compat aliases re-export the same bytes.
+        assert_eq!(DEFAULT_FG, rterm_core::DEFAULT_FG);
+        assert_eq!(DEFAULT_BG, rterm_core::DEFAULT_BG);
     }
 
     #[test]
