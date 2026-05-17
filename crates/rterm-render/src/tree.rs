@@ -315,32 +315,22 @@ impl<L> Tree<L> {
         if p_a == p_b {
             return false;
         }
+        // Validate both targets are reachable leaves *before* touching the
+        // tree. A leaf path can't be a prefix of any other valid path (the
+        // traversal stops at a Leaf), so the two physical slots are
+        // guaranteed independent — every `slot_at_mut` below is sound.
         if self.leaf_at(p_a).is_none() || self.leaf_at(p_b).is_none() {
             return false;
         }
-        // Pull p_a out, leaving Hole; then pull p_b out into the Hole-shaped
-        // slot at p_a (i.e. swap). Finally drop the original p_a payload
-        // back into the now-empty p_b slot.
-        let mut taken_a = Tree::Hole;
-        if let Some(slot_a) = self.slot_at_mut(p_a) {
-            std::mem::swap(slot_a, &mut taken_a);
-        } else {
-            return false;
-        }
-        let mut taken_b = Tree::Hole;
-        if let Some(slot_b) = self.slot_at_mut(p_b) {
-            std::mem::swap(slot_b, &mut taken_b);
-            *slot_b = taken_a;
-        } else {
-            // Put taken_a back to keep the tree well-formed.
-            if let Some(slot_a) = self.slot_at_mut(p_a) {
-                *slot_a = taken_a;
-            }
-            return false;
-        }
-        if let Some(slot_a) = self.slot_at_mut(p_a) {
-            *slot_a = taken_b;
-        }
+        let leaf_a = std::mem::replace(
+            self.slot_at_mut(p_a).expect("validated above"),
+            Tree::Hole,
+        );
+        let leaf_b = std::mem::replace(
+            self.slot_at_mut(p_b).expect("validated above"),
+            leaf_a,
+        );
+        *self.slot_at_mut(p_a).expect("validated above") = leaf_b;
         true
     }
 
@@ -617,6 +607,36 @@ mod tests {
         // [true, true] descends into a leaf at [true], then asks for the
         // "right" child of a leaf — not a split).
         assert!(!t.swap_leaves(&[false], &[true, true]));
+    }
+
+    #[test]
+    fn swap_leaves_handles_deep_asymmetric_paths() {
+        // Build a deliberately lopsided tree so the two leaves sit at
+        // different depths and on different sides — exercises the
+        // "paths are independent" property the new mem::replace shape
+        // relies on:
+        //
+        //          [root: H]
+        //          /        \
+        //       [v]          4 (at [true])
+        //      /   \
+        //     1     [v]      (at [false, false] = 1)
+        //          /   \
+        //         2     3    (at [false, true, false] = 2,
+        //                     [false, true, true] = 3)
+        let mut t = Tree::new(1u32);
+        t.split_leaf(&[], 4, SplitDir::Horizontal, 0.5);
+        t.split_leaf(&[false], 2, SplitDir::Vertical, 0.5);
+        t.split_leaf(&[false, true], 3, SplitDir::Vertical, 0.5);
+        // DFS order: 1, 2, 3, 4.
+        assert_eq!(t.leaves(), vec![&1, &2, &3, &4]);
+        // Swap the deepest left leaf (2 at [false, true, false]) with
+        // the shallow right leaf (4 at [true]).
+        assert!(t.swap_leaves(&[false, true, false], &[true]));
+        assert_eq!(t.leaves(), vec![&1, &4, &3, &2]);
+        // Swap back to make sure the operation round-trips.
+        assert!(t.swap_leaves(&[true], &[false, true, false]));
+        assert_eq!(t.leaves(), vec![&1, &2, &3, &4]);
     }
 
     #[test]
