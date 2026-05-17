@@ -593,6 +593,18 @@ fn progress_state_name(state: u8) -> &'static str {
     }
 }
 
+/// Atomically take the value out of a `Mutex<Option<T>>` slot.
+/// Returns `None` for empty slots AND for poisoned mutexes — the
+/// renderer's `take_pending_*` callers all treat poison the same way
+/// as "no pending value", so a worker thread that panicked during a
+/// Lua callback can't take a config-reload setter down with it. Used
+/// by the score of `PluginHost::take_pending_*` methods below so the
+/// `.lock().ok().and_then(|mut g| g.take())` triple stays in one
+/// place and isn't a copy-paste fan-out.
+fn take_slot<T>(slot: &Mutex<Option<T>>) -> Option<T> {
+    slot.lock().ok().and_then(|mut g| g.take())
+}
+
 impl PluginHost {
     /// Construct a fresh Lua plugin host.
     ///
@@ -3905,19 +3917,13 @@ impl PluginHost {
 
     /// Take the latest plugin-supplied palette snapshot from `set_palette`.
     pub fn take_pending_palette(&self) -> Option<PluginPalette> {
-        self.pending_palette
-            .lock()
-            .ok()
-            .and_then(|mut g| g.take())
+        take_slot(&self.pending_palette)
     }
 
     /// Take the latest built-in theme request from `rterm.set_theme(name)`.
     /// Returns the canonical theme name; App resolves it to a palette.
     pub fn take_pending_theme(&self) -> Option<String> {
-        self.pending_theme
-            .lock()
-            .ok()
-            .and_then(|mut g| g.take())
+        take_slot(&self.pending_theme)
     }
 
     /// The list of theme names the Lua API will accept in
@@ -3933,36 +3939,24 @@ impl PluginHost {
 
     /// Take the latest font-size request from `rterm.set_font_size(size)`.
     pub fn take_pending_font_size(&self) -> Option<f32> {
-        self.pending_font_size
-            .lock()
-            .ok()
-            .and_then(|mut g| g.take())
+        take_slot(&self.pending_font_size)
     }
 
     /// Take the latest opacity request from `rterm.set_opacity(value)`.
     /// Returns a value already clamped to `0.0..=1.0`.
     pub fn take_pending_opacity(&self) -> Option<f32> {
-        self.pending_opacity
-            .lock()
-            .ok()
-            .and_then(|mut g| g.take())
+        take_slot(&self.pending_opacity)
     }
 
 
     /// Take the latest logical line target from `rterm.scroll_to_line(line)`.
     pub fn take_pending_scroll_to_line(&self) -> Option<usize> {
-        self.pending_scroll_to_line
-            .lock()
-            .ok()
-            .and_then(|mut g| g.take())
+        take_slot(&self.pending_scroll_to_line)
     }
 
     /// Take the latest `rterm.start_search` request as `(query, regex_mode)`.
     pub fn take_pending_start_search(&self) -> Option<(String, bool)> {
-        self.pending_start_search
-            .lock()
-            .ok()
-            .and_then(|mut g| g.take())
+        take_slot(&self.pending_start_search)
     }
 
     /// Install the clipboard reader used by `rterm.read_clipboard()`. Called
@@ -4025,35 +4019,23 @@ impl PluginHost {
 
     /// Take the latest focus request from `rterm.focus_pane(...)`.
     pub fn take_pending_focus(&self) -> Option<(usize, usize)> {
-        self.pending_focus
-            .lock()
-            .ok()
-            .and_then(|mut g| g.take())
+        take_slot(&self.pending_focus)
     }
 
     /// Take the latest uid from `rterm.focus_pane_by_uid(uid)`. App
     /// resolves uid → live `(tab, pane)` at drain.
     pub fn take_pending_focus_by_uid(&self) -> Option<u64> {
-        self.pending_focus_by_uid
-            .lock()
-            .ok()
-            .and_then(|mut g| g.take())
+        take_slot(&self.pending_focus_by_uid)
     }
 
     /// Take the latest tab index from `rterm.focus_tab(idx)`.
     pub fn take_pending_tab_focus(&self) -> Option<usize> {
-        self.pending_tab_focus
-            .lock()
-            .ok()
-            .and_then(|mut g| g.take())
+        take_slot(&self.pending_tab_focus)
     }
 
     /// Take the latest clipboard text from `rterm.copy(text)`.
     pub fn take_pending_copy(&self) -> Option<String> {
-        self.pending_copy
-            .lock()
-            .ok()
-            .and_then(|mut g| g.take())
+        take_slot(&self.pending_copy)
     }
 
 
@@ -4101,10 +4083,7 @@ impl PluginHost {
 
     /// Take the most recent scrollback-limit override (if any), clearing it.
     pub fn take_pending_scrollback_limit(&self) -> Option<usize> {
-        self.pending_scrollback_limit
-            .lock()
-            .ok()
-            .and_then(|mut g| g.take())
+        take_slot(&self.pending_scrollback_limit)
     }
 
     /// Publish a new scrollback limit (e.g. from the TOML watcher) so the
@@ -4117,10 +4096,7 @@ impl PluginHost {
 
     /// Most-recent `terminal.tab_silence_ms` override (if any), cleared.
     pub fn take_pending_tab_silence_ms(&self) -> Option<u64> {
-        self.pending_tab_silence_ms
-            .lock()
-            .ok()
-            .and_then(|mut g| g.take())
+        take_slot(&self.pending_tab_silence_ms)
     }
 
     /// Publish a new `tab_silence_ms` value (from TOML watcher or Lua) so
@@ -4156,7 +4132,7 @@ impl PluginHost {
 
     /// Pending `terminal.cursor_blink` override from the config watcher.
     pub fn take_pending_cursor_blink(&self) -> Option<bool> {
-        self.pending_cursor_blink.lock().ok().and_then(|mut g| g.take())
+        take_slot(&self.pending_cursor_blink)
     }
     pub fn set_cursor_blink_override(&self, v: bool) {
         if let Ok(mut g) = self.pending_cursor_blink.lock() {
@@ -4164,7 +4140,7 @@ impl PluginHost {
         }
     }
     pub fn take_pending_show_scrollbar(&self) -> Option<bool> {
-        self.pending_show_scrollbar.lock().ok().and_then(|mut g| g.take())
+        take_slot(&self.pending_show_scrollbar)
     }
     pub fn set_show_scrollbar_override(&self, v: bool) {
         if let Ok(mut g) = self.pending_show_scrollbar.lock() {
@@ -4172,7 +4148,7 @@ impl PluginHost {
         }
     }
     pub fn take_pending_scroll_on_output(&self) -> Option<bool> {
-        self.pending_scroll_on_output.lock().ok().and_then(|mut g| g.take())
+        take_slot(&self.pending_scroll_on_output)
     }
     pub fn set_scroll_on_output_override(&self, v: bool) {
         if let Ok(mut g) = self.pending_scroll_on_output.lock() {
@@ -4180,7 +4156,7 @@ impl PluginHost {
         }
     }
     pub fn take_pending_bell_visual(&self) -> Option<bool> {
-        self.pending_bell_visual.lock().ok().and_then(|mut g| g.take())
+        take_slot(&self.pending_bell_visual)
     }
     pub fn set_bell_visual_override(&self, v: bool) {
         if let Ok(mut g) = self.pending_bell_visual.lock() {
@@ -4188,7 +4164,7 @@ impl PluginHost {
         }
     }
     pub fn take_pending_bell_urgent(&self) -> Option<bool> {
-        self.pending_bell_urgent.lock().ok().and_then(|mut g| g.take())
+        take_slot(&self.pending_bell_urgent)
     }
     pub fn set_bell_urgent_override(&self, v: bool) {
         if let Ok(mut g) = self.pending_bell_urgent.lock() {
@@ -4198,7 +4174,7 @@ impl PluginHost {
     /// Hot-reloadable `[font].family` override. Empty string =
     /// "auto-pick system monospace default".
     pub fn take_pending_font_family(&self) -> Option<String> {
-        self.pending_font_family.lock().ok().and_then(|mut g| g.take())
+        take_slot(&self.pending_font_family)
     }
     pub fn set_font_family_override(&self, name: String) {
         if let Ok(mut g) = self.pending_font_family.lock() {
@@ -4213,7 +4189,7 @@ impl PluginHost {
     pub fn take_pending_guake(
         &self,
     ) -> Option<Option<(bool, String, u8, u8)>> {
-        self.pending_guake.lock().ok().and_then(|mut g| g.take())
+        take_slot(&self.pending_guake)
     }
     /// App-side override, normally driven from a config hot-reload.
     /// Pass `None` to deactivate guake mid-session (e.g. user flipped
@@ -4289,7 +4265,7 @@ impl PluginHost {
             .unwrap_or_default()
     }
     pub fn take_pending_slow_command_ms(&self) -> Option<u64> {
-        self.pending_slow_command_ms.lock().ok().and_then(|mut g| g.take())
+        take_slot(&self.pending_slow_command_ms)
     }
     pub fn set_slow_command_ms_override(&self, v: u64) {
         if let Ok(mut g) = self.pending_slow_command_ms.lock() {
@@ -4312,10 +4288,7 @@ impl PluginHost {
     /// Outer `Some` = update was requested this frame; inner `None` clears
     /// any existing override, `Some(name)` sets it.
     pub fn take_pending_window_title(&self) -> Option<Option<String>> {
-        self.pending_window_title
-            .lock()
-            .ok()
-            .and_then(|mut g| g.take())
+        take_slot(&self.pending_window_title)
     }
 
     /// Drain queued `(tab, pane, title)` overrides from `rterm.set_pane_title`.
