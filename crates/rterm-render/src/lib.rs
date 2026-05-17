@@ -3917,14 +3917,23 @@ impl App {
             ));
             // Hover highlight on the × close marker — Chrome-style:
             // small darker pill behind the cross when the cursor is
-            // specifically over it.
+            // specifically over it. The close zone is two cells wide
+            // (`"× "` — glyph + trailing space) but the × itself sits
+            // in the *left* cell only; centring the highlight over the
+            // whole zone would visually offset the pill to the right
+            // of the glyph. Centre on the × cell instead so the pill
+            // sits symmetrically around the cross.
             if hover_close_tab == Some(e.idx) {
                 if let Some(state) = self.state.as_ref() {
                     let cell_w = state.text.cell_width();
                     if cell_w > 0.0 {
-                        let close_w = TAB_CLOSE_WIDTH_CELLS as f32 * cell_w;
-                        let close_left_px =
-                            (e.close_end as f32) - close_w + 1.0;
+                        let glyph_center_x = e.body_end as f32 + cell_w * 0.5;
+                        // Modest horizontal padding around the glyph
+                        // (~4 px each side) without growing past a
+                        // single cell-and-a-half — keeps the pill
+                        // crisp on narrow fonts.
+                        let hl_w = (cell_w + 8.0).min(cell_w * 1.5);
+                        let close_left_px = glyph_center_x - hl_w * 0.5;
                         let highlight = [
                             bg[0].saturating_add(40).min(180),
                             bg[1].saturating_sub(10),
@@ -3932,7 +3941,7 @@ impl App {
                         ];
                         out.push(bg::BgQuad::from_srgb_rounded(
                             [close_left_px, chip_top + 2.0],
-                            [close_w - 2.0, chip_h - 4.0],
+                            [hl_w, chip_h - 4.0],
                             highlight,
                             0.85,
                             chip_radius * 0.8,
