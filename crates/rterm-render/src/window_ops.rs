@@ -129,28 +129,25 @@ impl App {
                 let target_w = (mw * w_pct / 100).max(320);
                 let target_h = (mh * h_pct / 100).max(200);
                 let centre_x = mon_pos.x + (mw - target_w) / 2;
-                match cfg.position.as_str() {
+                // "full" maximises and skips the position/size dance —
+                // the compositor owns the geometry there. Everything
+                // else picks a Y for the configured edge and runs the
+                // shared set_outer_position + request_inner_size pair.
+                let edge_y = match cfg.position.as_str() {
                     "full" => {
                         state.window.set_maximized(true);
+                        None
                     }
-                    "bottom" => {
-                        let pos = winit::dpi::PhysicalPosition::new(
-                            centre_x,
-                            mon_pos.y + mh - target_h,
-                        );
-                        state.window.set_outer_position(pos);
-                        let _ = state.window.request_inner_size(
-                            winit::dpi::PhysicalSize::new(target_w as u32, target_h as u32),
-                        );
-                    }
-                    _ => {
-                        // Default + "top".
-                        let pos = winit::dpi::PhysicalPosition::new(centre_x, mon_pos.y);
-                        state.window.set_outer_position(pos);
-                        let _ = state.window.request_inner_size(
-                            winit::dpi::PhysicalSize::new(target_w as u32, target_h as u32),
-                        );
-                    }
+                    "bottom" => Some(mon_pos.y + mh - target_h),
+                    // Default + "top".
+                    _ => Some(mon_pos.y),
+                };
+                if let Some(y) = edge_y {
+                    let pos = winit::dpi::PhysicalPosition::new(centre_x, y);
+                    state.window.set_outer_position(pos);
+                    let _ = state.window.request_inner_size(
+                        winit::dpi::PhysicalSize::new(target_w as u32, target_h as u32),
+                    );
                 }
             }
             // Raise above other windows + take focus so the user can
