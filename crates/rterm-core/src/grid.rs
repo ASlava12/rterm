@@ -146,27 +146,27 @@ impl Grid {
         let cols = self.size.cols as usize;
         let region_rows = (bottom - top + 1) as usize;
         let shift = (n as usize).min(region_rows);
+        let top_row = top as usize;
 
-        let mut evicted = Vec::with_capacity(shift);
-        for i in 0..shift {
-            let row_idx = top as usize + i;
-            let start = row_idx * cols;
-            evicted.push(self.cells[start..start + cols].to_vec());
+        // The evicted rows, the surviving block, and the blanked tail
+        // each occupy contiguous slices of `cells`, so we can use one
+        // chunk / `copy_within` / `fill` per region — no per-row loop.
+        let evict_start = top_row * cols;
+        let evict_end = evict_start + shift * cols;
+        let evicted: Vec<Vec<Cell>> = self.cells[evict_start..evict_end]
+            .chunks_exact(cols)
+            .map(<[Cell]>::to_vec)
+            .collect();
+
+        let survive_len = (region_rows - shift) * cols;
+        if survive_len > 0 {
+            let src_start = evict_end;
+            self.cells.copy_within(src_start..src_start + survive_len, evict_start);
         }
 
-        // Move surviving rows up.
-        for i in 0..(region_rows - shift) {
-            let src_start = (top as usize + i + shift) * cols;
-            let dst_start = (top as usize + i) * cols;
-            self.cells.copy_within(src_start..src_start + cols, dst_start);
-        }
-
-        // Blank the bottom `shift` rows.
-        for i in (region_rows - shift)..region_rows {
-            let row_idx = top as usize + i;
-            let start = row_idx * cols;
-            self.cells[start..start + cols].fill(blank);
-        }
+        let blank_start = evict_start + survive_len;
+        let blank_end = blank_start + shift * cols;
+        self.cells[blank_start..blank_end].fill(blank);
 
         evicted
     }
@@ -180,19 +180,19 @@ impl Grid {
         let cols = self.size.cols as usize;
         let region_rows = (bottom - top + 1) as usize;
         let shift = (n as usize).min(region_rows);
+        let top_row = top as usize;
 
-        // Move surviving rows down, back to front.
-        for i in (0..(region_rows - shift)).rev() {
-            let src_start = (top as usize + i) * cols;
-            let dst_start = (top as usize + i + shift) * cols;
-            self.cells.copy_within(src_start..src_start + cols, dst_start);
+        // Move the surviving block down in a single `copy_within` and
+        // blank the freed top in a single `fill`. `copy_within` handles
+        // the overlapping back-to-front move internally.
+        let region_start = top_row * cols;
+        let blank_end = region_start + shift * cols;
+        let survive_len = (region_rows - shift) * cols;
+        if survive_len > 0 {
+            self.cells
+                .copy_within(region_start..region_start + survive_len, blank_end);
         }
-
-        for i in 0..shift {
-            let row_idx = top as usize + i;
-            let start = row_idx * cols;
-            self.cells[start..start + cols].fill(blank);
-        }
+        self.cells[region_start..blank_end].fill(blank);
     }
 
     fn index(&self, pos: Position) -> Option<usize> {
@@ -286,6 +286,67 @@ mod tests {
         assert_eq!(g.row(1).unwrap().iter().map(|c| c.ch).collect::<String>(), "ef");
         // Bottom row blanked with `blank`.
         assert_eq!(g.row(2).unwrap().iter().map(|c| c.ch).collect::<String>(), "..");
+    }
+
+    #[test]
+    fn scroll_down_inserts_blanks_at_top() {
+        let mut g = Grid::new(Size { cols: 2, rows: 3 });
+        for r in 0..3u16 {
+            for c in 0..2u16 {
+                g.cell_mut(Position { col: c, row: r }).unwrap().ch =
+                    char::from_u32(b'a' as u32 + (r * 2 + c) as u32).unwrap();
+            }
+        }
+        let blank = Cell { ch: '.', ..Cell::default() };
+        g.scroll_down(0, 2, 1, blank);
+        // Top row blanked.
+        assert_eq!(g.row(0).unwrap().iter().map(|c| c.ch).collect::<String>(), "..");
+        // Previously top + middle rows shifted down by one.
+        assert_eq!(g.row(1).unwrap().iter().map(|c| c.ch).collect::<String>(), "ab");
+        assert_eq!(g.row(2).unwrap().iter().map(|c| c.ch).collect::<String>(), "cd");
+    }
+
+    #[test]
+    fn scroll_up_full_region_blanks_everything() {
+        // shift == region_rows: no row survives the scroll. The new
+        // single-`fill` path has to cover the whole region without
+        // tripping over a zero-length `copy_within`.
+        let mut g = Grid::new(Size { cols: 2, rows: 3 });
+        for r in 0..3u16 {
+            for c in 0..2u16 {
+                g.cell_mut(Position { col: c, row: r }).unwrap().ch =
+                    char::from_u32(b'a' as u32 + (r * 2 + c) as u32).unwrap();
+            }
+        }
+        let blank = Cell { ch: '.', ..Cell::default() };
+        // Region is just rows 1..=2 (two rows), and we scroll by 5 —
+        // clamps to region_rows so both rows are evicted + blanked.
+        let evicted = g.scroll_up(1, 2, 5, blank);
+        assert_eq!(evicted.len(), 2);
+        assert_eq!(evicted[0].iter().map(|c| c.ch).collect::<String>(), "cd");
+        assert_eq!(evicted[1].iter().map(|c| c.ch).collect::<String>(), "ef");
+        // Row outside the region is untouched.
+        assert_eq!(g.row(0).unwrap().iter().map(|c| c.ch).collect::<String>(), "ab");
+        // The two scrolled rows are now blanks.
+        assert_eq!(g.row(1).unwrap().iter().map(|c| c.ch).collect::<String>(), "..");
+        assert_eq!(g.row(2).unwrap().iter().map(|c| c.ch).collect::<String>(), "..");
+    }
+
+    #[test]
+    fn scroll_down_full_region_blanks_everything() {
+        let mut g = Grid::new(Size { cols: 2, rows: 3 });
+        for r in 0..3u16 {
+            for c in 0..2u16 {
+                g.cell_mut(Position { col: c, row: r }).unwrap().ch =
+                    char::from_u32(b'a' as u32 + (r * 2 + c) as u32).unwrap();
+            }
+        }
+        let blank = Cell { ch: '.', ..Cell::default() };
+        g.scroll_down(0, 1, 5, blank);
+        assert_eq!(g.row(0).unwrap().iter().map(|c| c.ch).collect::<String>(), "..");
+        assert_eq!(g.row(1).unwrap().iter().map(|c| c.ch).collect::<String>(), "..");
+        // Row outside the region kept.
+        assert_eq!(g.row(2).unwrap().iter().map(|c| c.ch).collect::<String>(), "ef");
     }
 
     #[test]
