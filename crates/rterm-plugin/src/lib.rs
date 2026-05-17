@@ -307,9 +307,6 @@ pub struct PluginHost {
     //     command vocabulary (justifies a `rterm-types` crate),
     //   * lock contention shows up in flamegraphs,
     //   * a new command can't fit the legacy `pending_*` shape.
-    /// Queue of byte payloads to send to the focused pane's PTY. Drained
-    /// from the App's render loop and written via the pane's TerminalIo.
-    pending_input: Arc<Mutex<VecDeque<Vec<u8>>>>,
     /// Queue of byte payloads addressed to a specific (tab, pane) pair via
     /// `rterm.send_to_pane(tab, pane, payload)`. Indices are 0-based here;
     /// the Lua API converts from the 1-based form used in `list_panes`.
@@ -356,10 +353,6 @@ pub struct PluginHost {
     /// The App drains and re-dispatches via `emit()` once per frame so the
     /// effect is identical to a native event but free of re-entrancy.
     pending_custom_events: EventQueue,
-    /// Pending scroll-offset deltas from `rterm.scroll(delta)`. Each entry
-    /// is a signed integer added to the focused pane's `scroll_offset`
-    /// (positive = into scrollback, negative = toward live).
-    pending_scroll: Arc<Mutex<VecDeque<i32>>>,
     /// Absolute scroll target from `rterm.scroll_to_line(line)`. 0-based
     /// logical line index (scrollback first, then grid).
     pending_scroll_to_line: Arc<Mutex<Option<usize>>>,
@@ -381,13 +374,6 @@ pub struct PluginHost {
     /// from opaque (1.0) to translucent at runtime may not affect the
     /// window background — but cell-level alpha tracking still works.
     pending_opacity: Arc<Mutex<Option<f32>>>,
-    /// Queue of paste payloads from `rterm.paste(text)`. App wraps in
-    /// `ESC [ 200 ~ … ESC [ 201 ~` only when the destination pane has
-    /// bracketed paste enabled.
-    pending_paste: Arc<Mutex<VecDeque<Vec<u8>>>>,
-    /// `(tab, pane)` 0-based targets to kill, queued from
-    /// `rterm.kill_pane(tab, pane)`.
-    pending_kills: Arc<Mutex<VecDeque<(usize, usize)>>>,
     /// `rterm.bell()` was called — App fires the same visual flash and
     /// attention ping a terminal BEL byte triggers.
     pending_bell: Arc<Mutex<bool>>,
@@ -778,16 +764,12 @@ impl PluginHost {
             })?,
         )?;
 
-        let pending_input: Arc<Mutex<VecDeque<Vec<u8>>>> =
-            Arc::new(Mutex::new(VecDeque::new()));
-        let pending_input_for_send = Arc::clone(&pending_input);
+        let send_input_tx = cmd_tx.clone();
         rterm.set(
             "send_input",
             lua.create_function(move |_, payload: String| {
-                pending_input_for_send
-                    .lock()
-                    .unwrap()
-                    .push_back(payload.into_bytes());
+                let _ = send_input_tx
+                    .send(rterm_core::PluginCmd::SendInput(payload.into_bytes()));
                 Ok(())
             })?,
         )?;
@@ -1588,22 +1570,20 @@ impl PluginHost {
             })?,
         )?;
 
-        let pending_scroll: Arc<Mutex<VecDeque<i32>>> =
-            Arc::new(Mutex::new(VecDeque::new()));
-        let scroll_for_call = Arc::clone(&pending_scroll);
+        let scroll_tx = cmd_tx.clone();
         rterm.set(
             "scroll",
             lua.create_function(move |_, delta: i32| {
-                scroll_for_call.lock().unwrap().push_back(delta);
+                let _ = scroll_tx.send(rterm_core::PluginCmd::Scroll(delta));
                 Ok(())
             })?,
         )?;
-        let scroll_for_live = Arc::clone(&pending_scroll);
+        let scroll_to_live_tx = cmd_tx.clone();
         rterm.set(
             "scroll_to_live",
             lua.create_function(move |_, ()| {
                 // A large negative delta is clamped to 0 by the App.
-                scroll_for_live.lock().unwrap().push_back(i32::MIN);
+                let _ = scroll_to_live_tx.send(rterm_core::PluginCmd::Scroll(i32::MIN));
                 Ok(())
             })?,
         )?;
@@ -1691,13 +1671,11 @@ impl PluginHost {
             })?,
         )?;
 
-        let pending_paste: Arc<Mutex<VecDeque<Vec<u8>>>> =
-            Arc::new(Mutex::new(VecDeque::new()));
-        let paste_for_call = Arc::clone(&pending_paste);
+        let paste_tx = cmd_tx.clone();
         rterm.set(
             "paste",
             lua.create_function(move |_, text: String| {
-                paste_for_call.lock().unwrap().push_back(text.into_bytes());
+                let _ = paste_tx.send(rterm_core::PluginCmd::Paste(text.into_bytes()));
                 Ok(())
             })?,
         )?;
@@ -1711,15 +1689,13 @@ impl PluginHost {
             })?,
         )?;
 
-        let pending_kills: Arc<Mutex<VecDeque<(usize, usize)>>> =
-            Arc::new(Mutex::new(VecDeque::new()));
-        let kills_for_call = Arc::clone(&pending_kills);
+        let kill_pane_tx = cmd_tx.clone();
         rterm.set(
             "kill_pane",
             lua.create_function(move |_, (tab, pane): (u32, u32)| {
                 let t = tab.saturating_sub(1) as usize;
                 let p = pane.saturating_sub(1) as usize;
-                kills_for_call.lock().unwrap().push_back((t, p));
+                let _ = kill_pane_tx.send(rterm_core::PluginCmd::KillPane(t, p));
                 Ok(())
             })?,
         )?;
@@ -3853,7 +3829,6 @@ impl PluginHost {
             lua,
             handlers,
             actions,
-            pending_input,
             pending_tab_titles,
             pending_window_title,
             pending_pane_titles,
@@ -3887,15 +3862,12 @@ impl PluginHost {
             builtin_action_labels,
             builtin_events,
             pending_custom_events,
-            pending_scroll,
             pending_scroll_to_line,
             pending_start_search,
             pending_new_tabs,
             pending_splits,
             pending_font_size,
             pending_opacity,
-            pending_paste,
-            pending_kills,
             pending_bell,
             pending_palette,
             pending_theme,
@@ -3942,16 +3914,6 @@ impl PluginHost {
         self.match_rules
             .lock()
             .map(|g| g.iter().map(|r| r.name.clone()).collect())
-            .unwrap_or_default()
-    }
-
-    /// Drain queued `(tab, pane)` kill targets from `rterm.kill_pane`.
-    /// The by-uid sibling migrated to the unified `PluginCmd` channel;
-    /// this one stays for now (uses indices rather than uid).
-    pub fn drain_pending_kills(&self) -> Vec<(usize, usize)> {
-        self.pending_kills
-            .lock()
-            .map(|mut q| q.drain(..).collect())
             .unwrap_or_default()
     }
 
@@ -4008,21 +3970,6 @@ impl PluginHost {
             .and_then(|mut g| g.take())
     }
 
-    /// Drain queued paste payloads from `rterm.paste(text)`.
-    pub fn drain_pending_paste(&self) -> Vec<Vec<u8>> {
-        self.pending_paste
-            .lock()
-            .map(|mut q| q.drain(..).collect())
-            .unwrap_or_default()
-    }
-
-    /// Drain queued scroll deltas from `rterm.scroll(delta)`.
-    pub fn drain_pending_scroll(&self) -> Vec<i32> {
-        self.pending_scroll
-            .lock()
-            .map(|mut q| q.drain(..).collect())
-            .unwrap_or_default()
-    }
 
     /// Take the latest logical line target from `rterm.scroll_to_line(line)`.
     pub fn take_pending_scroll_to_line(&self) -> Option<usize> {
@@ -4443,15 +4390,6 @@ impl PluginHost {
         }
     }
 
-    /// Drain queued byte payloads from `rterm.send_input(...)` calls. The
-    /// caller (rterm-app) writes each to the focused pane's PTY.
-    pub fn drain_pending_input(&self) -> Vec<Vec<u8>> {
-        self.pending_input
-            .lock()
-            .map(|mut q| q.drain(..).collect())
-            .unwrap_or_default()
-    }
-
     pub fn action_names(&self) -> Vec<String> {
         let map = self.actions.lock().unwrap();
         let mut names: Vec<String> = map.keys().cloned().collect();
@@ -4743,10 +4681,17 @@ mod tests {
             .load(r#"rterm.send_input("hi"); rterm.send_input("there")"#)
             .exec()
             .unwrap();
-        let queued = host.drain_pending_input();
+        let queued: Vec<Vec<u8>> = host
+            .drain_pending_commands()
+            .into_iter()
+            .filter_map(|c| match c {
+                rterm_core::PluginCmd::SendInput(b) => Some(b),
+                _ => None,
+            })
+            .collect();
         assert_eq!(queued, vec![b"hi".to_vec(), b"there".to_vec()]);
         // Second drain returns empty — items are consumed, not cloned.
-        assert!(host.drain_pending_input().is_empty());
+        assert!(host.drain_pending_commands().is_empty());
     }
 
     #[test]
@@ -4787,10 +4732,16 @@ mod tests {
             .unwrap();
         assert_eq!(host.take_pending_copy().as_deref(), Some("hello world"));
         assert!(host.take_pending_copy().is_none(), "copy is one-shot");
-        let pastes = host.drain_pending_paste();
-        assert_eq!(pastes, vec![b"incoming".to_vec()]);
         let cmds = host.drain_pending_commands();
-        let notifications: Vec<_> = cmds
+        let pastes: Vec<Vec<u8>> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                rterm_core::PluginCmd::Paste(b) => Some(b.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pastes, vec![b"incoming".to_vec()]);
+        let notifications: Vec<String> = cmds
             .into_iter()
             .filter_map(|c| match c {
                 rterm_core::PluginCmd::Notify(s) => Some(s),
@@ -6338,13 +6289,19 @@ mod tests {
             )
             .exec()
             .unwrap();
-        let kills = host.drain_pending_kills();
-        assert_eq!(kills, vec![(0, 1), (2, 0)]);
-        let tab_kills: Vec<usize> = host
-            .drain_pending_commands()
-            .into_iter()
+        let cmds = host.drain_pending_commands();
+        let kills: Vec<(usize, usize)> = cmds
+            .iter()
             .filter_map(|c| match c {
-                rterm_core::PluginCmd::KillTab(i) => Some(i),
+                rterm_core::PluginCmd::KillPane(t, p) => Some((*t, *p)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kills, vec![(0, 1), (2, 0)]);
+        let tab_kills: Vec<usize> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                rterm_core::PluginCmd::KillTab(i) => Some(*i),
                 _ => None,
             })
             .collect();
@@ -6352,16 +6309,23 @@ mod tests {
         // Saturating-sub guards against an accidental 0 — clamped to 0,
         // not a usize underflow.
         host.lua.load(r#"rterm.kill_tab(0); rterm.kill_pane(0, 0)"#).exec().unwrap();
-        let tab_kills_zero: Vec<usize> = host
-            .drain_pending_commands()
-            .into_iter()
+        let cmds2 = host.drain_pending_commands();
+        let tab_kills_zero: Vec<usize> = cmds2
+            .iter()
             .filter_map(|c| match c {
-                rterm_core::PluginCmd::KillTab(i) => Some(i),
+                rterm_core::PluginCmd::KillTab(i) => Some(*i),
                 _ => None,
             })
             .collect();
         assert_eq!(tab_kills_zero, vec![0]);
-        assert_eq!(host.drain_pending_kills(), vec![(0, 0)]);
+        let kills_zero: Vec<(usize, usize)> = cmds2
+            .into_iter()
+            .filter_map(|c| match c {
+                rterm_core::PluginCmd::KillPane(t, p) => Some((t, p)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kills_zero, vec![(0, 0)]);
     }
 
     #[test]
@@ -6688,10 +6652,16 @@ mod tests {
             )
             .exec()
             .unwrap();
-        let scrolls = host.drain_pending_scroll();
+        let cmds = host.drain_pending_commands();
+        let scrolls: Vec<i32> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                rterm_core::PluginCmd::Scroll(d) => Some(*d),
+                _ => None,
+            })
+            .collect();
         assert_eq!(scrolls, vec![-3, 5]);
-        let urls: Vec<String> = host
-            .drain_pending_commands()
+        let urls: Vec<String> = cmds
             .into_iter()
             .filter_map(|c| match c {
                 rterm_core::PluginCmd::OpenUrl(u) => Some(u),

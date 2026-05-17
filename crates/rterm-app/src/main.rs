@@ -138,13 +138,6 @@ impl EventSink for PluginBridge {
         }
     }
 
-    fn drain_pending_input(&self) -> Vec<Vec<u8>> {
-        self.0
-            .lock()
-            .map(|h| h.drain_pending_input())
-            .unwrap_or_default()
-    }
-
     fn drain_pending_routed_input_by_uid(&self) -> Vec<(u64, Vec<u8>)> {
         self.0
             .lock()
@@ -208,13 +201,6 @@ impl EventSink for PluginBridge {
             .unwrap_or_default()
     }
 
-    fn drain_pending_scroll(&self) -> Vec<i32> {
-        self.0
-            .lock()
-            .map(|h| h.drain_pending_scroll())
-            .unwrap_or_default()
-    }
-
     fn take_pending_scroll_to_line(&self) -> Option<usize> {
         self.0
             .lock()
@@ -255,20 +241,6 @@ impl EventSink for PluginBridge {
             .lock()
             .ok()
             .and_then(|h| h.take_pending_opacity())
-    }
-
-    fn drain_pending_paste(&self) -> Vec<Vec<u8>> {
-        self.0
-            .lock()
-            .map(|h| h.drain_pending_paste())
-            .unwrap_or_default()
-    }
-
-    fn drain_pending_kills(&self) -> Vec<(usize, usize)> {
-        self.0
-            .lock()
-            .map(|h| h.drain_pending_kills())
-            .unwrap_or_default()
     }
 
     fn take_pending_bell(&self) -> bool {

@@ -9531,15 +9531,9 @@ impl ApplicationHandler for App {
                     self.last_exit_code = Some(last);
                 }
 
-                // Forward any plugin-queued input to the focused pane's PTY.
-                let queued = self.events.drain_pending_input();
-                if !queued.is_empty() {
-                    if let Some(pane) = self.focused_pane() {
-                        for bytes in queued {
-                            pane.io.write_input(&bytes);
-                        }
-                    }
-                }
+                // `rterm.send_input(...)` migrated to the PluginCmd
+                // channel (SendInput variant) — handled in the main
+                // command-match block above.
 
                 // Plugin-addressed input by stable uid. Walk live panes
                 // to find the matching uid and forward bytes. Unknown
@@ -9880,6 +9874,61 @@ impl ApplicationHandler for App {
                                 }
                             }
                         }
+                        rterm_core::PluginCmd::KillPane(tab_idx, pane_idx) => {
+                            if let Some(pane) = self
+                                .tabs
+                                .get(tab_idx)
+                                .and_then(|t| t.pane_at(pane_idx))
+                            {
+                                pane.alive.store(false, Ordering::Release);
+                            }
+                        }
+                        rterm_core::PluginCmd::Paste(bytes) => {
+                            // Wrap in bracketed-paste markers when the
+                            // destination shell asked for them (DECSET
+                            // ?2004); otherwise forward raw. Mirrors
+                            // the keyboard-Paste path's handling.
+                            if let Some(pane) = self.focused_pane() {
+                                let bracketed = pane
+                                    .terminal
+                                    .lock()
+                                    .ok()
+                                    .map(|t| t.bracketed_paste())
+                                    .unwrap_or(false);
+                                if bracketed {
+                                    pane.io.write_input(b"\x1b[200~");
+                                    pane.io.write_input(&bytes);
+                                    pane.io.write_input(b"\x1b[201~");
+                                } else {
+                                    pane.io.write_input(&bytes);
+                                }
+                                self.events.emit("paste", &String::from_utf8_lossy(&bytes));
+                            }
+                        }
+                        rterm_core::PluginCmd::SendInput(bytes) => {
+                            // Plugin-injected input as if the user
+                            // typed. Goes to the focused pane's PTY.
+                            if let Some(pane) = self.focused_pane() {
+                                pane.io.write_input(&bytes);
+                            }
+                        }
+                        rterm_core::PluginCmd::Scroll(delta) => {
+                            // Positive = into history; negative = toward
+                            // live. `i32::MIN` is the `scroll_to_live`
+                            // sentinel — clamp catches it.
+                            if let Some(pane) = self.focused_pane() {
+                                let max_off = pane
+                                    .terminal
+                                    .lock()
+                                    .ok()
+                                    .map(|t| t.scrollback_len() as i32)
+                                    .unwrap_or(0);
+                                let cur = pane.scroll_offset.load(Ordering::Relaxed) as i32;
+                                let next = cur.saturating_add(delta).clamp(0, max_off);
+                                pane.scroll_offset.store(next as u16, Ordering::Relaxed);
+                                self.events.emit("scroll", &next.to_string());
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -9941,22 +9990,9 @@ impl ApplicationHandler for App {
                 }
 
 
-                // Plugin-requested pane kills. Flip the `alive` flag so the
-                // standard prune path closes the leaf next frame.
-                for (tab_idx, pane_idx) in self.events.drain_pending_kills() {
-                    if let Some(pane) = self
-                        .tabs
-                        .get(tab_idx)
-                        .and_then(|t| t.pane_at(pane_idx))
-                    {
-                        pane.alive.store(false, Ordering::Release);
-                    }
-                }
-
-                // Plugin-requested tab kills: mark every pane in the tab
-                // dead so the same prune path collapses it. Doing it via
-                // `alive` keeps a single tear-down code path and preserves
-                // any "save scrollback on exit" hooks per pane.
+                // `rterm.kill_pane` / `rterm.kill_tab` migrated to the
+                // PluginCmd channel (KillPane / KillTab variants) —
+                // handled in the main command-match block above.
 
                 // Plugin-supplied full palette swap from `rterm.set_palette`.
                 if let Some((fg, bg, cur, named)) = self.events.take_pending_palette() {
@@ -10013,37 +10049,11 @@ impl ApplicationHandler for App {
                 }
 
                 // Plugin-paste — route through `write_paste` so the same
-                // line-ending normalisation and bracketed-paste-marker
-                // stripping applies as for clipboard / right-click pastes.
-                // Lossy UTF-8 conversion is fine: Lua strings are usually
-                // valid UTF-8, and non-text bytes have no defensible meaning
-                // when fed to a shell anyway.
-                for bytes in self.events.drain_pending_paste() {
-                    let text = String::from_utf8_lossy(&bytes);
-                    self.write_paste(&text);
-                }
-
-                // Plugin-driven scroll deltas — applied to the focused pane,
-                // clamped to its scrollback length. Sums via saturating_add
-                // so `i32::MIN` (used by `scroll_to_live`) doesn't overflow.
-                let scrolls = self.events.drain_pending_scroll();
-                if !scrolls.is_empty() {
-                    if let Some(pane) = self.focused_pane() {
-                        let max = pane
-                            .terminal
-                            .lock()
-                            .ok()
-                            .map(|t| t.scrollback_len() as i32)
-                            .unwrap_or(0);
-                        let cur = pane.scroll_offset.load(Ordering::Relaxed) as i32;
-                        let sum = scrolls
-                            .iter()
-                            .fold(0i32, |acc, d| acc.saturating_add(*d));
-                        let next = cur.saturating_add(sum).clamp(0, max).max(0) as u16;
-                        pane.scroll_offset.store(next, Ordering::Relaxed);
-                        self.events.emit("scroll", &next.to_string());
-                    }
-                }
+                // `rterm.paste(text)` and `rterm.scroll(delta)`
+                // migrated to the PluginCmd channel — see the
+                // Paste / Scroll match arms in the main command
+                // loop above. The renderer-side write_paste helper
+                // is now invoked directly through the channel arm.
 
                 // Absolute scroll from `rterm.scroll_to_line(line)`.
                 // `scroll_offset = sb_len - line`, clamped. Anchors the

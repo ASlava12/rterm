@@ -20,11 +20,6 @@ pub trait EventSink: Send + Sync {
     }
     /// Run a plugin-registered action by name. No-op if unknown.
     fn run_action(&self, _name: &str) {}
-    /// Drain queued input payloads enqueued by plugins via
-    /// `rterm.send_input(...)`. The App writes each to the focused PTY.
-    fn drain_pending_input(&self) -> Vec<Vec<u8>> {
-        Vec::new()
-    }
     /// Drain queued addressed input from `rterm.send_to_pane(...)`. The
     /// `(tab, pane)` indices are 0-based; out-of-range entries are
     /// silently dropped by the App.
@@ -154,10 +149,6 @@ pub trait EventSink: Send + Sync {
     fn drain_pending_custom_events(&self) -> Vec<(String, String)> {
         Vec::new()
     }
-    /// Drain scroll deltas from `rterm.scroll(delta)` (focused-pane scope).
-    fn drain_pending_scroll(&self) -> Vec<i32> {
-        Vec::new()
-    }
     /// Latest logical line target from `rterm.scroll_to_line(line)`.
     fn take_pending_scroll_to_line(&self) -> Option<usize> {
         None
@@ -185,18 +176,6 @@ pub trait EventSink: Send + Sync {
     /// clamped to `0.0..=1.0`.
     fn take_pending_opacity(&self) -> Option<f32> {
         None
-    }
-    /// Drain paste payloads from `rterm.paste(text)`. Each is sent to the
-    /// focused pane, wrapped in bracketed-paste markers when the pane has
-    /// the mode enabled.
-    fn drain_pending_paste(&self) -> Vec<Vec<u8>> {
-        Vec::new()
-    }
-    /// Drain `(tab, pane)` kill targets from `rterm.kill_pane`. The App
-    /// flips the target pane's `alive` flag so `prune_dead_panes` closes
-    /// it on the next frame.
-    fn drain_pending_kills(&self) -> Vec<(usize, usize)> {
-        Vec::new()
     }
     /// True if `rterm.bell()` was called since the last drain — App fires
     /// the standard bell flash + attention ping.

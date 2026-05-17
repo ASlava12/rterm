@@ -46,4 +46,21 @@ pub enum PluginCmd {
     /// `rterm.kill_tab(idx)` — close the tab at 0-based index. The
     /// App treats this like clicking the tab's `×` button.
     KillTab(usize),
+    /// `rterm.kill_pane(tab, pane)` — index-based pane close. Tab
+    /// and pane indices are 0-based here; the Lua wrapper converts
+    /// from the 1-based form users type.
+    KillPane(usize, usize),
+    /// `rterm.paste(text)` — synthesise a paste into the focused
+    /// pane. The renderer wraps in bracketed-paste markers (`ESC [
+    /// 200 ~ … ESC [ 201 ~`) when the destination shell asked for
+    /// them via DECSET ?2004.
+    Paste(Vec<u8>),
+    /// `rterm.send_input(payload)` — write raw bytes to the focused
+    /// pane's PTY (as if the user had typed). Used by plugin
+    /// macros to inject canned text / commands.
+    SendInput(Vec<u8>),
+    /// `rterm.scroll(delta)` — scroll the focused pane's viewport.
+    /// Positive = into history (scroll up); negative = toward live
+    /// output (scroll down). Magnitude is in cells.
+    Scroll(i32),
 }
