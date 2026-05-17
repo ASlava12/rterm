@@ -77,6 +77,11 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
+    # `GetCurrentThreadId` lives under `Win32_System_Threading`; the
+    # global-hotkey worker reports its thread id back so the main
+    # thread can post `WM_QUIT` to it on shutdown via
+    # `PostThreadMessageW`.
+    "Win32_System_Threading",
 ] }
 
 [profile.dev]
