@@ -119,80 +119,18 @@ impl AppAction {
     /// Canonical snake_case names that `from_name` accepts (one canonical
     /// alias per variant). Exposed to plugins through
     /// `rterm.builtin_actions()`.
+    ///
+    /// Derived from [`AppAction::ALL`] via [`AppAction::canonical_for`]
+    /// so the two stay in lock-step automatically — adding a new
+    /// variant only needs an `ALL` entry plus an arm in
+    /// `canonical_for` / `from_name`, not a third copy of the name
+    /// list. Order matches `ALL`'s display order; CLI consumers
+    /// (`--list-actions`) sort the result themselves.
     pub fn canonical_names() -> Vec<String> {
-        [
-            "new_tab",
-            "close_tab",
-            "next_tab",
-            "prev_tab",
-            "goto_first_tab",
-            "goto_last_tab",
-            "move_tab_left",
-            "move_tab_right",
-            "split_horizontal",
-            "split_vertical",
-            "split_auto",
-            "close_pane",
-            "focus_next_pane",
-            "focus_prev_pane",
-            "focus_first_pane",
-            "focus_last_pane",
-            "paste",
-            "copy",
-            "clear_selection",
-            "search",
-            "jump_prev_prompt",
-            "jump_next_prompt",
-            "jump_prev_command",
-            "jump_next_command",
-            "scroll_page_up",
-            "scroll_page_down",
-            "scroll_half_page_up",
-            "scroll_half_page_down",
-            "scroll_line_up",
-            "scroll_line_down",
-            "scroll_home",
-            "scroll_end",
-            "clear_scrollback",
-            "resize_pane_left",
-            "resize_pane_right",
-            "resize_pane_up",
-            "resize_pane_down",
-            "toggle_help",
-            "open_palette",
-            "save_scrollback",
-            "zoom_pane",
-            "balance_panes",
-            "quit",
-            "font_increase",
-            "font_decrease",
-            "font_reset",
-            "opacity_increase",
-            "opacity_decrease",
-            "opacity_reset",
-            "toggle_last_tab",
-            "copy_hovered_url",
-            "reset_pane",
-            "swap_pane_next",
-            "swap_pane_prev",
-            "toggle_bell_mute",
-            "open_hovered_url",
-            "cycle_theme",
-            "cycle_theme_prev",
-            "open_settings",
-            "rename_tab",
-            "snap_window_left",
-            "snap_window_right",
-            "snap_window_top",
-            "snap_window_bottom",
-            "maximize_toggle",
-            "minimize_window",
-            "restore_window",
-            "toggle_guake",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect()
+        Self::ALL
+            .iter()
+            .map(|(action, _)| Self::canonical_for(*action).to_string())
+            .collect()
     }
 
     /// Parse a snake_case action name from config — keep in sync with `ALL`.

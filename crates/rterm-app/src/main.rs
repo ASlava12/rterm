@@ -2441,18 +2441,27 @@ mod tests {
 
     #[test]
     fn default_toml_template_mentions_every_canonical_action() {
-        // The `# Actions:` comment in `default.toml` is what first-run
-        // users skim to learn what they can bind. When a new action is
-        // added without updating this comment, the user has no on-disk
-        // record that it exists (and `--list-actions` is easy to miss).
-        // Pin the contract so a future variant addition fails the test
-        // until the template comment is updated alongside.
-        let template = rterm_config::default_template();
-        for name in rterm_render::AppAction::canonical_names() {
-            assert!(
-                template.contains(&name),
-                "default.toml template missing canonical action {name:?}",
-            );
+        // The `# Actions:` comment in the auto-generated `config.toml`
+        // is what first-run users skim to learn what they can bind.
+        // When a new action is added without updating this comment, the
+        // user has no on-disk record that it exists (and
+        // `--list-actions` is easy to miss). Pin the contract for every
+        // shipped comment language so a future variant addition fails
+        // the test until BOTH templates are updated alongside —
+        // otherwise a `ru_RU` user would silently lose visibility into
+        // newer actions even after the EN template gets the comment.
+        let names = rterm_render::AppAction::canonical_names();
+        for lang in [
+            rterm_config::CommentLang::En,
+            rterm_config::CommentLang::Ru,
+        ] {
+            let template = rterm_config::default_template_for(lang);
+            for name in &names {
+                assert!(
+                    template.contains(name),
+                    "{lang:?} default-template missing canonical action {name:?}",
+                );
+            }
         }
     }
 
