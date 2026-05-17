@@ -33,7 +33,12 @@ use winit::keyboard::{ModifiersState, NamedKey};
 /// dropping the handle unregisters the hotkey and joins the worker
 /// thread (if any).
 pub(crate) struct GlobalHotkeyHandle {
+    // Held purely for its `Drop` side effect (unregisters the hotkey
+    // + joins the worker thread); the field is never read. The
+    // `dead_code` allow is the standard way to silence the linter
+    // for RAII guards.
     #[cfg(windows)]
+    #[allow(dead_code)]
     inner: Option<windows_impl::WorkerHandle>,
     // Non-Windows targets carry no state — the constructor logs and
     // returns this empty handle.
