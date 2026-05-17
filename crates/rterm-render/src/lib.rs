@@ -2208,6 +2208,12 @@ enum TabHit {
 const TAB_CLOSE_GLYPH: &str = "× ";
 const TAB_CLOSE_WIDTH_CELLS: usize = 2;
 
+/// Breathing-room between the last tab and the window-control strip.
+/// Without this the trailing edge of the rightmost tab visually
+/// presses against the `−`/`□`/`×` cluster on Windows defaults —
+/// reported as "last tab overlaps the minimize / close icons".
+const TAB_CONTROLS_GAP_CELLS: usize = 2;
+
 /// `≡` hamburger button at the start of the header. Clicking it opens
 /// the app menu (every common action in one list). Padded with leading
 /// and trailing spaces so the glyph reads as a distinct chip rather
@@ -2410,6 +2416,14 @@ pub struct App {
     /// position to the new one over `TAB_SWAP_ANIM_MS` so the slide
     /// looks smooth instead of a hard jump.
     tab_swap_anim: Option<TabSwapAnim>,
+    /// Horizontal scroll of the tab strip in pixels. Increasing it
+    /// shifts the tab labels LEFT (so tabs that previously ran past
+    /// the window-control buttons slide into view from the right).
+    /// Driven by wheel-over-tabstrip — VSCode-style scrolling — and
+    /// auto-adjusted on focus change so the active tab stays visible.
+    /// Clamped to [0, total_tabs_width - available_strip_width] at
+    /// the use site (tab_layout / handle_scroll).
+    tab_scroll_offset: f64,
     /// Phase reference for the cursor-blink animation.
     cursor_blink_anchor: Instant,
     /// Last cursor icon we asked winit for — avoid re-setting on every mouse
@@ -2654,6 +2668,7 @@ impl App {
             tab_dragging: None,
             tab_drag_press_offset: 0.0,
             tab_swap_anim: None,
+            tab_scroll_offset: 0.0,
             cursor_blink_anchor: Instant::now(),
             drag_scroll_dir: 0,
             last_cursor_icon: CursorIcon::Default,
@@ -3074,29 +3089,33 @@ impl App {
         }
         let hb_end = rect.left as f64 + HAMBURGER_WIDTH_CELLS as f64 * cell_w;
         // Reserve the trailing N cells for the window controls
-        // (min / max / close), which share the row with the tabs.
+        // (min / max / close), plus an extra `TAB_CONTROLS_GAP_CELLS`
+        // of breathing room so the very last tab doesn't visually
+        // butt up against the close button.
         let controls_cells = if self.os_decorations {
             0.0
         } else {
-            WINDOW_CONTROLS_WIDTH_CELLS as f64
+            WINDOW_CONTROLS_WIDTH_CELLS as f64 + TAB_CONTROLS_GAP_CELLS as f64
         };
         let tabs_right =
             (rect.left as f64 + rect.width as f64) - controls_cells * cell_w;
-        let mut cursor = hb_end;
+        // VSCode-style horizontal scroll: shifting the cursor LEFT by
+        // `tab_scroll_offset` slides off-screen tabs into view from
+        // the right. Negative `left` is fine — TextBounds + the
+        // tab-rendering clip on `tabs_right` keep glyphs from
+        // bleeding into the hamburger or controls strips.
+        let mut cursor = hb_end - self.tab_scroll_offset;
         let mut entries = Vec::with_capacity(self.tabs.len());
         for (i, tab) in self.tabs.iter().enumerate() {
             let info = self.tab_label(i, tab);
             let close_cells = TAB_CLOSE_WIDTH_CELLS as f64;
             let body_end = cursor + (info.body_cells + info.badge_cells) as f64 * cell_w;
             let close_end = body_end + close_cells * cell_w;
-            // Stop laying out tabs once we run into the window-controls
-            // strip on the right. The remaining tabs simply aren't
-            // clickable from the tab bar this frame (resize the window
-            // or rebind a focus shortcut) — better than overlapping
-            // chips that look broken.
-            if cursor >= tabs_right {
-                break;
-            }
+            // Every tab gets a full-width entry — even off-screen
+            // ones. The clamp on `body_end` / `close_end` to
+            // `tabs_right` keeps hit-test from accepting clicks past
+            // the visible strip; off-screen `left < hb_end` entries
+            // are filtered out at hit-test time.
             entries.push(TabLayoutEntry {
                 idx: i,
                 left: cursor,
@@ -3121,6 +3140,100 @@ impl App {
         })
     }
 
+    /// Total width of all tab chips in pixels (no scroll applied).
+    /// Used to clamp `tab_scroll_offset` so the user can't scroll past
+    /// the right end of the strip into empty space.
+    fn total_tabs_width(&self) -> f64 {
+        let Some(state) = self.state.as_ref() else { return 0.0 };
+        let cell_w = state.text.cell_width() as f64;
+        if cell_w <= 0.0 {
+            return 0.0;
+        }
+        self.tabs
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let info = self.tab_label(i, t);
+                (info.body_cells + info.badge_cells + TAB_CLOSE_WIDTH_CELLS) as f64 * cell_w
+            })
+            .sum()
+    }
+
+    /// Width of the visible tab-strip slot (between the hamburger
+    /// button and the window-controls reserve, minus the breathing
+    /// gap that keeps last-tab from touching the close button).
+    fn tab_strip_visible_width(&self) -> f64 {
+        let Some(rect) = self.header_rect() else { return 0.0 };
+        let Some(state) = self.state.as_ref() else { return 0.0 };
+        let cell_w = state.text.cell_width() as f64;
+        let hb_end = rect.left as f64 + HAMBURGER_WIDTH_CELLS as f64 * cell_w;
+        let controls_cells = if self.os_decorations {
+            0.0
+        } else {
+            WINDOW_CONTROLS_WIDTH_CELLS as f64 + TAB_CONTROLS_GAP_CELLS as f64
+        };
+        let tabs_right =
+            (rect.left as f64 + rect.width as f64) - controls_cells * cell_w;
+        (tabs_right - hb_end).max(0.0)
+    }
+
+    /// Maximum value for `tab_scroll_offset`. Zero when all tabs fit
+    /// inside the visible strip.
+    fn max_tab_scroll(&self) -> f64 {
+        let total = self.total_tabs_width();
+        let visible = self.tab_strip_visible_width();
+        (total - visible).max(0.0)
+    }
+
+    /// Adjust `tab_scroll_offset` by `delta_px` and clamp to
+    /// `[0, max_tab_scroll()]`. Returns `true` when the value
+    /// actually changed (so callers can request a redraw).
+    pub(crate) fn scroll_tab_strip(&mut self, delta_px: f64) -> bool {
+        let max = self.max_tab_scroll();
+        let new = (self.tab_scroll_offset + delta_px).clamp(0.0, max);
+        if (new - self.tab_scroll_offset).abs() < 0.5 {
+            return false;
+        }
+        self.tab_scroll_offset = new;
+        true
+    }
+
+    /// Make sure the active tab is visible inside the strip. Called
+    /// after focus changes / new-tab / tab close so a tab that's
+    /// scrolled off-screen doesn't stay there silently.
+    pub(crate) fn ensure_active_tab_visible(&mut self) {
+        let Some(layout) = self.tab_layout() else { return };
+        let Some(entry) = layout.entries.iter().find(|e| e.idx == self.active_tab)
+        else {
+            return;
+        };
+        let visible_left = layout.hamburger_end;
+        let visible_right = layout.tab_strip_rect.left as f64
+            + layout.tab_strip_rect.width as f64
+            - if self.os_decorations {
+                0.0
+            } else {
+                let cell_w = self
+                    .state
+                    .as_ref()
+                    .map(|s| s.text.cell_width() as f64)
+                    .unwrap_or(0.0);
+                (WINDOW_CONTROLS_WIDTH_CELLS + TAB_CONTROLS_GAP_CELLS) as f64 * cell_w
+            };
+        let tab_w = entry.close_end - entry.left;
+        if entry.left < visible_left {
+            // Tab is off the LEFT edge — bring it back into view by
+            // reducing the scroll offset.
+            let delta = entry.left - visible_left;
+            self.scroll_tab_strip(delta);
+        } else if entry.left + tab_w > visible_right {
+            // Off the RIGHT edge — scroll forward until the right
+            // edge of the tab matches the visible right edge.
+            let delta = (entry.left + tab_w) - visible_right;
+            self.scroll_tab_strip(delta);
+        }
+    }
+
     /// `tab_at` + a flag saying whether the click landed on the small
     /// "× close" marker appended to each tab label.
     fn tab_hit_at(&self, x: f64, y: f64) -> Option<(usize, TabHit)> {
@@ -3133,7 +3246,14 @@ impl App {
             return None;
         }
         for e in &layout.entries {
-            if x >= e.left && x < e.close_end {
+            // Clamp the left edge of the hit zone to the hamburger
+            // boundary. Off-screen-left tabs (when `tab_scroll_offset`
+            // is positive) have `e.left < hamburger_end`; without
+            // this clamp a click in the gap between the hamburger
+            // and the first visible tab would be attributed to the
+            // off-screen tab.
+            let visible_left = e.left.max(layout.hamburger_end);
+            if x >= visible_left && x < e.close_end {
                 let hit = if x >= e.body_end {
                     TabHit::Close
                 } else {
@@ -4295,6 +4415,10 @@ impl App {
         self.previous_tab = prev;
         self.sync_terminal_size();
         self.update_title();
+        // A freshly-added tab is the last one in the strip; if the
+        // user already scrolled the strip, the new tab might appear
+        // off the right edge. Scroll forward so it stays visible.
+        self.ensure_active_tab_visible();
         // Payload: `<tab_1based>\t<cwd>` — empty cwd field means the
         // spawner used its default (typically the process cwd).
         self.events.emit(
@@ -4400,6 +4524,9 @@ impl App {
         self.sync_terminal_size();
         self.update_title();
         self.mark_tab_read(self.active_tab);
+        // Keep the newly-active tab visible inside the (possibly
+        // scrolled) tab strip — symmetric with VSCode / Chrome.
+        self.ensure_active_tab_visible();
         // The search overlay's `pane_idx` referenced the old tab. Keeping
         // it open across the switch would silently re-target a same-index
         // pane in the new tab. Close it instead so a re-open re-anchors.
@@ -4426,6 +4553,7 @@ impl App {
         self.sync_terminal_size();
         self.update_title();
         self.mark_tab_read(self.active_tab);
+        self.ensure_active_tab_visible();
         // The search overlay's `pane_idx` referenced the old tab. Keeping
         // it open across the switch would silently re-target a same-index
         // pane in the new tab. Close it instead so a re-open re-anchors.
@@ -7142,14 +7270,37 @@ impl App {
             }
             return;
         }
-        // Wheel over the tab bar switches tabs (Firefox/Chrome
-        // convention). Wheel up = previous tab, down = next tab.
+        // Wheel over the tab bar scrolls the tab strip horizontally
+        // (VSCode convention). Wheel up = scroll LEFT (towards first
+        // tab), down = scroll RIGHT (towards last tab). Shift+wheel
+        // keeps the older Firefox/Chrome behaviour of switching tabs.
         // Falls through to pane-scroll when outside the header.
         if let Some(rect) = self.header_rect() {
             let y = self.cursor_pos.y as f32;
             if y >= rect.top && y < rect.top + rect.height {
-                let dir = -step.signum() as isize;
-                self.switch_tab(dir);
+                if self.modifiers.contains(ModifiersState::SHIFT) {
+                    let dir = -step.signum() as isize;
+                    self.switch_tab(dir);
+                } else {
+                    // One "step" of wheel = roughly one tab's worth
+                    // of horizontal scroll. Use cell_w × 8 cells per
+                    // step (an average tab is ~10-14 cells with
+                    // padding); 8 keeps a single notch from sliding
+                    // past a short tab while still feeling
+                    // responsive on long tab strips. Down = scroll
+                    // forward (deeper into the list); up = back.
+                    let cell_w = self
+                        .state
+                        .as_ref()
+                        .map(|s| s.text.cell_width() as f64)
+                        .unwrap_or(8.0);
+                    let delta_px = -(step as f64) * cell_w * 8.0;
+                    if self.scroll_tab_strip(delta_px) {
+                        if let Some(state) = self.state.as_ref() {
+                            state.window.request_redraw();
+                        }
+                    }
+                }
                 return;
             }
         }
@@ -8614,6 +8765,13 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(size) => {
                 if let Some(state) = self.state.as_mut() {
                     state.resize(size.width, size.height);
+                }
+                // Window grew or shrank — clamp the tab-strip scroll
+                // offset in case the new strip width can already show
+                // all tabs without scrolling.
+                let max = self.max_tab_scroll();
+                if self.tab_scroll_offset > max {
+                    self.tab_scroll_offset = max;
                 }
                 // Update the wgpu surface size immediately so the
                 // next frame renders at the right dimensions, but
