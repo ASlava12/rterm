@@ -1313,37 +1313,32 @@ fn spawn_watcher(plugins: Arc<Mutex<PluginHost>>, config_dir: PathBuf, config_to
                         rterm_render::palette::init_palette(build_palette_over(&cfg.colors));
                         rterm_render::palette::set_bold_is_bright(cfg.font.bold_is_bright);
                         if let Ok(host) = plugins.lock() {
-                            host.set_scrollback_limit_override(cfg.terminal.scrollback);
-                            host.set_tab_silence_ms_override(cfg.terminal.tab_silence_ms);
-                            host.set_cursor_blink_override(cfg.terminal.cursor_blink);
-                            host.set_show_scrollbar_override(cfg.terminal.show_scrollbar);
-                            host.set_scroll_on_output_override(cfg.terminal.scroll_on_output);
-                            host.set_bell_visual_override(cfg.terminal.bell_visual);
-                            host.set_bell_urgent_override(cfg.terminal.bell_urgent);
-                            host.set_slow_command_ms_override(cfg.terminal.slow_command_ms);
-                            // Guake snapshot — flip to None when the
-                            // user disables the feature mid-session so
-                            // the renderer drops the AlwaysOnTop level
-                            // it may have left applied.
-                            host.set_guake_override(if cfg.guake.enabled {
-                                Some((
-                                    true,
-                                    cfg.guake.position.clone(),
-                                    cfg.guake.height_pct,
-                                    cfg.guake.width_pct,
-                                ))
-                            } else {
-                                None
-                            });
-                            // `set_font_size` reuses the same pending
-                            // channel as `rterm.set_font_size(N)` — the
-                            // renderer's clamp+NaN guard already
-                            // sanitizes whatever value lands here.
-                            host.set_font_size_override(cfg.font.size);
-                            // Same idea for `window.opacity` — let a user
-                            // dial the translucency live without
-                            // restarting. NaN-guarded at the boundary.
-                            host.set_opacity_override(cfg.window.opacity);
+                            // Single batched call — `apply_config_snapshot`
+                            // owns the field list, so adding a new hot-
+                            // reloadable knob touches one method in
+                            // rterm-plugin instead of two sites here.
+                            host.apply_config_snapshot(
+                                cfg.terminal.scrollback,
+                                cfg.terminal.tab_silence_ms,
+                                cfg.terminal.cursor_blink,
+                                cfg.terminal.show_scrollbar,
+                                cfg.terminal.scroll_on_output,
+                                cfg.terminal.bell_visual,
+                                cfg.terminal.bell_urgent,
+                                cfg.terminal.slow_command_ms,
+                                if cfg.guake.enabled {
+                                    Some((
+                                        true,
+                                        cfg.guake.position.clone(),
+                                        cfg.guake.height_pct,
+                                        cfg.guake.width_pct,
+                                    ))
+                                } else {
+                                    None
+                                },
+                                cfg.font.size,
+                                cfg.window.opacity,
+                            );
                             let _ = host.emit("reload", "config".to_string());
                             // Let plugins re-style their overlays when the
                             // palette swaps.

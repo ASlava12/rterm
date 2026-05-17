@@ -20,7 +20,22 @@ pub struct SplitFrame {
     pub b_rect: PaneRect,
 }
 
+/// BSP-style pane tree.
+///
+/// The `Hole` variant is an internal placeholder used during structural
+/// mutations (`split_leaf`, `close_leaf`, `swap_leaves`) to satisfy the
+/// borrow checker via `mem::replace`. It is **not** part of the
+/// observable shape: every public method that returns or accepts a
+/// `Tree<L>` guarantees no `Hole` is reachable at rest.
+///
+/// `#[non_exhaustive]` is intentional — it prevents callers outside
+/// the crate from writing exhaustive matches that would have to
+/// handle `Hole`. The module itself is `pub(crate)` so external
+/// crates can't reach this type at all; the attribute is defence in
+/// depth against any future `pub` re-export accidentally widening the
+/// surface.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Tree<L> {
     Leaf(L),
     Split {
@@ -32,6 +47,7 @@ pub enum Tree<L> {
     },
     /// Internal placeholder used during structural mutations (split, close)
     /// to satisfy the borrow checker. Should not be observed at rest.
+    #[doc(hidden)]
     Hole,
 }
 

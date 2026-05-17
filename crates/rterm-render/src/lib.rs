@@ -2,7 +2,7 @@
 
 mod bg;
 pub mod palette;
-pub mod tree;
+pub(crate) mod tree;
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

@@ -583,6 +583,36 @@ fn progress_state_name(state: u8) -> &'static str {
 }
 
 impl PluginHost {
+    /// Construct a fresh Lua plugin host.
+    ///
+    /// ## Trust model
+    ///
+    /// `Lua::new()` opens the full Lua 5.4 standard library: `io`,
+    /// `os` (including `os.execute` and `os.remove`), `package`
+    /// (including `package.loadlib` — arbitrary C extension loading),
+    /// `debug`, and friends. This is **intentional** — rterm plugins
+    /// are written by the same user who owns the host shell, sit in
+    /// the user's config directory (`~/.config/rterm/`), and have the
+    /// same trust level as shell rc files.
+    ///
+    /// A plugin can:
+    /// - read/write any file the user can,
+    /// - spawn subprocesses,
+    /// - send arbitrary bytes to any pane via `rterm.send_input` /
+    ///   `rterm.send_to_pane`,
+    /// - open URLs through `rterm.open_url` (filtered by the safe-
+    ///   scheme whitelist on the renderer side; see
+    ///   `rterm_core::is_safe_url`).
+    ///
+    /// The threat boundary is the **filesystem permission** to write
+    /// into `~/.config/rterm/`. An attacker who can drop a file there
+    /// already has user-level access by definition.
+    ///
+    /// If you ever need a restricted Lua surface — e.g. running
+    /// third-party plugins — replace `Lua::new()` with
+    /// `Lua::new_with(StdLib::SAFE, LuaOptions::default())` and audit
+    /// every `rterm.set("foo", lua.create_function(...))` setter for
+    /// side-effects on host state.
     pub fn new() -> Result<Self> {
         let lua = Lua::new();
         let handlers: Arc<Mutex<HashMap<String, Vec<RegistryKey>>>> =
@@ -4267,6 +4297,45 @@ impl PluginHost {
         if let Ok(mut g) = self.pending_guake.lock() {
             *g = Some(guake);
         }
+    }
+
+    /// Push a full config snapshot to the renderer in one call. Centralises
+    /// the field list so adding a new hot-reloadable config knob touches
+    /// THIS function plus the matching `take_pending_X` drain — instead of
+    /// one update line in `rterm-app`'s reload watcher per field.
+    ///
+    /// Internally still calls the per-field `set_X_override` setters; their
+    /// sub-mutexes are short-lived (single-write each), so an interleaved
+    /// renderer drain may see a partial snapshot for a few microseconds.
+    /// That's the same behaviour the old multi-call site produced — neither
+    /// is atomic across all fields, and the renderer applies whatever it
+    /// drains at the next frame.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_config_snapshot(
+        &self,
+        scrollback: usize,
+        tab_silence_ms: u64,
+        cursor_blink: bool,
+        show_scrollbar: bool,
+        scroll_on_output: bool,
+        bell_visual: bool,
+        bell_urgent: bool,
+        slow_command_ms: u64,
+        guake: Option<(bool, String, u8, u8)>,
+        font_size: f32,
+        opacity: f32,
+    ) {
+        self.set_scrollback_limit_override(scrollback);
+        self.set_tab_silence_ms_override(tab_silence_ms);
+        self.set_cursor_blink_override(cursor_blink);
+        self.set_show_scrollbar_override(show_scrollbar);
+        self.set_scroll_on_output_override(scroll_on_output);
+        self.set_bell_visual_override(bell_visual);
+        self.set_bell_urgent_override(bell_urgent);
+        self.set_slow_command_ms_override(slow_command_ms);
+        self.set_guake_override(guake);
+        self.set_font_size_override(font_size);
+        self.set_opacity_override(opacity);
     }
     /// Drain queued per-pane bell-mute requests from
     /// `rterm.set_pane_bell_muted(tab, pane, muted)`. Indices are 0-based
