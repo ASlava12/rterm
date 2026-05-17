@@ -3942,14 +3942,14 @@ impl App {
                 alpha * focus_mul,
                 chip_radius,
             ));
-            // Hover highlight on the × close marker — Chrome-style:
-            // small darker pill behind the cross when the cursor is
-            // specifically over it. The close zone is two cells wide
-            // (`"× "` — glyph + trailing space) but the × itself sits
-            // in the *left* cell only; centring the highlight over the
-            // whole zone would visually offset the pill to the right
-            // of the glyph. Centre on the × cell instead so the pill
-            // sits symmetrically around the cross.
+            // Hover highlight on the × close marker. The close zone
+            // is two cells wide (`"× "` — glyph + trailing space) but
+            // the × itself sits in the *left* cell only; centring the
+            // highlight over the whole zone would visually offset the
+            // marker to the right of the glyph. Centre on the × cell
+            // so the marker sits symmetrically around the cross.
+            // Painted as a sharp rectangle (no corner radius) to match
+            // the user's preferred square outline.
             if hover_close_tab == Some(e.idx) {
                 if let Some(state) = self.state.as_ref() {
                     let cell_w = state.text.cell_width();
@@ -3957,7 +3957,7 @@ impl App {
                         let glyph_center_x = e.body_end as f32 + cell_w * 0.5;
                         // Modest horizontal padding around the glyph
                         // (~4 px each side) without growing past a
-                        // single cell-and-a-half — keeps the pill
+                        // single cell-and-a-half — keeps the marker
                         // crisp on narrow fonts.
                         let hl_w = (cell_w + 8.0).min(cell_w * 1.5);
                         let close_left_px = glyph_center_x - hl_w * 0.5;
@@ -3966,12 +3966,11 @@ impl App {
                             bg[1].saturating_sub(10),
                             bg[2].saturating_sub(10),
                         ];
-                        out.push(bg::BgQuad::from_srgb_rounded(
+                        out.push(bg::BgQuad::from_srgb(
                             [close_left_px, chip_top + 2.0],
                             [hl_w, chip_h - 4.0],
                             highlight,
                             0.85,
-                            chip_radius * 0.8,
                         ));
                     }
                 }
