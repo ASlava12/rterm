@@ -4,6 +4,7 @@ members = [
     "crates/rterm-core",
     "crates/rterm-pty",
     "crates/rterm-config",
+    "crates/rterm-history",
     "crates/rterm-plugin",
     "crates/rterm-render",
     "crates/rterm-app",
@@ -24,6 +25,7 @@ rterm-pty = { path = "crates/rterm-pty" }
 rterm-config = { path = "crates/rterm-config" }
 rterm-plugin = { path = "crates/rterm-plugin" }
 rterm-render = { path = "crates/rterm-render" }
+rterm-history = { path = "crates/rterm-history" }
 
 # Error handling
 anyhow = "1.0"
@@ -68,6 +70,11 @@ arboard = "3"
 open = "5"
 base64 = "0.22"
 regex = "1"
+
+# Embedded relational store for the command-history feature
+# (rterm-history). `bundled` compiles SQLite from vendored C so the
+# resulting binary has no system-SQLite dependency on any platform.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Win32 imports for the global-hotkey worker thread (RegisterHotKey +
 # its message-pump cousins). Pulled in only on Windows targets via the

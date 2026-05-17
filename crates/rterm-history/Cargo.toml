@@ -1,0 +1,13 @@
+[package]
+name = "rterm-history"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Persistent terminal-side command history + suggestions (SQLite-backed) for rterm"
+
+[dependencies]
+anyhow = { workspace = true }
+tracing = { workspace = true }
+rusqlite = { workspace = true }
