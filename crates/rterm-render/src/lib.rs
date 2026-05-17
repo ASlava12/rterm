@@ -9692,32 +9692,73 @@ fn trim_label(s: &str, max: usize) -> String {
     out
 }
 
-/// Write `text` to the system clipboard. On Linux/Wayland arboard's clipboard
-/// connection has to outlive the call (the content lives in the process that
-/// "owns" the selection), so we hand ownership to a background thread that
-/// holds the connection until another app pastes. On macOS/Windows the OS
-/// stores the bytes directly, so a one-shot `set_text` is enough.
+/// Write `text` to the system clipboard.
+///
+/// On macOS / Windows the OS stores the bytes directly, so a one-shot
+/// `set_text` is enough.
+///
+/// On Linux (X11 / Wayland) the protocol ties selection ownership to a
+/// live client connection: the process that called `set()` has to
+/// remain reachable until another client requests the data. arboard's
+/// `set().wait()` blocks the calling thread until that handover
+/// happens. We need to call `wait()`, but spawning a *new* thread on
+/// every Ctrl+Shift+C accumulates idle threads indefinitely if the
+/// user copies a lot without any other application pasting (a real
+/// failure mode reported during the audit: each thread sits idle
+/// holding ~8 MB of virtual address space).
+///
+/// Hand the actual `wait()` to a single, lazily-started owner thread.
+/// Callers write the latest text into a slot guarded by a `Mutex` +
+/// `Condvar`; the worker takes the slot, runs `set().wait()`, and
+/// loops back. Subsequent `clipboard_set` calls during a long-running
+/// `wait()` overwrite the slot in place — the worker picks up the
+/// freshest text once `wait()` returns. The slot is bounded to one
+/// entry, so memory cannot grow.
+#[cfg(target_os = "linux")]
 fn clipboard_set(text: &str) {
-    #[cfg(target_os = "linux")]
-    {
-        use arboard::SetExtLinux;
-        let owned = text.to_string();
-        std::thread::spawn(move || {
-            let Ok(mut cb) = arboard::Clipboard::new() else { return };
-            // `wait()` blocks until another client takes the selection. If
-            // that never happens, the thread sits idle harmlessly; the
-            // process exit will tear the connection down.
-            if let Err(e) = cb.set().wait().text(owned) {
+    use arboard::SetExtLinux;
+    use std::sync::{Condvar, Mutex, OnceLock};
+    struct Slot {
+        pending: Mutex<Option<String>>,
+        cv: Condvar,
+    }
+    static SLOT: OnceLock<&'static Slot> = OnceLock::new();
+    let slot = SLOT.get_or_init(|| {
+        let s: &'static Slot = Box::leak(Box::new(Slot {
+            pending: Mutex::new(None),
+            cv: Condvar::new(),
+        }));
+        std::thread::spawn(move || loop {
+            let text = {
+                let mut g = s.pending.lock().unwrap_or_else(|e| e.into_inner());
+                while g.is_none() {
+                    g = s.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+                }
+                g.take().unwrap_or_default()
+            };
+            let Ok(mut cb) = arboard::Clipboard::new() else { continue };
+            // wait() blocks until another client takes the selection.
+            // While we block here, fresh `clipboard_set` calls keep
+            // overwriting `pending` — the next loop iteration will
+            // pick up the latest, not the queue of historical copies.
+            if let Err(e) = cb.set().wait().text(text) {
                 tracing::warn!("clipboard set failed: {e}");
             }
         });
-    }
-    #[cfg(not(target_os = "linux"))]
+        s
+    });
     {
-        if let Ok(mut cb) = arboard::Clipboard::new() {
-            if let Err(e) = cb.set_text(text.to_string()) {
-                tracing::warn!("clipboard set failed: {e}");
-            }
+        let mut g = slot.pending.lock().unwrap_or_else(|e| e.into_inner());
+        *g = Some(text.to_string());
+    }
+    slot.cv.notify_one();
+}
+
+#[cfg(not(target_os = "linux"))]
+fn clipboard_set(text: &str) {
+    if let Ok(mut cb) = arboard::Clipboard::new() {
+        if let Err(e) = cb.set_text(text.to_string()) {
+            tracing::warn!("clipboard set failed: {e}");
         }
     }
 }
