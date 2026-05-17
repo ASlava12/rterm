@@ -949,6 +949,63 @@ impl TextLayer {
         }
     }
 
+    /// Replace the active font family in-place. Re-probes the natural
+    /// monospace advance for the new face and resyncs every buffer's
+    /// monospace width so cell-derived rects stay consistent.
+    ///
+    /// Empty / whitespace-only `new_family` falls back to cosmic-text's
+    /// `Family::Monospace` resolution — the same path
+    /// `TextLayer::new` uses when the user leaves `[font].family`
+    /// blank.
+    ///
+    /// `Box::leak` once per change: the glyphon API requires
+    /// `Family::Name(&'static str)` for `Attrs<'static>`, so the new
+    /// name has to outlive every span built afterwards. Memory cost
+    /// is the new family-name bytes (~10-50 B); the previous static
+    /// reference becomes unreachable but is small enough that a
+    /// long-running session swapping family hundreds of times still
+    /// stays under a few KiB.
+    pub fn set_font_family(&mut self, new_family: String) {
+        let family_static: &'static str = if new_family.trim().is_empty() {
+            resolve_default_monospace(&self.font_system)
+                .map(|n| Box::leak(n.into_boxed_str()) as &'static str)
+                .unwrap_or("")
+        } else {
+            Box::leak(new_family.into_boxed_str())
+        };
+        // No-op when nothing actually changed — avoids reshaping every
+        // buffer + re-probing cell width on a settling hot-reload tick.
+        if family_static == self.font_family {
+            return;
+        }
+        self.font_family = family_static;
+        // Re-probe the natural advance for the new face. Falls back
+        // to the historical 0.6× ratio when shaping unexpectedly
+        // fails (e.g. the requested family isn't in the fontdb).
+        let family_for_probe = self.family_attr();
+        let cell_width = probe_cell_width(
+            &mut self.font_system,
+            self.font_size,
+            self.line_height,
+            family_for_probe,
+        )
+        .unwrap_or_else(|| (self.font_size * 0.6).max(1.0));
+        self.cell_width = cell_width;
+        for b in [
+            &mut self.header_buffer,
+            &mut self.header_right_buffer,
+            &mut self.header_tabs_buffer,
+            &mut self.title_bar_buffer,
+            &mut self.status_bar_buffer,
+            &mut self.overlay_buffer,
+        ] {
+            b.set_monospace_width(&mut self.font_system, Some(cell_width));
+        }
+        for b in &mut self.buffers {
+            b.set_monospace_width(&mut self.font_system, Some(cell_width));
+        }
+    }
+
     fn ensure_buffers(&mut self, n: usize) {
         while self.buffers.len() < n {
             let mut b = Buffer::new(
@@ -9644,6 +9701,19 @@ impl ApplicationHandler for App {
                 }
                 if let Some(v) = self.events.take_pending_bell_urgent() {
                     self.bell_urgent = v;
+                }
+                if let Some(new_family) = self.events.take_pending_font_family() {
+                    // No-op check is inside set_font_family — avoids
+                    // the expensive cell-width re-probe + buffer
+                    // resync on a settling reload tick that didn't
+                    // actually change the family name. Also forces
+                    // a redraw so the new glyphs land on screen
+                    // next frame without waiting for unrelated state.
+                    if let Some(state) = self.state.as_mut() {
+                        state.text.set_font_family(new_family);
+                        state.window.request_redraw();
+                    }
+                    self.sync_terminal_size();
                 }
                 if let Some(new_guake) = self.events.take_pending_guake() {
                     // `None` = feature disabled. If we left the window

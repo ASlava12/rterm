@@ -93,6 +93,12 @@ pub trait EventSink: Send + Sync {
     fn take_pending_guake(&self) -> Option<Option<GuakeRunConfig>> {
         None
     }
+    /// Hot-reloadable `[font].family` override. Empty string means
+    /// "auto-pick the system's preferred monospace face". `None`
+    /// means no change since last drain.
+    fn take_pending_font_family(&self) -> Option<String> {
+        None
+    }
     /// Drain `(tab, pane, muted)` requests from
     /// `rterm.set_pane_bell_muted` (0-based indices). The App writes
     /// each entry into the matching pane's `bell_muted` flag so the

@@ -432,6 +432,9 @@ pub struct PluginHost {
     pending_bell_visual: Arc<Mutex<Option<bool>>>,
     /// Hot-reloadable `terminal.bell_urgent` override.
     pending_bell_urgent: Arc<Mutex<Option<bool>>>,
+    /// Hot-reloadable `[font].family` override. Empty string means
+    /// "auto-pick the system's preferred monospace face".
+    pending_font_family: Arc<Mutex<Option<String>>>,
     /// Hot-reloadable `[guake]` snapshot. Outer `Option` = "any
     /// pending change", inner = "new state" (None = disable).
     /// Plugin crate doesn't know the renderer's `GuakeRunConfig`
@@ -925,6 +928,15 @@ impl PluginHost {
             "set_bell_urgent",
             lua.create_function(move |_, v: bool| {
                 *bell_urgent_for_set.lock().unwrap() = Some(v);
+                Ok(())
+            })?,
+        )?;
+        let pending_font_family: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let font_family_for_set = Arc::clone(&pending_font_family);
+        rterm.set(
+            "set_font_family",
+            lua.create_function(move |_, name: String| {
+                *font_family_for_set.lock().unwrap() = Some(name);
                 Ok(())
             })?,
         )?;
@@ -3854,6 +3866,7 @@ impl PluginHost {
             pending_scroll_on_output,
             pending_bell_visual,
             pending_bell_urgent,
+            pending_font_family,
             pending_guake,
             pending_pane_bell_mute,
             pending_pane_bell_mute_by_uid,
@@ -4309,6 +4322,16 @@ impl PluginHost {
             *g = Some(v);
         }
     }
+    /// Hot-reloadable `[font].family` override. Empty string =
+    /// "auto-pick system monospace default".
+    pub fn take_pending_font_family(&self) -> Option<String> {
+        self.pending_font_family.lock().ok().and_then(|mut g| g.take())
+    }
+    pub fn set_font_family_override(&self, name: String) {
+        if let Ok(mut g) = self.pending_font_family.lock() {
+            *g = Some(name);
+        }
+    }
     /// Hot-reloadable `[guake]` snapshot. `Some(None)` = disable;
     /// `Some(Some((enabled, position, height_pct, width_pct)))` =
     /// install. The outer Option is what the renderer drains —
@@ -4343,6 +4366,7 @@ impl PluginHost {
     /// is atomic across all fields, and the renderer applies whatever it
     /// drains at the next frame.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_config_snapshot(
         &self,
         scrollback: usize,
@@ -4355,6 +4379,7 @@ impl PluginHost {
         slow_command_ms: u64,
         guake: Option<(bool, String, u8, u8)>,
         font_size: f32,
+        font_family: String,
         opacity: f32,
     ) {
         self.set_scrollback_limit_override(scrollback);
@@ -4367,6 +4392,7 @@ impl PluginHost {
         self.set_slow_command_ms_override(slow_command_ms);
         self.set_guake_override(guake);
         self.set_font_size_override(font_size);
+        self.set_font_family_override(font_family);
         self.set_opacity_override(opacity);
     }
     /// Drain queued per-pane bell-mute requests from

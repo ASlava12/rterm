@@ -379,6 +379,9 @@ impl EventSink for PluginBridge {
     fn take_pending_bell_urgent(&self) -> Option<bool> {
         self.0.lock().ok().and_then(|h| h.take_pending_bell_urgent())
     }
+    fn take_pending_font_family(&self) -> Option<String> {
+        self.0.lock().ok().and_then(|h| h.take_pending_font_family())
+    }
     fn take_pending_guake(&self) -> Option<Option<rterm_render::GuakeRunConfig>> {
         self.0.lock().ok().and_then(|h| h.take_pending_guake()).map(
             |inner| {
@@ -1337,6 +1340,7 @@ fn spawn_watcher(plugins: Arc<Mutex<PluginHost>>, config_dir: PathBuf, config_to
                                     None
                                 },
                                 cfg.font.size,
+                                cfg.font.family.clone(),
                                 cfg.window.opacity,
                             );
                             let _ = host.emit("reload", "config".to_string());
