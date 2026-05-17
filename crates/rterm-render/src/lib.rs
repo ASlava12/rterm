@@ -3249,6 +3249,12 @@ pub struct App {
     /// Guake-style drop-down config snapshot. `None` keeps the action
     /// disabled. Cloned per call inside `toggle_guake`.
     guake: Option<GuakeRunConfig>,
+    /// Tracks whether the last `toggle_guake` call put the window in the
+    /// dropped-down state. `false` (default) means the window is in its
+    /// natural, user-controlled layout — the FIRST `toggle_guake` press
+    /// should drop the window down rather than minimise it, regardless
+    /// of the current minimise state.
+    guake_dropped: bool,
     /// Set after the FIRST `RedrawRequested` has issued a clear-only frame
     /// to kick the Wayland compositor's `configure` → `Resized` chain.
     /// Until then we render `render_clear_only` rather than the full
@@ -3418,6 +3424,7 @@ impl App {
             bell_urgent,
             allow_osc52,
             guake,
+            guake_dropped: false,
             first_frame_done: false,
             render_test_only,
             last_frame_tick: None,
@@ -7984,13 +7991,12 @@ impl App {
             }
         };
         let Some(state) = self.state.as_ref() else { return };
-        // Cheap state machine: if currently minimised, drop down;
-        // otherwise minimise. The window itself owns the "minimised"
-        // truth — `is_minimized()` is exposed on every winit backend
-        // we target, and we don't try to track it ourselves to keep
-        // the action idempotent across external WM minimise actions.
-        let is_min = state.window.is_minimized().unwrap_or(false);
-        if is_min {
+        // Drive the toggle off the explicit `guake_dropped` flag rather
+        // than `is_minimized()`. The first press on a freshly-launched
+        // (visible, not minimised) window must DROP DOWN, not minimise
+        // — and `is_minimized() == false` would otherwise route that
+        // first press to the "hide" branch.
+        if !self.guake_dropped {
             // Drop down.
             state.window.set_minimized(false);
             if state.window.is_maximized() {
@@ -8036,6 +8042,7 @@ impl App {
                 .window
                 .set_window_level(winit::window::WindowLevel::AlwaysOnTop);
             state.window.focus_window();
+            self.guake_dropped = true;
             tracing::info!(position = %cfg.position, "guake: dropped");
         } else {
             // Hide. Stick with `set_minimized(true)` rather than
@@ -8048,6 +8055,7 @@ impl App {
             state
                 .window
                 .set_window_level(winit::window::WindowLevel::Normal);
+            self.guake_dropped = false;
             tracing::info!("guake: hidden");
         }
     }
