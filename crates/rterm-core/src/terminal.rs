@@ -1664,12 +1664,19 @@ fn parse_rgb_spec(s: &str) -> Option<[u8; 3]> {
         return None;
     }
     fn take_byte(s: &str) -> Option<u8> {
-        match s.len() {
-            2 => u8::from_str_radix(s, 16).ok(),
+        // Slice through `as_bytes()` rather than `&s[..N]` so a
+        // shell-supplied OSC payload that smuggles a multi-byte UTF-8
+        // char into a hex-channel slot (`漢a` is 4 bytes but only 2
+        // chars) fails cleanly via UTF-8 validation instead of
+        // panicking on a non-boundary byte index.
+        let bytes = s.as_bytes();
+        let head: &[u8] = match bytes.len() {
+            2 => bytes,
             // 4-digit form: take the high byte by parsing the first two.
-            4 => u8::from_str_radix(&s[..2], 16).ok(),
-            _ => None,
-        }
+            4 => &bytes[..2],
+            _ => return None,
+        };
+        u8::from_str_radix(std::str::from_utf8(head).ok()?, 16).ok()
     }
     Some([take_byte(r)?, take_byte(g)?, take_byte(b)?])
 }
@@ -1677,24 +1684,36 @@ fn parse_rgb_spec(s: &str) -> Option<[u8; 3]> {
 /// `#RGB` (each nibble doubled — `#f08` → `[ff, 00, 88]`) or `#RRGGBB`
 /// (straight bytes). Anything else returns `None`.
 fn parse_hex_hash(s: &str) -> Option<[u8; 3]> {
-    match s.len() {
+    // Operate on `as_bytes()` so a shell-supplied OSC payload that
+    // matches one of the length arms but uses multi-byte UTF-8 chars
+    // (e.g. `#🌍ab` = 6 bytes / 3 chars) is rejected via UTF-8
+    // validation in `from_utf8` rather than panicking on a non-
+    // boundary `&s[..2]` slice.
+    let bytes = s.as_bytes();
+    fn hex_pair(pair: &[u8]) -> Option<u8> {
+        u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()
+    }
+    match bytes.len() {
         3 => {
-            let bytes = s.as_bytes();
+            // ASCII hex digits are single-byte, so `bytes[i] as char`
+            // is the same as the original char for the legal inputs
+            // and falls through to `to_digit(16)` returning None for
+            // anything else (incl. UTF-8 lead / continuation bytes).
             let r = (bytes[0] as char).to_digit(16)? as u8;
             let g = (bytes[1] as char).to_digit(16)? as u8;
             let b = (bytes[2] as char).to_digit(16)? as u8;
             Some([r * 0x11, g * 0x11, b * 0x11])
         }
         6 => Some([
-            u8::from_str_radix(&s[0..2], 16).ok()?,
-            u8::from_str_radix(&s[2..4], 16).ok()?,
-            u8::from_str_radix(&s[4..6], 16).ok()?,
+            hex_pair(&bytes[0..2])?,
+            hex_pair(&bytes[2..4])?,
+            hex_pair(&bytes[4..6])?,
         ]),
         // `#RRGGBBAA` — alpha ignored.
         8 => Some([
-            u8::from_str_radix(&s[0..2], 16).ok()?,
-            u8::from_str_radix(&s[2..4], 16).ok()?,
-            u8::from_str_radix(&s[4..6], 16).ok()?,
+            hex_pair(&bytes[0..2])?,
+            hex_pair(&bytes[2..4])?,
+            hex_pair(&bytes[4..6])?,
         ]),
         _ => None,
     }
@@ -3469,6 +3488,28 @@ mod tests {
         assert_eq!(parse_rgb_spec("rgb:ff/80/00/aa"), None);
         // Non-hex digits.
         assert_eq!(parse_rgb_spec("rgb:zz/00/00"), None);
+    }
+
+    #[test]
+    fn parse_rgb_spec_rejects_multibyte_without_panic() {
+        // Regression: a shell-supplied OSC 10/11/12 payload that
+        // smuggles a multi-byte UTF-8 char into a hex channel slot
+        // used to panic in `take_byte` on a non-boundary `&s[..2]`
+        // slice. The new path validates via `from_utf8` and returns
+        // None cleanly. Any panic here would surface in the parser
+        // dispatch loop on the user's session.
+        assert_eq!(parse_rgb_spec("rgb:漢a/00/00"), None);
+        assert_eq!(parse_rgb_spec("rgb:🌍/00/00"), None);
+        assert_eq!(parse_rgb_spec("rgb:ééé/00/00"), None);
+        // `#RGB` / `#RRGGBB` hash-form must reject mismatched-byte
+        // lengths through the same path.
+        assert_eq!(parse_rgb_spec("#🌍ab"), None);
+        assert_eq!(parse_rgb_spec("#漢ab"), None);
+        assert_eq!(parse_rgb_spec("#éé"), None);
+        // Strictly-Latin1 6-byte input where every byte boundary
+        // happens to land on a char boundary still fails on the
+        // `from_str_radix` step (the `é` byte pair is not hex digits).
+        assert_eq!(parse_rgb_spec("#ééé"), None);
     }
 
     #[test]
