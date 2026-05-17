@@ -1,0 +1,291 @@
+# rterm — автогенерируемый конфиг (русские комментарии). Создаётся при
+# первом запуске; редактируется свободно. Сохранение перечитывается на
+# лету вместе с init.lua и plugins/*.lua — перезапуск не требуется.
+#
+# Чтобы пересоздать файл на другом языке, передайте `--lang en`
+# (или другой код) в `rterm --print-default-config` и направьте вывод
+# в файл.
+
+# ── [font] ────────────────────────────────────────────────────────────
+# Рендеринг шрифта. Hot-reload: смена family / size подхватывается при
+# следующем сохранении конфига, без перезапуска.
+[font]
+# family — точное имя установленного моноширинного шрифта.
+#   Тип:    строка. Пустая строка `""` позволяет рендереру подобрать
+#           системный default (DejaVu Sans Mono на большинстве Linux,
+#           Menlo на macOS, Consolas на Windows). Список установленных
+#           семейств — `rterm --list-fonts`; проверка конкретного
+#           имени — `rterm --check`.
+#   По умолчанию: "" (автовыбор).
+family = ""
+# size — размер шрифта в пунктах.
+#   Тип:    f32. Практический диапазон 6.0..=64.0. Значения за его
+#           пределами рисуются, но становятся либо нечитаемыми
+#           (слишком мелко), либо съедают окно (слишком крупно).
+#   По умолчанию: 13.0.
+size = 13.0
+# bold_is_bright — правило xterm «жирный = яркий».
+#   Тип:    bool.
+#   По умолчанию: true. При true атрибут SGR `bold` дополнительно
+#           переключает 8 базовых ANSI-цветов на их яркие варианты
+#           (совпадает с xterm, iTerm2, kitty). Поставьте false для
+#           тем, где жирность используется как самостоятельный
+#           акцент без смены палитры.
+bold_is_bright = true
+
+# ── [window] ──────────────────────────────────────────────────────────
+# Стартовая геометрия окна + прозрачность + декорации.
+[window]
+# width — стартовая ширина окна в логических пикселях.
+#   Тип:    u32. Разумный диапазон 320..=8192 (меньше — нечитаемо,
+#           больше — обычно выходит за пределы монитора).
+#   По умолчанию: 1024.
+width = 1024
+# height — стартовая высота окна в логических пикселях.
+#   Тип:    u32. Разумный диапазон 240..=8192.
+#   По умолчанию: 640.
+height = 640
+# opacity — прозрачность окна.
+#   Тип:    f32 в 0.0..=1.0 (0 — полностью прозрачно, 1 — непрозрачно).
+#           Требует композитор, поддерживающий прозрачность окон
+#           (Wayland, macOS, KWin/Mutter, Windows с включённым DWM).
+#           Значения вне диапазона клампятся на старте.
+#   По умолчанию: 1.0.
+opacity = 1.0
+# os_decorations — отдать оконному менеджеру отрисовку заголовка и
+# рамок.
+#   Тип:    bool. При false (дефолт rterm) рендерер сам рисует
+#           заголовочную полосу, вкладки и кнопки управления окном
+#           (стиль Chrome / Firefox). Поставьте true, чтобы вернуть
+#           нативные декорации на тайловых WM или если встроенные
+#           drag/resize-области кажутся неудобными.
+#   По умолчанию: false.
+os_decorations = false
+
+# ── [shell] ───────────────────────────────────────────────────────────
+# Что rterm запускает в каждой новой панели. Оставьте `program`
+# пустым, чтобы наследовать $SHELL на Unix / powershell.exe на Windows.
+[shell]
+# program — путь / имя исполняемого файла оболочки.
+#   Тип:    строка. Пустая строка `""` возвращает к $SHELL /
+#           powershell.
+#   По умолчанию: "".
+# program = "/bin/zsh"
+# args — дополнительные аргументы, передаваемые `program`.
+#   Тип:    массив строк.
+#   По умолчанию: [].
+# args = ["-l"]
+# [shell.env] — дополнительные переменные окружения для каждой
+# запущенной оболочки. Применяются ПОСЛЕ встроенных TERM / COLORTERM /
+# TERM_PROGRAM, поэтому пользовательские записи побеждают при
+# совпадении ключа. Родительское окружение остаётся, это аддитивный
+# overlay, а не замена.
+#   Тип:    таблица `КЛЮЧ = "значение"`.
+# [shell.env]
+# RUST_BACKTRACE = "1"
+# LANG = "ru_RU.UTF-8"
+
+# ── [terminal] ────────────────────────────────────────────────────────
+# Поведение терминала: scrollback, курсор, звуковые сигналы, OSC-политика.
+[terminal]
+# scrollback — сколько строк хранится в кольце прокрутки каждой панели.
+#   Тип:    usize. 0 полностью отключает scrollback. Память на хранение
+#           ≈ `scrollback * cols * 16` байт на панель.
+#   По умолчанию: 10000.
+scrollback = 10000
+# save_scrollback_on_exit — при закрытии окна сохранять scrollback
+# активной панели в `$XDG_CACHE_HOME/rterm/scrollback-<ts>.txt` (тот же
+# путь / формат, что и у действия `save_scrollback`).
+#   Тип:    bool. По умолчанию: false.
+save_scrollback_on_exit = false
+# restore_session — сохранять (и восстанавливать на следующем запуске)
+# список вкладок. На вкладку записывается cwd её сфокусированной
+# панели; split'ы НЕ сохраняются — каждая восстановленная вкладка
+# открывается одной панелью в сохранённом cwd.
+#   Тип:    bool. По умолчанию: false.
+restore_session = false
+# scroll_on_output — снэпать вид к актуальному выводу при любом новом
+# выводе (поведение tail-like). По умолчанию пользователь остаётся на
+# той строке, которую читал.
+#   Тип:    bool. По умолчанию: false.
+scroll_on_output = false
+# cursor_blink — мастер-переключатель мерцания курсора.
+#   Тип:    bool. При false курсор рисуется стабильно, игнорируя
+#           DECSCUSR-запросы оболочки.
+#   По умолчанию: true.
+cursor_blink = true
+# show_scrollbar — рисовать тонкую полосу прокрутки у правого края,
+# когда у панели есть scrollback.
+#   Тип:    bool. Поставьте false, чтобы скрыть её полностью.
+#   По умолчанию: true.
+show_scrollbar = true
+# tab_silence_ms — порог тишины для plugin-события `tab.silence`. После
+# того как вкладка что-то вывела, она должна молчать столько
+# миллисекунд, чтобы событие сработало (edge-triggered, фиксируется
+# один раз).
+#   Тип:    u64 мс. 0 отключает событие полностью.
+#   По умолчанию: 5000 (5 с).
+tab_silence_ms = 5000
+# bell_visual — визуальная вспышка экрана при BEL (или `rterm.bell()`).
+#   Тип:    bool. Plugin-событие `bell` срабатывает в любом случае.
+#   По умолчанию: true.
+bell_visual = true
+# bell_urgent — пинать оконный менеджер (urgency-флаг в панели задач /
+# badge в доке) при BEL, когда окно rterm не в фокусе. Удобно для
+# сценариев «пинг, когда сборка закончится»; ставьте false там, где
+# пинг шумит.
+#   Тип:    bool. По умолчанию: true.
+bell_urgent = true
+# slow_command_ms — порог для plugin-события `pane.slow_command` (и
+# пинга urgency-флага, когда окно не в фокусе). Команда, обрамлённая
+# OSC 133;C … 133;D, должна работать минимум столько, чтобы событие
+# сработало. Парится с shell-интеграцией ради уведомлений «долгая
+# задача завершилась».
+#   Тип:    u64 мс. 0 отключает функцию полностью.
+#   По умолчанию: 10000 (10 с).
+slow_command_ms = 10000
+# allow_osc52 — разрешать оболочке писать в системный буфер обмена
+# через `ESC ] 52 ; c ; <base64> ESC \\`. Тихая поддержка этого —
+# реальный фишинг-примитив: pipeline в оболочке может подменить
+# содержимое clipboard между вашим Copy и Paste. xterm, kitty, wezterm
+# и Alacritty по умолчанию это блокируют.
+#   Тип:    bool.
+#   По умолчанию: false. Включайте true, только если полагаетесь на
+#           tmux / mosh / SSH clipboard forwarding.
+allow_osc52 = false
+
+# ── [appearance] ──────────────────────────────────────────────────────
+# Живые визуальные предпочтения, переключаемые действием cycle-theme /
+# вызовом `rterm.set_theme(name)` / окном настроек. Сохраняется между
+# запусками, чтобы последний выбор применился снова.
+[appearance]
+# theme — каноническое имя встроенной темы.
+#   Тип:    строка. Полный список — `rterm --list-actions` (раздел
+#           `cycle_theme`) или окно настроек (по умолчанию
+#           Ctrl+Shift+,). Встроенные: "default", "dark", "dracula",
+#           "solarized-dark", "solarized-light", "nord",
+#           "gruvbox-dark", "light". Пустая строка `""` = без
+#           предпочтения (откат на `[colors]`-оверрайды, иначе
+#           встроенная default-палитра).
+#   По умолчанию: "".
+theme = ""
+
+# ── [guake] ───────────────────────────────────────────────────────────
+# Guake-подобный drop-down: когда `enabled = true`, действие
+# `toggle_guake` переключает окно между состоянием «выпало»
+# (размер `width_pct` × `height_pct` от монитора, привязка к
+# `position`, поверх остальных окон) и свёрнутым. Привяжите
+# `toggle_guake` к клавише в `[[keybindings]]`, чтобы пользоваться.
+#
+# Глобальный системный хоткей (чтобы связка работала, когда окно
+# rterm НЕ в фокусе) rterm не предоставляет — настройте ярлык
+# рабочего стола через `wmctrl` / `xdotool` / KWin-скрипт, который
+# целится в уже запущенный экземпляр rterm.
+#
+# Hot-reload: изменения в `[guake]` подхватываются при сохранении
+# `config.toml` без перезапуска (как и font / opacity / bell).
+# Переключение `enabled = false` посреди сессии также снимает уровень
+# AlwaysOnTop, который рендерер мог поставить при предыдущем drop'е.
+[guake]
+# enabled — мастер-переключатель.
+#   Тип:    bool.
+#   По умолчанию: false (`toggle_guake` — no-op).
+enabled = false
+# position — край, к которому пристыковывается выпавшее окно.
+#   Тип:    одно из "top" | "bottom" | "full". На Wayland позиции
+#           управляет композитор, поэтому "top" / "full" откатываются
+#           на `set_maximized(true)`; "bottom" логирует предупреждение
+#           и не применяется.
+#   По умолчанию: "top".
+position = "top"
+# height_pct — доля высоты монитора, которую занимает выпавшее окно.
+#   Тип:    u8 в 10..=100. Игнорируется при `position = "full"`
+#           (там окно максимизируется композитором). Клампится в
+#           рантайме.
+#   По умолчанию: 50.
+height_pct = 50
+# width_pct — доля ширины монитора.
+#   Тип:    u8 в 20..=100. Клампится в рантайме.
+#   По умолчанию: 100.
+width_pct = 100
+
+# ── [colors] ──────────────────────────────────────────────────────────
+# Переопределения палитры терминала. Каждая запись — необязательный
+# тройной байт `[r, g, b]` (каждый канал 0..=255); пропущенные поля
+# остаются на встроенных xterm-ish значениях. Перечитывается на лету
+# при сохранении.
+[colors]
+# fg / bg — default foreground / background для ячеек `Color::Default`.
+# fg      = [220, 220, 220]
+# bg      = [10, 12, 18]
+# cursor — фиксированный цвет курсорного блока. Без значения курсор
+# использует инвертированный foreground ячейки (xterm-конвенция).
+# cursor  = [255, 204, 102]
+
+# Именованная 16-цветовая палитра (8 обычных + 8 ярких).
+# black   = [0, 0, 0]
+# red     = [205, 49, 49]
+# green   = [13, 188, 121]
+# yellow  = [229, 229, 16]
+# blue    = [36, 114, 200]
+# magenta = [188, 63, 188]
+# cyan    = [17, 168, 205]
+# white   = [229, 229, 229]
+# bright_black   = [102, 102, 102]
+# bright_red     = [241, 76, 76]
+# bright_green   = [35, 209, 139]
+# bright_yellow  = [245, 245, 67]
+# bright_blue    = [59, 142, 234]
+# bright_magenta = [214, 112, 214]
+# bright_cyan    = [41, 184, 219]
+# bright_white   = [255, 255, 255]
+
+# ── [[keybindings]] ───────────────────────────────────────────────────
+# Пользовательские keybind'ы. Каждая запись перекрывает встроенный
+# дефолт для той же комбинации; полный живой список — Ctrl+Shift+H в
+# самом rterm.
+#
+# Поля записи: `{ keys, action }`.
+#
+# Модификаторы (комбинируются через `+`):
+#                                 Ctrl (или Control), Shift, Alt (или
+#                                 Option), Super (или Cmd, Meta, Win).
+# Именованные клавиши:            Enter (Return), Escape (Esc), Tab,
+#                                 Space, Backspace, Delete (Del),
+#                                 Insert (Ins), Home, End, PageUp
+#                                 (PgUp), PageDown (PgDn),
+#                                 Up/Down/Left/Right (ArrowUp/Down/
+#                                 Left/Right), F1..F12.
+# Псевдонимы пунктуации:          Plus (+), Minus/Dash (-), Equal (=),
+#                                 Comma (,), Period/Dot (.), Slash (/),
+#                                 Backslash (\\), Semicolon (;),
+#                                 Colon (:), Apostrophe/Quote (').
+#
+# Действия (живой канонический список — `rterm --list-actions`):
+#   new_tab, close_tab, next_tab, prev_tab, move_tab_left, move_tab_right,
+#   split_horizontal, split_vertical, split_auto, close_pane,
+#   goto_first_tab, goto_last_tab,
+#   focus_next_pane, focus_prev_pane, focus_first_pane, focus_last_pane,
+#   paste, copy, clear_selection, search,
+#   jump_prev_prompt, jump_next_prompt, jump_prev_command,
+#   jump_next_command, scroll_page_up, scroll_page_down,
+#   scroll_half_page_up, scroll_half_page_down,
+#   scroll_line_up, scroll_line_down, scroll_home,
+#   scroll_end, clear_scrollback, resize_pane_left, resize_pane_right,
+#   resize_pane_up, resize_pane_down,
+#   toggle_help, open_palette, save_scrollback, zoom_pane, balance_panes,
+#   quit, font_increase, font_decrease, font_reset, opacity_increase,
+#   opacity_decrease, opacity_reset, toggle_last_tab, copy_hovered_url,
+#   reset_pane, swap_pane_next, swap_pane_prev, toggle_bell_mute,
+#   open_hovered_url, cycle_theme, cycle_theme_prev, open_settings,
+#   rename_tab, snap_window_left, snap_window_right, snap_window_top,
+#   snap_window_bottom, maximize_toggle, minimize_window,
+#   restore_window, toggle_guake.
+
+# [[keybindings]]
+# keys   = "Ctrl+T"
+# action = "new_tab"
+
+# [[keybindings]]
+# keys   = "F2"
+# action = "search"

@@ -259,15 +259,88 @@ impl Default for WindowConfig {
     }
 }
 
-/// Commented template written on first run.
-const DEFAULT_TEMPLATE: &str = include_str!("default.toml");
+/// Language for the auto-generated `config.toml` comments.
+///
+/// The TOML values themselves are identical across languages — only
+/// the surrounding `# …` annotation text differs. The
+/// `default_template_matches_default_struct_*` tests pin both
+/// languages against the same `Config::default()` snapshot to keep
+/// them from drifting.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum CommentLang {
+    /// English (default).
+    #[default]
+    En,
+    /// Russian.
+    Ru,
+}
 
-/// The bundled `default.toml` text — exposed so downstream crates can
-/// keep its comment lists in sync with their own canonical names via
-/// tests (e.g. `rterm-app` asserts every `AppAction::canonical_names()`
-/// entry is mentioned in the template's actions comment).
+impl CommentLang {
+    /// Parse a language code as written on the CLI (`--lang en`) or
+    /// pulled out of `LANG` / `LC_ALL`. Accepts case-insensitive
+    /// ISO 639-1 prefixes (`en`, `en_US.UTF-8`, `EN`, `english` →
+    /// English; `ru`, `ru_RU.UTF-8`, `RU`, `russian` → Russian).
+    /// Anything else returns `None` so the caller can fall back.
+    pub fn parse(raw: &str) -> Option<Self> {
+        let head = raw
+            .trim()
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .next()
+            .unwrap_or("");
+        if head.eq_ignore_ascii_case("en") || head.eq_ignore_ascii_case("english") {
+            Some(CommentLang::En)
+        } else if head.eq_ignore_ascii_case("ru") || head.eq_ignore_ascii_case("russian") {
+            Some(CommentLang::Ru)
+        } else {
+            None
+        }
+    }
+
+    /// Auto-detect from environment. Priority:
+    /// 1. `RTERM_LANG` env var (`en` / `ru`),
+    /// 2. `LC_ALL`, then `LANG` (POSIX locale priority),
+    /// 3. fall back to `En`.
+    ///
+    /// First-run template generation calls this so a user with a
+    /// `ru_RU.UTF-8` locale gets Russian comments without having to
+    /// pass any flags.
+    pub fn detect() -> Self {
+        for var in ["RTERM_LANG", "LC_ALL", "LANG"] {
+            if let Some(raw) = nonempty_env(var).and_then(|s| s.into_string().ok()) {
+                if let Some(lang) = Self::parse(&raw) {
+                    return lang;
+                }
+            }
+        }
+        CommentLang::En
+    }
+}
+
+/// Commented template written on first run (English version).
+const DEFAULT_TEMPLATE_EN: &str = include_str!("default.toml");
+/// Commented template written on first run (Russian version).
+const DEFAULT_TEMPLATE_RU: &str = include_str!("default.ru.toml");
+
+/// The bundled English `default.toml` text — exposed so downstream
+/// crates can keep its comment lists in sync with their own canonical
+/// names via tests (e.g. `rterm-app` asserts every
+/// `AppAction::canonical_names()` entry is mentioned in the template's
+/// actions comment).
+///
+/// Equivalent to `default_template_for(CommentLang::En)`; kept for
+/// backwards compatibility.
 pub fn default_template() -> &'static str {
-    DEFAULT_TEMPLATE
+    default_template_for(CommentLang::En)
+}
+
+/// Bundled `default.toml` text for the requested language. Both
+/// templates encode the same TOML values; only the surrounding
+/// comments differ.
+pub fn default_template_for(lang: CommentLang) -> &'static str {
+    match lang {
+        CommentLang::En => DEFAULT_TEMPLATE_EN,
+        CommentLang::Ru => DEFAULT_TEMPLATE_RU,
+    }
 }
 
 impl Config {
@@ -284,9 +357,19 @@ impl Config {
         Self::from_toml_str(&s)
     }
 
-    /// Create a commented template at `path` if no config file exists yet.
-    /// Idempotent — does nothing when a file is already present.
+    /// Create a commented template at `path` if no config file exists
+    /// yet. Idempotent — does nothing when a file is already present.
+    /// The comment language is auto-detected from `RTERM_LANG` /
+    /// `LC_ALL` / `LANG` (see [`CommentLang::detect`]); pass an
+    /// explicit choice via [`Config::ensure_default_with_lang`].
     pub fn ensure_default(path: &Path) -> Result<bool> {
+        Self::ensure_default_with_lang(path, CommentLang::detect())
+    }
+
+    /// Like [`Config::ensure_default`], but writes the template for the
+    /// explicit comment language. Lets callers honour a `--lang` CLI
+    /// override without consulting the environment.
+    pub fn ensure_default_with_lang(path: &Path, lang: CommentLang) -> Result<bool> {
         if path.exists() {
             return Ok(false);
         }
@@ -294,7 +377,7 @@ impl Config {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("mkdir {}", parent.display()))?;
         }
-        std::fs::write(path, DEFAULT_TEMPLATE)
+        std::fs::write(path, default_template_for(lang))
             .with_context(|| format!("writing default config to {}", path.display()))?;
         Ok(true)
     }
@@ -502,7 +585,7 @@ mod tests {
         //   2. Comment lines start with `# `, never tab-indented
         //      `#\t`, so reflowing in a normal editor doesn't
         //      lose the leading space.
-        let tpl = DEFAULT_TEMPLATE;
+        let tpl = DEFAULT_TEMPLATE_EN;
         assert!(
             tpl.ends_with('\n'),
             "DEFAULT_TEMPLATE must end with a newline",
@@ -531,7 +614,7 @@ mod tests {
         // from `Config::default()`, new users get behaviour that
         // disagrees with what the binary uses when no config exists.
         // Parse the template and compare every field we explicitly set.
-        let parsed = Config::from_toml_str(DEFAULT_TEMPLATE)
+        let parsed = Config::from_toml_str(DEFAULT_TEMPLATE_EN)
             .expect("bundled default.toml must always parse");
         let baseline = Config::default();
         // [font]
@@ -686,5 +769,149 @@ mod tests {
         assert_eq!(reparsed.terminal.bell_visual, original.terminal.bell_visual);
         assert_eq!(reparsed.terminal.bell_urgent, original.terminal.bell_urgent);
         assert_eq!(reparsed.terminal.slow_command_ms, original.terminal.slow_command_ms);
+    }
+
+    #[test]
+    fn comment_lang_parse_accepts_iso_and_locale_forms() {
+        // Both `en` (CLI shorthand) and `en_US.UTF-8` (POSIX LANG)
+        // must resolve to English; same for Russian. The function
+        // tolerates leading whitespace + trailing locale modifiers
+        // since real-world `LANG` values include both. Names like
+        // `english` / `russian` are accepted as a developer-friendly
+        // alias.
+        assert_eq!(CommentLang::parse("en"), Some(CommentLang::En));
+        assert_eq!(CommentLang::parse("EN"), Some(CommentLang::En));
+        assert_eq!(CommentLang::parse("en_US.UTF-8"), Some(CommentLang::En));
+        assert_eq!(CommentLang::parse(" english "), Some(CommentLang::En));
+        assert_eq!(CommentLang::parse("ru"), Some(CommentLang::Ru));
+        assert_eq!(CommentLang::parse("RU"), Some(CommentLang::Ru));
+        assert_eq!(CommentLang::parse("ru_RU.UTF-8"), Some(CommentLang::Ru));
+        assert_eq!(CommentLang::parse("russian"), Some(CommentLang::Ru));
+        // Unknown / unsupported languages fall back to None so the
+        // caller can decide (most call sites pick English).
+        assert!(CommentLang::parse("fr_FR.UTF-8").is_none());
+        assert!(CommentLang::parse("").is_none());
+        assert!(CommentLang::parse("C").is_none());
+    }
+
+    #[test]
+    fn comment_lang_detect_priority_rterm_lang_wins() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // Snapshot + clear so the test is deterministic regardless of
+        // the host locale.
+        let saved = (
+            std::env::var_os("RTERM_LANG"),
+            std::env::var_os("LC_ALL"),
+            std::env::var_os("LANG"),
+        );
+        // SAFETY: env mutation is serialised by ENV_GUARD; restored
+        // via the snapshot at the end of the test.
+        unsafe {
+            std::env::remove_var("RTERM_LANG");
+            std::env::remove_var("LC_ALL");
+            std::env::remove_var("LANG");
+        }
+        // No env at all → English fallback.
+        assert_eq!(CommentLang::detect(), CommentLang::En);
+        // `LANG` is honoured.
+        unsafe { std::env::set_var("LANG", "ru_RU.UTF-8") };
+        assert_eq!(CommentLang::detect(), CommentLang::Ru);
+        // `LC_ALL` wins over `LANG` (POSIX priority).
+        unsafe { std::env::set_var("LC_ALL", "en_US.UTF-8") };
+        assert_eq!(CommentLang::detect(), CommentLang::En);
+        // `RTERM_LANG` wins over both (CLI / user intent).
+        unsafe { std::env::set_var("RTERM_LANG", "ru") };
+        assert_eq!(CommentLang::detect(), CommentLang::Ru);
+
+        // Restore the host's original state.
+        unsafe {
+            match saved.0 {
+                Some(v) => std::env::set_var("RTERM_LANG", v),
+                None => std::env::remove_var("RTERM_LANG"),
+            }
+            match saved.1 {
+                Some(v) => std::env::set_var("LC_ALL", v),
+                None => std::env::remove_var("LC_ALL"),
+            }
+            match saved.2 {
+                Some(v) => std::env::set_var("LANG", v),
+                None => std::env::remove_var("LANG"),
+            }
+        }
+    }
+
+    #[test]
+    fn default_template_for_returns_distinct_bilingual_text() {
+        let en = default_template_for(CommentLang::En);
+        let ru = default_template_for(CommentLang::Ru);
+        // The two templates SHOULD differ (otherwise we shipped the
+        // same file twice). Cheap sanity check.
+        assert_ne!(en, ru, "EN and RU templates must not be identical");
+        // English headline appears only in the EN template; same for
+        // a Russian-specific Cyrillic word in the RU one. Catches an
+        // accidental swap of `include_str!` paths.
+        assert!(en.contains("English comments"));
+        assert!(!en.contains("русские комментарии"));
+        assert!(ru.contains("русские комментарии"));
+        assert!(!ru.contains("English comments"));
+    }
+
+    #[test]
+    fn ru_template_parses_and_matches_default_struct() {
+        // Same invariant `default_template_parses_and_matches_default_
+        // struct` enforces for the EN template — the Russian template
+        // must also decode to a `Config` that equals
+        // `Config::default()` for every key it sets explicitly.
+        // Without this, a `ru_RU` first-run user would silently get
+        // different defaults than every other locale.
+        let parsed = Config::from_toml_str(DEFAULT_TEMPLATE_RU)
+            .expect("bundled default.ru.toml must always parse");
+        let baseline = Config::default();
+        assert_eq!(parsed.font.size, baseline.font.size);
+        assert_eq!(parsed.font.family, baseline.font.family);
+        assert_eq!(parsed.font.bold_is_bright, baseline.font.bold_is_bright);
+        assert_eq!(parsed.window.width, baseline.window.width);
+        assert_eq!(parsed.window.height, baseline.window.height);
+        assert!((parsed.window.opacity - baseline.window.opacity).abs() < f32::EPSILON);
+        assert_eq!(parsed.window.os_decorations, baseline.window.os_decorations);
+        assert_eq!(parsed.terminal.scrollback, baseline.terminal.scrollback);
+        assert_eq!(parsed.terminal.cursor_blink, baseline.terminal.cursor_blink);
+        assert_eq!(parsed.terminal.show_scrollbar, baseline.terminal.show_scrollbar);
+        assert_eq!(parsed.terminal.allow_osc52, baseline.terminal.allow_osc52);
+        assert_eq!(parsed.appearance.theme, baseline.appearance.theme);
+        assert_eq!(parsed.guake.enabled, baseline.guake.enabled);
+        assert_eq!(parsed.guake.position, baseline.guake.position);
+        assert_eq!(parsed.guake.height_pct, baseline.guake.height_pct);
+        assert_eq!(parsed.guake.width_pct, baseline.guake.width_pct);
+    }
+
+    #[test]
+    fn ensure_default_with_lang_writes_the_requested_template() {
+        // Pick a unique tmpdir per test invocation so parallel runs
+        // don't clobber each other. Both branches must produce a file
+        // that round-trips through `Config::from_toml_str`.
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "rterm-test-ensure-default-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        for lang in [CommentLang::En, CommentLang::Ru] {
+            let path = dir.join(format!("{:?}.toml", lang));
+            let created = Config::ensure_default_with_lang(&path, lang)
+                .expect("ensure_default_with_lang");
+            assert!(created, "ensure_default should report 'created'");
+            let written = std::fs::read_to_string(&path).expect("read back");
+            assert_eq!(written, default_template_for(lang));
+            // Idempotent: a second call sees the file and returns false.
+            let again = Config::ensure_default_with_lang(&path, lang)
+                .expect("ensure_default_with_lang idempotent");
+            assert!(!again);
+        }
+        // Tidy up so /tmp doesn't accumulate stragglers across runs.
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

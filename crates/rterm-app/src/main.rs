@@ -490,8 +490,13 @@ fn main() -> Result<()> {
                                        (case-insensitive substring filter; --json emits\n  \
                                        `{{\"default\":\"...\",\"families\":[...]}}`)\n  \
                        --print-config  Print resolved config as TOML and exit\n  \
-                       --print-default-config  Print the bundled default config\n  \
-                                       template (with comments) for first-run setup\n  \
+                       --print-default-config [--lang en|ru]  Print the bundled\n  \
+                                       default config template (annotated with\n  \
+                                       comments) for first-run setup. The first-run\n  \
+                                       writer also picks the language automatically\n  \
+                                       from RTERM_LANG / LC_ALL / LANG (POSIX locale\n  \
+                                       priority); `--lang` overrides that for the dump\n  \
+                                       only. Currently supported: en (default), ru.\n  \
                        --print-paths [--json]  Print resolved config / plugins / cache paths and exit\n  \
                        --check         Validate config and exit (non-zero on parse error)\n  \
                        --font-size <pt>  Override font size for this run\n  \
@@ -515,6 +520,10 @@ fn main() -> Result<()> {
                        RTERM_CONFIG_PATH  Override the default config path \
                                        (~/.config/rterm/config.toml) for every\n  \
                                        sub-flag that resolves it (--check, --print-config, GUI).\n  \
+                       RTERM_LANG      Comment language for the auto-generated\n  \
+                                       config.toml (`en` (default) or `ru`). Wins\n  \
+                                       over LC_ALL / LANG; overridden by\n  \
+                                       `--lang` on `--print-default-config`.\n  \
                        RTERM_SMOKE_COMMAND  Replace `echo hello rterm` in `--smoke`. The value\n  \
                                        is passed verbatim to `sh -c` / `cmd /C`. Useful for CI.",
                     env!("CARGO_PKG_VERSION"),
@@ -941,7 +950,14 @@ fn main() -> Result<()> {
                 // user overrides merged in). Pipe to a file for
                 // first-run setup:
                 //   `rterm --print-default-config > ~/.config/rterm/config.toml`
-                print!("{}", rterm_config::default_template());
+                //
+                // Language selection: pick up `--lang ru` / `--lang en`
+                // anywhere on the rest of the command line; without it
+                // we fall back to the env-driven `CommentLang::detect`
+                // (`RTERM_LANG` > `LC_ALL` > `LANG` > English).
+                let lang = parse_lang_flag(std::env::args().skip(2))
+                    .unwrap_or_else(rterm_config::CommentLang::detect);
+                print!("{}", rterm_config::default_template_for(lang));
                 return Ok(());
             }
             "--print-config" => {
@@ -1650,6 +1666,24 @@ fn parse_gui_overrides<I: IntoIterator<Item = String>>(args: I) -> GuiCliOverrid
         }
     }
     out
+}
+
+/// Scan a CLI-args iterator for the first `--lang en|ru` (or
+/// `--lang=value`) and return the parsed language. Unknown values and
+/// missing arguments yield `None` so the caller can fall back to
+/// `CommentLang::detect()`. Used only by `--print-default-config`.
+fn parse_lang_flag<I: IntoIterator<Item = String>>(args: I) -> Option<rterm_config::CommentLang> {
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--lang" {
+            if let Some(v) = iter.next() {
+                return rterm_config::CommentLang::parse(&v);
+            }
+        } else if let Some(v) = arg.strip_prefix("--lang=") {
+            return rterm_config::CommentLang::parse(v);
+        }
+    }
+    None
 }
 
 fn resolve_shell(config: &Config) -> (String, Vec<String>) {

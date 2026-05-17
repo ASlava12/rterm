@@ -1,108 +1,217 @@
-# rterm configuration — generated on first run. Edit freely. Reloaded with
-# init.lua on file change.
+# rterm — auto-generated config (English comments). Generated on first
+# run; edit freely. Saved changes hot-reload automatically together with
+# init.lua and plugins/*.lua — no restart needed.
+#
+# To regenerate this file in another language pass `--lang ru` to
+# `rterm --print-default-config` and pipe the output back to disk.
 
+# ── [font] ────────────────────────────────────────────────────────────
+# Glyph rendering. Hot-reloadable: family / size changes take effect on
+# the next config save, no restart.
 [font]
-# Pick a family installed on your system, e.g. "JetBrains Mono",
-# "Fira Code", "MesloLGS NF". Empty = system monospace default.
+# family — exact name of an installed monospace face.
+#   Type:   string. Empty `""` lets the renderer auto-pick the system
+#           default monospace family (DejaVu Sans Mono on most Linux,
+#           Menlo on macOS, Consolas on Windows). Use
+#           `rterm --list-fonts` to see what is installed; check a name
+#           with `rterm --check`.
+#   Default: "" (auto-pick).
 family = ""
+# size — font size in points.
+#   Type:   float. Practical range 6.0..=64.0. Values outside this band
+#           render but become illegible (tiny) or eat the window (huge).
+#   Default: 13.0.
 size = 13.0
-# When true (xterm default), SGR `bold` also remaps the 8 base ANSI colours
-# to their bright variants. Set false for themes that already use bold
-# explicitly for emphasis without colour changes.
+# bold_is_bright — apply the xterm-style "bold also brightens" rule.
+#   Type:   bool.
+#   Default: true. When true, the SGR `bold` attribute remaps the 8 base
+#           ANSI colours to their bright variants (matches xterm,
+#           iTerm2, kitty). Set false for themes that already encode
+#           emphasis via bold without changing the colour palette.
 bold_is_bright = true
 
+# ── [window] ──────────────────────────────────────────────────────────
+# Initial window geometry + transparency + decorations.
 [window]
+# width — initial window width in logical pixels.
+#   Type:   u32. Reasonable range 320..=8192 (smaller is unreadable,
+#           larger usually exceeds the monitor).
+#   Default: 1024.
 width = 1024
+# height — initial window height in logical pixels.
+#   Type:   u32. Reasonable range 240..=8192.
+#   Default: 640.
 height = 640
-# 1.0 = opaque. Lower values require a compositor that honours window
-# transparency (Wayland / macOS / DWM-enabled Windows).
+# opacity — window opacity.
+#   Type:   float in 0.0..=1.0 (0 = fully transparent, 1 = opaque).
+#           Requires a compositor that honours window transparency
+#           (Wayland, macOS, KWin/Mutter, DWM-enabled Windows). Values
+#           outside the range are clamped at startup.
+#   Default: 1.0.
 opacity = 1.0
+# os_decorations — let the platform's window manager draw the title bar
+# and borders.
+#   Type:   bool. When false (the rterm default) the renderer paints its
+#           own header strip + tabs + window-control buttons (matches
+#           Chrome / Firefox). Set true to fall back to native chrome
+#           on tiling WMs or when the in-app drag/resize affordances
+#           feel off.
+#   Default: false.
+os_decorations = false
 
+# ── [shell] ───────────────────────────────────────────────────────────
+# What rterm spawns inside every new pane. Leave `program` empty to
+# inherit $SHELL on Unix / powershell.exe on Windows.
 [shell]
-# Leave program = "" to inherit $SHELL (Unix) / powershell.exe (Windows).
+# program — explicit shell binary.
+#   Type:   string. Empty `""` falls back to $SHELL / powershell.
+#   Default: "".
 # program = "/bin/zsh"
+# args — extra arguments passed to `program`.
+#   Type:   array of strings.
+#   Default: [].
 # args = ["-l"]
-# Extra environment variables for every spawned shell. Applied after the
-# built-in TERM / COLORTERM / TERM_PROGRAM defaults so user entries win
-# on key collision. Parent env stays intact — this is additive.
+# [shell.env] — extra environment variables for every spawned shell.
+# Applied AFTER the built-in TERM / COLORTERM / TERM_PROGRAM defaults so
+# user entries win on key collision. Parent env stays intact — this is
+# additive, never a replacement.
+#   Type:   table of `KEY = "value"`.
 # [shell.env]
 # RUST_BACKTRACE = "1"
 # LANG = "en_US.UTF-8"
 
+# ── [terminal] ────────────────────────────────────────────────────────
+# Per-pane terminal behaviour: scrollback, cursor, bells, OSC policy.
 [terminal]
-# Scrollback retention per pane. Set to 0 to disable scrollback entirely.
+# scrollback — number of lines retained in each pane's scrollback ring.
+#   Type:   usize. 0 disables scrollback entirely. Memory cost is
+#           roughly `scrollback * cols * 16` bytes per pane.
+#   Default: 10000.
 scrollback = 10000
-# Dump the focused pane's scrollback automatically when the window closes
+# save_scrollback_on_exit — dump the focused pane's scrollback to
+# `$XDG_CACHE_HOME/rterm/scrollback-<ts>.txt` when the window closes
 # (same path / format as the `save_scrollback` action).
+#   Type:   bool. Default: false.
 save_scrollback_on_exit = false
-# Persist the list of tabs (one focused-pane cwd per tab) on exit and
-# restore it on next startup. Splits are not preserved — each saved tab
-# restores as a single pane in the recorded cwd.
+# restore_session — persist (and re-open) the list of tabs across runs.
+# One focused-pane cwd is recorded per tab; splits are NOT preserved
+# (each restored tab opens as a single pane in the saved cwd).
+#   Type:   bool. Default: false.
 restore_session = false
-# Snap the view back to live on any new output (tail-like). Default keeps
-# the user anchored to the line they were reading.
+# scroll_on_output — snap the view back to live whenever new output
+# arrives (tail-like). Default keeps the user anchored to the line they
+# were reading.
+#   Type:   bool. Default: false.
 scroll_on_output = false
-# Master cursor-blink toggle. Set to false for a steady cursor regardless
-# of what the shell requests via DECSCUSR.
+# cursor_blink — master cursor-blink toggle.
+#   Type:   bool. When false the cursor is drawn steady regardless of
+#           the shell's DECSCUSR request.
+#   Default: true.
 cursor_blink = true
-# Draw the slim right-edge scrollbar when scrollback exists. Set to false
-# to hide it entirely.
+# show_scrollbar — draw the slim right-edge scrollbar when the pane has
+# scrollback.
+#   Type:   bool. Set to false to hide it entirely.
+#   Default: true.
 show_scrollbar = true
-# Milliseconds a tab must be idle (after producing output) before the
-# edge-triggered `tab.silence` plugin event fires. Set to 0 to disable
-# the event entirely.
+# tab_silence_ms — silence threshold for the `tab.silence` plugin event.
+# After a tab has produced output, it must stay idle for this many
+# milliseconds before the edge-triggered event fires once.
+#   Type:   u64 milliseconds. 0 disables the event entirely.
+#   Default: 5000 (5 s).
 tab_silence_ms = 5000
-# Visual flash on BEL (or `rterm.bell()`). Set to false if you find the
-# screen-flash distracting; the `bell` plugin event still fires.
+# bell_visual — on-screen flash when a BEL (or `rterm.bell()`) fires.
+#   Type:   bool. The `bell` plugin event still fires even when false.
+#   Default: true.
 bell_visual = true
-# Ping the window manager (taskbar urgency / dock badge) on BEL when the
-# rterm window is unfocused. Useful for "ping me when this build
-# finishes" workflows; set to false on desktops where the ping is noisy.
+# bell_urgent — ping the window manager (taskbar urgency / dock badge)
+# on BEL when the rterm window is unfocused. Useful for "ping me when
+# this build finishes" workflows; set false on desktops where the ping
+# is noisy.
+#   Type:   bool. Default: true.
 bell_urgent = true
-# Milliseconds a shell command (between OSC 133;C and 133;D) must run
-# before the `pane.slow_command` plugin event fires and (when unfocused)
-# the window pings the taskbar. Pair with shell integration to get a
-# "long task finished" notification. Set to 0 to disable entirely.
+# slow_command_ms — threshold for the `pane.slow_command` plugin event
+# (and the taskbar urgency ping when unfocused). A shell command framed
+# by OSC 133;C … 133;D must run at least this long to fire it. Pair
+# with shell-integration for "long task finished" notifications.
+#   Type:   u64 milliseconds. 0 disables the feature entirely.
+#   Default: 10000 (10 s).
 slow_command_ms = 10000
-# OSC 52 clipboard-write policy. A shell can request a clipboard
-# overwrite via `\e]52;c;<base64>\e\\`. Allowing this silently is a
-# real phishing primitive (a shell pipeline that fires the sequence
-# between your copy and your paste can swap the buffer contents).
-# Default is `false`; set to `true` if you rely on tmux / mosh / SSH
-# clipboard forwarding.
+# allow_osc52 — let shells write to the system clipboard via
+# `ESC ] 52 ; c ; <base64> ESC \\`. Allowing this silently is a real
+# phishing primitive: a shell pipeline can swap your clipboard contents
+# between Copy and Paste. xterm, kitty, wezterm, and Alacritty all gate
+# this by default.
+#   Type:   bool.
+#   Default: false. Set true only if you rely on tmux / mosh / SSH
+#           clipboard forwarding.
 allow_osc52 = false
 
-# Guake-style drop-down. When `enabled = true`, the `toggle_guake`
+# ── [appearance] ──────────────────────────────────────────────────────
+# Live visual preferences picked by the cycle-theme action /
+# `rterm.set_theme(name)` / the settings overlay. Survives restart so
+# your last pick re-applies.
+[appearance]
+# theme — canonical built-in theme name.
+#   Type:   string. Run `rterm --list-actions` and look for
+#           `cycle_theme` to see all names, or use the settings overlay
+#           (default Ctrl+Shift+,). Built-ins: "default", "dark",
+#           "dracula", "solarized-dark", "solarized-light", "nord",
+#           "gruvbox-dark", "light". Empty `""` = no preference (falls
+#           back to `[colors]` overrides if any, otherwise the built-in
+#           default palette).
+#   Default: "".
+theme = ""
+
+# ── [guake] ───────────────────────────────────────────────────────────
+# Guake-style drop-down: when `enabled = true`, the `toggle_guake`
 # action toggles the window between a "dropped" state (sized per
 # `width_pct` × `height_pct` of the current monitor, anchored to
 # `position`, raised above other windows) and a minimised state.
-# Bind `toggle_guake` to a key in `[[keybindings]]` below to use it.
+# Bind `toggle_guake` to a key in `[[keybindings]]` to use it.
+#
 # A system-wide global hotkey (so the binding works while the rterm
-# window is not focused) is not provided by rterm — wire a desktop
+# window is NOT focused) is not provided by rterm — wire a desktop
 # shortcut to a `wmctrl` / `xdotool` / KWin script that targets the
 # already-running rterm instance.
 #
-# Hot-reload: changes to `[guake]` are picked up on `config.toml`
-# save without restart (same as font / opacity / bell). Flipping
-# `enabled = false` mid-session also drops any AlwaysOnTop level
-# the renderer may have applied on a prior drop.
+# Hot-reload: changes to `[guake]` are picked up on `config.toml` save
+# without restart (same as font / opacity / bell). Flipping
+# `enabled = false` mid-session also drops any AlwaysOnTop level the
+# renderer had applied during a prior drop.
 [guake]
+# enabled — master toggle.
+#   Type:   bool.
+#   Default: false (`toggle_guake` is a no-op).
 enabled = false
-# "top" | "bottom" | "full". On Wayland positioning is owned by the
-# compositor so "top" / "full" fall back to `set_maximized(true)`.
+# position — edge the dropped window anchors to.
+#   Type:   one of "top" | "bottom" | "full". On Wayland the compositor
+#           owns positioning, so "top" / "full" fall back to
+#           `set_maximized(true)`; "bottom" warns once and skips.
+#   Default: "top".
 position = "top"
-# 10..=100 % of the monitor height (ignored for "full").
+# height_pct — fraction of the monitor height the dropped window takes.
+#   Type:   u8 in 10..=100. Ignored when `position = "full"` (the
+#           compositor maximises). Clamped at runtime.
+#   Default: 50.
 height_pct = 50
-# 20..=100 % of the monitor width.
+# width_pct — fraction of the monitor width.
+#   Type:   u8 in 20..=100. Clamped at runtime.
+#   Default: 100.
 width_pct = 100
 
-# Terminal palette. All entries are optional [r, g, b] byte triples; any
-# missing field falls back to the built-in xterm-ish defaults.
+# ── [colors] ──────────────────────────────────────────────────────────
+# Terminal palette overrides. Every entry is an optional `[r, g, b]`
+# byte triple (each channel 0..=255); missing fields keep the built-in
+# xterm-ish defaults. Live-reloaded on save.
 [colors]
+# fg / bg — default foreground / background for `Color::Default` cells.
 # fg      = [220, 220, 220]
 # bg      = [10, 12, 18]
-# cursor  = [255, 204, 102]   # uncomment to pin the cursor colour
+# cursor — fixed cursor block colour. When unset the cursor uses the
+# inverted cell foreground (xterm convention).
+# cursor  = [255, 204, 102]
 
+# Named 16-colour palette (8 normal + 8 bright).
 # black   = [0, 0, 0]
 # red     = [205, 49, 49]
 # green   = [13, 188, 121]
@@ -120,19 +229,24 @@ width_pct = 100
 # bright_cyan    = [41, 184, 219]
 # bright_white   = [255, 255, 255]
 
-# Custom keybindings (override built-ins; see `Ctrl+Shift+H` in-app for the
-# full default list). Each entry: keys + action.
+# ── [[keybindings]] ───────────────────────────────────────────────────
+# Custom keybindings. Each entry overrides any built-in default for the
+# same key combo; press `Ctrl+Shift+H` in-app to see the full live list.
 #
-# Recognised modifiers: Ctrl (or Control), Shift, Alt (or Option),
-#                       Super (or Cmd, Meta, Win).
-# Named keys: Enter (Return), Escape (Esc), Tab, Space, Backspace,
-#             Delete (Del), Insert (Ins), Home, End, PageUp (PgUp),
-#             PageDown (PgDn), Up/Down/Left/Right (ArrowUp/Down/Left/Right),
-#             F1..F12.
-# Punctuation aliases (use in place of bare `+` or unprintable keys):
-#             Plus (+), Minus/Dash (-), Equal (=), Comma (,),
-#             Period/Dot (.), Slash (/), Backslash (\\), Semicolon (;),
-#             Colon (:), Apostrophe/Quote (').
+# Each entry is `{ keys, action }`:
+#
+# Modifiers (combined with `+`):  Ctrl (or Control), Shift, Alt (or
+#                                 Option), Super (or Cmd, Meta, Win).
+# Named keys:                     Enter (Return), Escape (Esc), Tab,
+#                                 Space, Backspace, Delete (Del),
+#                                 Insert (Ins), Home, End, PageUp
+#                                 (PgUp), PageDown (PgDn),
+#                                 Up/Down/Left/Right (ArrowUp/Down/
+#                                 Left/Right), F1..F12.
+# Punctuation aliases:            Plus (+), Minus/Dash (-), Equal (=),
+#                                 Comma (,), Period/Dot (.), Slash (/),
+#                                 Backslash (\\), Semicolon (;),
+#                                 Colon (:), Apostrophe/Quote (').
 #
 # Actions (run `rterm --list-actions` for the live canonical list):
 #   new_tab, close_tab, next_tab, prev_tab, move_tab_left, move_tab_right,
