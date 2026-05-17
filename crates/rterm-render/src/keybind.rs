@@ -39,6 +39,37 @@ pub struct UserBinding {
     pub(crate) action_name: String,
 }
 
+/// Function-key names accepted by `parse_key_spec`. Index `N` holds
+/// `NamedKey::F{N+1}` so `parse_function_key("f3")` reads
+/// `FUNCTION_KEYS[2]`. Kept as a flat table because `winit::NamedKey`
+/// does not expose a by-index getter — the variants are independent
+/// values, not a range. Limited to F1..=F12 (the keys present on every
+/// keyboard we ship for); extending to F13..=F24 is a one-line edit if
+/// a user reports a hardware function row beyond F12.
+const FUNCTION_KEYS: [NamedKey; 12] = [
+    NamedKey::F1,
+    NamedKey::F2,
+    NamedKey::F3,
+    NamedKey::F4,
+    NamedKey::F5,
+    NamedKey::F6,
+    NamedKey::F7,
+    NamedKey::F8,
+    NamedKey::F9,
+    NamedKey::F10,
+    NamedKey::F11,
+    NamedKey::F12,
+];
+
+/// Parse `"f<N>"` (already lower-cased by the caller) into a
+/// `NamedKey::F<N>`. Returns `None` for `"f0"`, `"f13"`+, or any
+/// non-numeric suffix (`"flag"`, `"fn"` etc.) — the caller falls back
+/// to treating the token as a literal `Char` glyph.
+fn parse_function_key(token: &str) -> Option<NamedKey> {
+    let n: usize = token.strip_prefix('f')?.parse().ok()?;
+    FUNCTION_KEYS.get(n.checked_sub(1)?).copied()
+}
+
 /// Parse a key spec like `"Ctrl+Shift+T"`, `"Alt+Right"`, `"F1"`.
 /// Returns None if the spec is malformed or names an unknown key.
 pub(crate) fn parse_key_spec(s: &str) -> Option<(ModifiersState, KeyMatch)> {
@@ -68,18 +99,7 @@ pub(crate) fn parse_key_spec(s: &str) -> Option<(ModifiersState, KeyMatch)> {
                     "down" | "arrowdown" => Some(NamedKey::ArrowDown),
                     "left" | "arrowleft" => Some(NamedKey::ArrowLeft),
                     "right" | "arrowright" => Some(NamedKey::ArrowRight),
-                    "f1" => Some(NamedKey::F1),
-                    "f2" => Some(NamedKey::F2),
-                    "f3" => Some(NamedKey::F3),
-                    "f4" => Some(NamedKey::F4),
-                    "f5" => Some(NamedKey::F5),
-                    "f6" => Some(NamedKey::F6),
-                    "f7" => Some(NamedKey::F7),
-                    "f8" => Some(NamedKey::F8),
-                    "f9" => Some(NamedKey::F9),
-                    "f10" => Some(NamedKey::F10),
-                    "f11" => Some(NamedKey::F11),
-                    "f12" => Some(NamedKey::F12),
+                    fn_key if fn_key.starts_with('f') => parse_function_key(fn_key),
                     _ => None,
                 };
                 // Named-key shorthand for punctuation that can't sit in

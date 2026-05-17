@@ -11808,6 +11808,63 @@ mod tests {
     }
 
     #[test]
+    fn parse_key_spec_function_keys_cover_full_range() {
+        // The function-key arm parses the numeric suffix instead of
+        // listing all twelve variants by hand. Pin the full F1..F12
+        // contract so a regression in `parse_function_key` (e.g.
+        // off-by-one on the lookup table) can't silently drop a
+        // mid-range key.
+        let expected = [
+            ("F1", NamedKey::F1),
+            ("F2", NamedKey::F2),
+            ("f3", NamedKey::F3),
+            ("F4", NamedKey::F4),
+            ("F5", NamedKey::F5),
+            ("F6", NamedKey::F6),
+            ("F7", NamedKey::F7),
+            ("F8", NamedKey::F8),
+            ("F9", NamedKey::F9),
+            // Two- and three-digit numeric suffixes are the easiest
+            // place for a hand-cranked alternation to lose an entry.
+            ("F10", NamedKey::F10),
+            ("F11", NamedKey::F11),
+            ("F12", NamedKey::F12),
+        ];
+        for (spec, want) in expected {
+            let (_, k) = parse_key_spec(spec)
+                .unwrap_or_else(|| panic!("{spec} should parse"));
+            assert_eq!(k, KeyMatch::Named(want), "wrong NamedKey for {spec}");
+        }
+    }
+
+    #[test]
+    fn parse_key_spec_function_key_rejects_out_of_range_and_garbage() {
+        // `f0` has no `NamedKey` equivalent; `f13`+ is outside the
+        // shipped range. Both must fall through to the "treat as a
+        // literal char" path so a user's typo doesn't silently bind
+        // an arbitrary F-key.
+        for spec in ["F0", "F13", "F99", "F999"] {
+            let (_, k) = parse_key_spec(spec)
+                .unwrap_or_else(|| panic!("{spec} should still parse as a literal"));
+            // Any `Named` result here would mean the suffix parser
+            // accepted an out-of-range index.
+            match k {
+                KeyMatch::Char(_) => {}
+                KeyMatch::Named(other) => panic!(
+                    "spec {spec:?} unexpectedly resolved to NamedKey {other:?}",
+                ),
+            }
+        }
+        // Single 'f' (not a function-key — the user wants the letter)
+        // must still resolve as a literal char binding.
+        let (_, k) = parse_key_spec("F").unwrap();
+        assert_eq!(k, KeyMatch::Char("f".to_string()));
+        // Non-numeric suffix (`flag`) too.
+        let (_, k) = parse_key_spec("flag").unwrap();
+        assert_eq!(k, KeyMatch::Char("flag".to_string()));
+    }
+
+    #[test]
     fn parse_key_spec_accepts_modifier_aliases() {
         // The bundled default.toml template documents alias spellings for
         // every modifier (Control, Option, Cmd/Meta/Win). Pin them so a
