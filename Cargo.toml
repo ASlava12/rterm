@@ -40,6 +40,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-ut
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+# toml_edit preserves comments / whitespace / section order across
+# round-trips. Used for in-place updates to user-owned config files
+# (e.g. `cycle_theme` persists `[appearance].theme` without
+# clobbering hand-written comments).
+toml_edit = "0.22"
 
 # Lua plugins
 mlua = { version = "0.10", features = ["lua54", "vendored", "send", "async"] }

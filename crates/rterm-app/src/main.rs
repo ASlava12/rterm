@@ -1504,22 +1504,50 @@ fn run_gui(
 }
 
 /// Rewrite the user's `config.toml` so that `[appearance].theme = "<name>"`
-/// matches `name`. Preserves the rest of the file by parsing+serializing
-/// the full `Config` rather than munging text. Creates parent directories
-/// as needed. Failures are logged at the caller.
+/// matches `name`. Uses `toml_edit` for in-place updates so the user's
+/// hand-written comments / section ordering / blank-line layout survive
+/// the rewrite (the previous `toml::to_string_pretty(&cfg)` round-trip
+/// wiped them).
+///
+/// Creates parent directories as needed. Falls back to a full serialise
+/// only when the file doesn't exist or fails to parse as a TOML document.
 fn persist_theme_to_config(path: &std::path::Path, name: &str) -> Result<()> {
-    let mut cfg = if path.exists() {
-        Config::load_from(path).unwrap_or_default()
-    } else {
-        Config::default()
-    };
-    if cfg.appearance.theme == name {
-        return Ok(());
-    }
-    cfg.appearance.theme = name.to_string();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
+    // Existing config: parse via toml_edit, replace just the one value,
+    // serialise back. Comments / whitespace preserved.
+    if path.exists() {
+        if let Ok(body) = std::fs::read_to_string(path) {
+            if let Ok(mut doc) = body.parse::<toml_edit::DocumentMut>() {
+                // Skip the write when the value is already correct —
+                // avoids touching mtime (the file watcher would
+                // otherwise see our own save and trigger a reload).
+                let current = doc.get("appearance")
+                    .and_then(|a| a.get("theme"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("");
+                if current == name {
+                    return Ok(());
+                }
+                // Ensure `[appearance]` table exists, then set `theme`.
+                let appearance = doc
+                    .entry("appearance")
+                    .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+                if let Some(tbl) = appearance.as_table_mut() {
+                    tbl["theme"] = toml_edit::value(name);
+                }
+                std::fs::write(path, doc.to_string()).with_context(|| {
+                    format!("write {} for theme persistence", path.display())
+                })?;
+                return Ok(());
+            }
+        }
+    }
+    // Path missing or unparseable — fall back to a minimal full
+    // serialise. The previous code path would have done the same.
+    let mut cfg = Config::default();
+    cfg.appearance.theme = name.to_string();
     let serialized = toml::to_string_pretty(&cfg).context("serialize config")?;
     std::fs::write(path, serialized).with_context(|| {
         format!("write {} for theme persistence", path.display())
@@ -2576,6 +2604,45 @@ mod tests {
         let cfg2 = Config::load_from(&path).unwrap();
         assert_eq!(cfg2.appearance.theme, "nord");
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn persist_theme_preserves_existing_comments_and_sections() {
+        // Seed the file with a hand-written config: comments, ordering,
+        // unrelated sections. After persist_theme, those must survive
+        // verbatim — only the `theme = "..."` value changes.
+        let dir = std::env::temp_dir().join("rterm-test-persist-preserve");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let original = r#"
+# user-authored header comment that must survive
+[font]
+family = "Fira Code"  # inline comment
+size = 14.0
+
+# Window section — keep me too.
+[window]
+opacity = 0.85
+
+[appearance]
+# previous theme below
+theme = "dracula"
+
+[terminal]
+scrollback = 50000
+"#;
+        std::fs::write(&path, original).unwrap();
+        super::persist_theme_to_config(&path, "nord").unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("# user-authored header comment that must survive"));
+        assert!(after.contains("# inline comment"));
+        assert!(after.contains("# Window section — keep me too."));
+        assert!(after.contains("# previous theme below"));
+        assert!(after.contains("scrollback = 50000"));
+        // The value MUST be updated.
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.appearance.theme, "nord");
         std::fs::remove_file(&path).ok();
     }
 }
