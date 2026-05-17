@@ -81,6 +81,12 @@ allow_osc52 = false
 # window is not focused) is not provided by rterm — wire a desktop
 # shortcut to a `wmctrl` / `xdotool` / KWin script that targets the
 # already-running rterm instance.
+#
+# NB: changes to this `[guake]` section require a restart of rterm —
+# unlike most config knobs (font, opacity, bell, scrollback), the
+# guake snapshot is read once at startup and not picked up by the
+# hot-reload watcher. Toggling `enabled` from `false` → `true` mid-
+# session won't activate the action until you exit and relaunch.
 [guake]
 enabled = false
 # "top" | "bottom" | "full". On Wayland positioning is owned by the

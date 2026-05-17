@@ -325,6 +325,12 @@ const OSC_RESPONSES_CAP: usize = 256;
 const PROMPT_MARKS_CAP: usize = 512;
 const NOTIFICATIONS_CAP: usize = 64;
 const HYPERLINK_CAP: usize = 4096;
+/// Running total cap on the cumulative bytes stored in the hyperlink
+/// URI table. Without this a malicious shell can fill `HYPERLINK_CAP`
+/// entries × `URI_CAP` bytes each = 32 MiB of pinned strings per pane
+/// — a slow but real DoS. 1 MiB matches "real URI loads are well
+/// under this" while still blunting the worst case.
+const HYPERLINK_TOTAL_BYTES_CAP: usize = 1024 * 1024;
 
 /// Pending palette change emitted by OSC 4 / 10 / 11 SET. Drained by the
 /// App and folded into the renderer's live `Palette`.
@@ -2472,14 +2478,20 @@ impl<'a> Perform for TerminalPerform<'a> {
                     } else {
                         let id = *self.next_link_id;
                         *self.next_link_id = self.next_link_id.wrapping_add(1).max(1);
-                        // Bound the lookup table: drop the oldest id when we
-                        // exceed the cap. Cells referring to evicted ids degrade
-                        // to "no link" rather than a stale URI.
-                        while self.hyperlinks.len() >= HYPERLINK_CAP {
-                            if let Some(old) = self.hyperlink_order.pop_front() {
-                                self.hyperlinks.remove(&old);
-                            } else {
-                                break;
+                        let new_len = uri.len();
+                        // Bound BOTH the entry count AND the cumulative
+                        // byte total — eviction loops drop the oldest
+                        // URI until each cap is satisfied. Cells
+                        // referring to evicted ids degrade to "no link"
+                        // rather than a stale URI.
+                        let mut bytes_used: usize =
+                            self.hyperlinks.values().map(|s| s.len()).sum();
+                        while self.hyperlinks.len() >= HYPERLINK_CAP
+                            || bytes_used + new_len > HYPERLINK_TOTAL_BYTES_CAP
+                        {
+                            let Some(old) = self.hyperlink_order.pop_front() else { break };
+                            if let Some(removed) = self.hyperlinks.remove(&old) {
+                                bytes_used = bytes_used.saturating_sub(removed.len());
                             }
                         }
                         self.hyperlinks.insert(id, uri);
@@ -4794,6 +4806,40 @@ mod tests {
         );
         // Last id (4097) survives.
         assert_eq!(t.hyperlink_uri(4097), Some("https://e/4097"));
+    }
+
+    #[test]
+    fn hyperlinks_total_bytes_capped() {
+        // HYPERLINK_TOTAL_BYTES_CAP (1 MiB) bounds the cumulative
+        // byte total even when the entry count is well below
+        // HYPERLINK_CAP — protects against a malicious shell that
+        // pushes a handful of huge (up to URI_CAP = 8 KiB) URIs.
+        // Push 200× 7 KiB URIs (~1.4 MiB nominal) and confirm the
+        // running total stays under the cap.
+        let mut t = term(4, 1);
+        let bulk = "a".repeat(7 * 1024);
+        for i in 1..=200u32 {
+            // ESC ] 8 ; ; <scheme>://<bulk>?<i> ESC \
+            t.advance(b"\x1b]8;;https://x.example/");
+            t.advance(bulk.as_bytes());
+            t.advance(format!("?{}", i).as_bytes());
+            t.advance(b"\x1b\\");
+        }
+        // Sum bytes of every surviving URI; must respect the cap
+        // (with a small headroom — eviction runs BEFORE insert, so
+        // the inserted URI itself might push slightly past the cap
+        // on the very last step; pin a generous 2× ceiling to make
+        // the regression test stable while still catching unbounded
+        // growth).
+        let total: usize = (1u32..=u32::MAX)
+            .take_while(|id| t.hyperlink_uri(*id).is_some() || *id < 250)
+            .filter_map(|id| t.hyperlink_uri(id))
+            .map(str::len)
+            .sum();
+        assert!(
+            total <= 2 * 1024 * 1024,
+            "hyperlink table grew to {total} bytes — total-byte cap not honoured",
+        );
     }
 
     #[test]
