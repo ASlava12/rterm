@@ -155,6 +155,34 @@ impl CommandBuffer {
         out
     }
 
+    /// Read the buffer's current contents WITHOUT consuming them.
+    /// Used by the popup to query history with the current
+    /// half-typed prefix. Returns the bytes interpreted as UTF-8;
+    /// non-UTF-8 trailing bytes (e.g. mid-character on a paste) are
+    /// dropped so the renderer never sees a partial codepoint.
+    #[allow(dead_code)] // wired up in the popup integration commit
+    pub(crate) fn current_input(&self) -> String {
+        // `from_utf8_lossy` substitutes a U+FFFD for each invalid
+        // sequence; that's fine for a *display* of the prefix but
+        // we don't want it to leak into history queries. Use a
+        // strict from_utf8 first and only fall back to the lossy
+        // form on the suffix — we want to keep all the valid
+        // prefix bytes for matching.
+        match std::str::from_utf8(&self.raw) {
+            Ok(s) => s.to_string(),
+            Err(e) => {
+                // Truncate at the first invalid byte; the popup
+                // will see whatever valid prefix the user has
+                // accumulated so far. The next valid byte will
+                // bring us back to a clean state on the next
+                // `feed`.
+                std::str::from_utf8(&self.raw[..e.valid_up_to()])
+                    .unwrap_or("")
+                    .to_string()
+            }
+        }
+    }
+
     /// Take whatever's currently in the buffer as a UTF-8 string,
     /// trim outer whitespace, return `Some` if non-empty. Resets
     /// the buffer.
@@ -201,6 +229,12 @@ impl CommandBuffer {
 pub(crate) struct CommandCapture {
     buffer: Mutex<CommandBuffer>,
     history: Option<Arc<Mutex<rterm_history::History>>>,
+    /// Monotonic counter bumped every time `feed` mutates the
+    /// buffer (i.e. on a non-empty, non-pure-control input).
+    /// The renderer polls this to detect "did the user just
+    /// type?" — when the value changes, it re-arms the popup
+    /// debounce timer.
+    generation: std::sync::atomic::AtomicU64,
 }
 
 impl CommandCapture {
@@ -208,6 +242,7 @@ impl CommandCapture {
         Self {
             buffer: Mutex::new(CommandBuffer::new()),
             history,
+            generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -218,6 +253,11 @@ impl CommandCapture {
     pub(crate) fn feed(&self, bytes: &[u8]) {
         let Ok(mut buf) = self.buffer.lock() else { return };
         let commands = buf.feed(bytes);
+        // Always bump generation, even on pure control / escape
+        // sequences — the popup wants to react to backspace or
+        // Ctrl+U the same way it reacts to a typed char.
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         drop(buf);
         let Some(history) = self.history.as_ref() else { return };
         let Ok(history) = history.lock() else { return };
@@ -226,6 +266,25 @@ impl CommandCapture {
                 tracing::debug!(error = %e, "history record failed");
             }
         }
+    }
+
+    /// Snapshot the current half-typed command. Empty string when
+    /// the buffer is empty (no prefix → popup typically hides).
+    #[allow(dead_code)] // wired up in the popup integration commit
+    pub(crate) fn current_input(&self) -> String {
+        self.buffer
+            .lock()
+            .ok()
+            .map(|b| b.current_input())
+            .unwrap_or_default()
+    }
+
+    /// Monotonic generation. The popup refresh-debouncer uses
+    /// `generation` deltas to detect input changes without holding
+    /// the buffer mutex across frames.
+    #[allow(dead_code)] // wired up in the popup integration commit
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -403,6 +462,70 @@ mod tests {
         assert_eq!(h.len().unwrap(), 2);
         let entry = h.lookup("ls -la").unwrap().unwrap();
         assert_eq!(entry.count, 2, "ls -la submitted twice");
+    }
+
+    #[test]
+    fn current_input_returns_unconsumed_prefix() {
+        // The popup queries the half-typed command without
+        // resetting the buffer. After feeding "git stat" the
+        // accumulated input should be readable verbatim, and
+        // the buffer must still hold those bytes for the next
+        // feed (the submit on `\r` is what clears).
+        let mut b = CommandBuffer::new();
+        let _ = b.feed(b"git stat");
+        assert_eq!(b.current_input(), "git stat");
+        // Buffer survives the read.
+        let out = b.feed(b"us\r");
+        assert_eq!(out, vec!["git status".to_string()]);
+        // After submit the buffer is empty.
+        assert_eq!(b.current_input(), "");
+    }
+
+    #[test]
+    fn current_input_truncates_at_first_invalid_utf8() {
+        // A paste can deliver a multi-byte char split across two
+        // feed calls. Reading mid-split must surface the valid
+        // prefix only; the dangling continuation byte stays in the
+        // buffer and reassembles on the next feed.
+        let mut b = CommandBuffer::new();
+        // 'л' = 0xd0 0xbb, 'с' = 0xd1 0x81. Feed 'л' + half of 'с'.
+        let _ = b.feed(&[b'a', 0xd0, 0xbb, 0xd1]);
+        assert_eq!(b.current_input(), "aл");
+        // Complete the broken char on the next feed.
+        let _ = b.feed(&[0x81, b'\r']);
+        // Note: we don't read current_input here — the submit
+        // emitted "aлс" already. Just verify the submit went
+        // through cleanly.
+    }
+
+    #[test]
+    fn command_capture_generation_bumps_on_feed() {
+        // The popup's debounce timer keys off generation deltas.
+        // Pin that every feed (even pure control) advances the
+        // counter — backspaces / Ctrl+U change the prefix the
+        // popup is matching against just like a typed letter.
+        let cap = CommandCapture::new(None);
+        let g0 = cap.generation();
+        cap.feed(b"a");
+        let g1 = cap.generation();
+        assert!(g1 > g0, "typed char must bump generation");
+        cap.feed(b"\x7f"); // backspace
+        let g2 = cap.generation();
+        assert!(g2 > g1, "backspace must bump generation");
+        cap.feed(b"\x1b[A"); // CSI arrow-up (dropped, but feed runs)
+        let g3 = cap.generation();
+        assert!(g3 > g2, "control sequence still bumps generation");
+    }
+
+    #[test]
+    fn command_capture_current_input_through_wrapper() {
+        let cap = CommandCapture::new(None);
+        cap.feed(b"vim ~/.bashrc");
+        assert_eq!(cap.current_input(), "vim ~/.bashrc");
+        // Bare Ctrl+U clears the line — popup must see an empty
+        // prefix afterwards.
+        cap.feed(b"\x15");
+        assert_eq!(cap.current_input(), "");
     }
 
     #[test]

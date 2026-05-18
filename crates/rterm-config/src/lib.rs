@@ -23,6 +23,46 @@ pub struct Config {
     pub terminal: TerminalConfig,
     pub appearance: AppearanceConfig,
     pub guake: GuakeConfig,
+    pub history: HistoryConfig,
+}
+
+/// Terminal-side command-history settings. Controls when the
+/// suggestion popup appears, how many rows it shows, and the
+/// minimum prefix length before the popup considers itself
+/// "armed". Defaults pick a sensible UX for typical shell
+/// workflows; tune via the `[history]` section.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HistoryConfig {
+    /// Master toggle. `false` disables capture AND the popup —
+    /// both effectively become no-ops. `true` (default) keeps
+    /// everything running with the rest of the defaults below.
+    pub enabled: bool,
+    /// Number of suggestion rows the popup shows at once. The
+    /// dropdown is scrollable: arrow keys move beyond the visible
+    /// window without resizing it.
+    pub popup_rows: u8,
+    /// Milliseconds the user must pause typing before the popup
+    /// queries the history and appears. Default 150ms — short
+    /// enough to feel responsive, long enough to skip the
+    /// per-keystroke flicker.
+    pub popup_debounce_ms: u32,
+    /// Minimum number of characters in the current input before
+    /// the popup is considered for display. Set higher (e.g. 3)
+    /// to silence the popup on single-letter commands like `ls`
+    /// or `vi` where users rarely want a dropdown.
+    pub min_prefix_len: u8,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            popup_rows: 5,
+            popup_debounce_ms: 150,
+            min_prefix_len: 1,
+        }
+    }
 }
 
 /// Guake-style drop-down preferences. When `enabled`, the
