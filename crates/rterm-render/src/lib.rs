@@ -1082,6 +1082,18 @@ impl TextLayer {
         self.font_size
     }
 
+    /// Evict glyphs from the glyph atlas that haven't been rendered
+    /// since the previous trim. Two atlases (colour + mask) get
+    /// trimmed at once. Cheap when nothing's evictable; meaningful
+    /// when a long-running session has rasterised many fonts /
+    /// sizes / colours and the atlas has grown past its initial
+    /// 256×256 footprint. Call infrequently (once a minute is
+    /// plenty) so re-uploads don't churn the GPU on cells that
+    /// would have been needed again next frame.
+    pub fn trim_atlas(&mut self) {
+        self.atlas.trim();
+    }
+
     /// Resolved family name handed to cosmic-text. Either the user's
     /// explicit pick or the default-monospace resolution; empty string
     /// means we're on cosmic-text's built-in `Family::Monospace` fallback.
@@ -2982,6 +2994,15 @@ pub struct App {
     /// Lets clock-display / idle-warning plugins do periodic work
     /// without subscribing to every redraw.
     last_frame_tick: Option<Instant>,
+    /// Most recent `TextAtlas::trim` timestamp. The glyph atlas
+    /// grows lazily as new glyph variants are rasterised; in a
+    /// long-running session that's seen many font sizes / colours
+    /// / families, it can balloon up to the GPU's max texture
+    /// dimension. Periodic trims (cadence: once a minute) evict
+    /// glyphs not rendered since the previous trim — cheap when
+    /// the working set is stable, meaningful after font-size
+    /// cycling or theme churn. `None` until the first trim fires.
+    last_atlas_trim: Option<Instant>,
     /// Milliseconds of inactivity before an armed tab fires `tab.silence`.
     /// `0` disables the event.
     tab_silence_ms: u64,
@@ -3173,6 +3194,7 @@ impl App {
             first_frame_done: false,
             render_test_only,
             last_frame_tick: None,
+            last_atlas_trim: None,
             tab_silence_ms,
             slow_command_ms,
             previous_tab: None,
@@ -10299,6 +10321,27 @@ impl ApplicationHandler<UserEvent> for App {
                 // compute), at most one SQLite query when the
                 // debounce window elapses.
                 self.refresh_suggestion_popup();
+                // Trim the glyph atlas once a minute. glyphon's
+                // atlas grows lazily up to the GPU's max texture
+                // dimension (often 8192² → ~64 MiB per atlas, two
+                // atlases = ~128 MiB) and never evicts on its own,
+                // so a session that's cycled through several font
+                // sizes / themes accumulates dead glyphs. The
+                // trim removes anything that hasn't been rendered
+                // since the previous trim — cheap when the working
+                // set is stable, big GPU-memory win after churn.
+                const ATLAS_TRIM_INTERVAL: Duration = Duration::from_secs(60);
+                let now = Instant::now();
+                let should_trim = match self.last_atlas_trim {
+                    Some(prev) => now.duration_since(prev) >= ATLAS_TRIM_INTERVAL,
+                    None => true,
+                };
+                if should_trim {
+                    if let Some(state) = self.state.as_mut() {
+                        state.text.trim_atlas();
+                    }
+                    self.last_atlas_trim = Some(now);
+                }
                 // Wayland/wgpu egg-and-chicken: the compositor only sends
                 // its `configure` after the client commits a buffer, and
                 // the client doesn't know its actual surface size until

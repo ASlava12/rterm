@@ -364,5 +364,15 @@ mod tests {
             sz <= 32,
             "Cell grew to {sz} bytes — pin the bloat with intent",
         );
+        // Lock the current packed layout so a stealth field add
+        // (or a careless `#[repr]` swap) gets flagged. Update this
+        // figure deliberately when intentionally widening the
+        // cell. As of writing: ch(4) + fg(4) + bg(4) + attrs(2) +
+        // pad(2) + hyperlink(4) = 20 bytes.
+        assert_eq!(
+            sz, 20,
+            "Cell layout changed — update the config doc + memory \
+             math (default.toml says ~cell_size bytes/cell)",
+        );
     }
 }

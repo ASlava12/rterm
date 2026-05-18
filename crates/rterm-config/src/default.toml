@@ -84,8 +84,11 @@ os_decorations = false
 # Per-pane terminal behaviour: scrollback, cursor, bells, OSC policy.
 [terminal]
 # scrollback — number of lines retained in each pane's scrollback ring.
-#   Type:   usize. 0 disables scrollback entirely. Memory cost is
-#           roughly `scrollback * cols * 16` bytes per pane.
+#   Type:   usize. 0 disables scrollback entirely. Each Cell is 20
+#           bytes (char + fg/bg colour + attrs + hyperlink id), so
+#           memory cost is roughly `scrollback * cols * 20` bytes
+#           per pane. 10 000 × 80 cols ≈ 16 MiB. Drop to 2000 if
+#           you keep many panes open or hit memory pressure.
 #   Default: 10000.
 scrollback = 10000
 # save_scrollback_on_exit — dump the focused pane's scrollback to
