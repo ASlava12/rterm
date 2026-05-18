@@ -7266,20 +7266,31 @@ impl App {
         }
     }
 
-    /// Mouse-click on the paste-confirmation modal. In Confirm
-    /// mode, find which button the click landed on and activate
-    /// it; clicks outside any button (but inside the modal) are
-    /// just absorbed. In Edit mode, all clicks are absorbed —
-    /// `Ctrl+Enter` / `Esc` are the only ways to leave the editor,
-    /// matching how modal text-areas usually work.
+    /// Mouse-click on the paste-confirmation modal. Confirm mode:
+    /// hit-test the button row. Edit mode: project the click onto
+    /// a (line, column) in the buffer and move the cursor there.
     fn handle_paste_confirmation_press(&mut self, x: f64, y: f64) {
         use paste_confirm::PasteMode;
         let Some(modal) = self.paste_confirmation.clone() else { return };
-        let PasteMode::Confirm { selected: _ } = modal.mode else {
-            // Edit mode — absorb the click, no further action.
-            return;
-        };
-        let Some(rect) = self.paste_confirmation_rect(&modal) else { return };
+        match modal.mode {
+            PasteMode::Confirm { .. } => {
+                self.paste_modal_press_confirm(&modal, x, y);
+            }
+            PasteMode::Edit { .. } => {
+                self.paste_modal_press_edit(x, y);
+            }
+        }
+    }
+
+    /// Button hit-test for the Confirm dialog. Clicks outside any
+    /// button are absorbed but ignored — the modal stays up.
+    fn paste_modal_press_confirm(
+        &mut self,
+        modal: &paste_confirm::PasteConfirmation,
+        x: f64,
+        y: f64,
+    ) {
+        let Some(rect) = self.paste_confirmation_rect(modal) else { return };
         let Some(state) = self.state.as_ref() else { return };
         let cell_w = state.text.cell_width();
         let line_h = state.text.line_height();
@@ -7296,11 +7307,8 @@ impl App {
         let row_y = rect.top + button_row_index as f32 * line_h;
         let yf = y as f32;
         if yf < row_y || yf >= row_y + line_h {
-            return; // Click missed the button row.
+            return;
         }
-        // Column math: leading 2 cells of indent, then per-button
-        // BUTTON_LABEL_CELLS wide blocks separated by BUTTON_GAP
-        // cells. Walk left → right and report the first hit.
         let xf = x as f32;
         let mut col = paste_confirm::BUTTON_LEADING_CELLS as f32;
         for btn in [
@@ -7317,7 +7325,144 @@ impl App {
             col += paste_confirm::BUTTON_LABEL_CELLS as f32
                 + paste_confirm::BUTTON_GAP_CELLS as f32;
         }
-        // Click landed in the modal but on no button — absorbed.
+    }
+
+    /// Click-to-position in the Edit mini-editor. Pixel coords →
+    /// (visible_row, cell_col) → absolute (line, char column) →
+    /// byte offset in the buffer, then `cursor` jumps there.
+    fn paste_modal_press_edit(&mut self, x: f64, y: f64) {
+        // Snapshot what we need from the renderer state and the
+        // modal layout. After this, the actual cursor update
+        // takes `&mut self` via `paste_confirmation.as_mut()`.
+        let Some(state) = self.state.as_ref() else { return };
+        let cell_w = state.text.cell_width();
+        let line_h = state.text.line_height();
+        if cell_w <= 0.0 || line_h <= 0.0 {
+            return;
+        }
+        let modal_ref = match self.paste_confirmation.as_ref() {
+            Some(m) => m.clone(),
+            None => return,
+        };
+        let Some(rect) = self.paste_confirmation_rect(&modal_ref) else { return };
+        let yf = y as f32;
+        let xf = x as f32;
+        if xf < rect.left
+            || xf >= rect.left + rect.width
+            || yf < rect.top
+            || yf >= rect.top + rect.height
+        {
+            return;
+        }
+        // Header eats 2 rows (matches the renderer's
+        // `HEADER_ROWS`). Lines below that are buffer rows.
+        const HEADER_ROWS: usize = 2;
+        let row_in_modal = ((yf - rect.top) / line_h) as usize;
+        if row_in_modal < HEADER_ROWS {
+            // Click landed on the header — absorbed, no nav.
+            return;
+        }
+        let viewport_row = row_in_modal - HEADER_ROWS;
+        let visible_rows = self.paste_modal_visible_rows();
+        if viewport_row >= visible_rows {
+            // Below the viewport (footer hint, padding) — absorbed.
+            return;
+        }
+        // `paste_modal_visible_rows` mirrors the renderer's row
+        // computation; the scroll is centered on cursor_line.
+        let lines: Vec<&str> = modal_ref.text.split('\n').collect();
+        // Reconstruct cursor_line + scroll using the same formula
+        // the renderer uses, so the click maps to exactly the
+        // line the user sees under their cursor.
+        let cursor_byte = match modal_ref.mode {
+            paste_confirm::PasteMode::Edit { cursor } => cursor,
+            _ => return,
+        };
+        let cursor_line = modal_ref.text[..cursor_byte.min(modal_ref.text.len())]
+            .bytes()
+            .filter(|b| *b == b'\n')
+            .count();
+        let half = visible_rows / 2;
+        let max_scroll = lines.len().saturating_sub(visible_rows);
+        let scroll = cursor_line.saturating_sub(half).min(max_scroll);
+        let absolute_line = scroll + viewport_row;
+        if absolute_line >= lines.len() {
+            // Click below the last buffer line (e.g. in the
+            // bottom padding row) — clamp to the end of the
+            // buffer.
+            if let Some(m) = self.paste_confirmation.as_mut() {
+                if let paste_confirm::PasteMode::Edit { cursor } = &mut m.mode {
+                    *cursor = m.text.len();
+                }
+            }
+            return;
+        }
+        // Column: subtract the 2-cell leading indent the renderer
+        // adds before each line.
+        const LINE_INDENT_CELLS: f32 = 2.0;
+        let raw_col_cells = ((xf - rect.left) / cell_w - LINE_INDENT_CELLS).max(0.0);
+        let target_col = raw_col_cells.round() as usize;
+        // Walk the target line's chars to find the byte offset at
+        // `target_col`. Clamps to end-of-line if the click was past
+        // the visible text. UTF-8 safe by construction.
+        let line_text = lines[absolute_line];
+        let mut byte_in_line = line_text.len();
+        for (i, (offset, _)) in line_text.char_indices().enumerate() {
+            if i == target_col {
+                byte_in_line = offset;
+                break;
+            }
+        }
+        // Translate (absolute_line, byte_in_line) → buffer byte
+        // offset by re-walking the buffer up to that line. Could
+        // be cached but `split('\n')` already linear-scans the
+        // buffer and the buffer is by construction bounded by the
+        // clipboard payload size.
+        let mut byte_to_line_start = 0usize;
+        for (i, l) in lines.iter().enumerate() {
+            if i == absolute_line {
+                break;
+            }
+            byte_to_line_start += l.len() + 1; // +1 for the '\n'
+        }
+        let new_cursor = byte_to_line_start + byte_in_line;
+        if let Some(m) = self.paste_confirmation.as_mut() {
+            if let paste_confirm::PasteMode::Edit { cursor } = &mut m.mode {
+                *cursor = new_cursor.min(m.text.len());
+            }
+        }
+    }
+
+    /// Mouse-wheel handling for the paste-confirmation modal. In
+    /// edit mode, the wheel scrolls the cursor up / down by a few
+    /// lines per tick (the viewport is centred on cursor, so
+    /// "scroll the cursor" produces the visual effect of a scrolled
+    /// editor). In confirm mode, the wheel is absorbed silently to
+    /// keep a stray scroll from leaking through to the pane below.
+    fn handle_paste_confirmation_wheel(&mut self, delta: MouseScrollDelta) {
+        use paste_confirm::PasteMode;
+        let Some(modal) = self.paste_confirmation.as_mut() else { return };
+        let PasteMode::Edit { .. } = modal.mode else {
+            return; // Confirm mode: absorb only.
+        };
+        // ~3 lines per wheel notch matches browser / VSCode
+        // defaults. Touchpad pixel-deltas are normalised against
+        // the same scale.
+        let step = match delta {
+            MouseScrollDelta::LineDelta(_, y) => y * 3.0,
+            MouseScrollDelta::PixelDelta(p) => (p.y as f32) / 12.0,
+        };
+        let lines = step.round() as i32;
+        if lines == 0 {
+            return;
+        }
+        // Wheel up (positive delta in winit) → scroll buffer UP
+        // visually = move cursor toward the top.
+        if lines > 0 {
+            modal.edit_up_n(lines as usize);
+        } else {
+            modal.edit_down_n((-lines) as usize);
+        }
     }
 
     /// Number of visible buffer rows in the paste-modal's edit
@@ -9718,6 +9863,15 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::KeyboardInput { .. } => {}
             WindowEvent::MouseWheel { delta, .. } => {
+                // Paste-confirmation modal grabs wheel events while
+                // up. In edit mode the wheel scrolls the cursor
+                // through the buffer; in confirm mode wheel is
+                // absorbed so a stray scroll doesn't accidentally
+                // page the pane underneath.
+                if self.paste_confirmation.is_some() {
+                    self.handle_paste_confirmation_wheel(delta);
+                    return;
+                }
                 // Ctrl+wheel = font zoom (common UX). Threshold step at 0.5
                 // so high-resolution touchpad scrolls don't fire on every
                 // tick; one notch ≈ one point.
