@@ -38,6 +38,13 @@ jobs:
             os: ubuntu-latest
             archive: tar.gz
             bin: rterm
+          # GitHub-hosted Linux/ARM64 runner (GA April 2025, free for
+          # public repos). Native compile — no `cross` toolchain or
+          # qemu emulation needed.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            archive: tar.gz
+            bin: rterm
           - target: x86_64-apple-darwin
             os: macos-13
             archive: tar.gz
@@ -48,6 +55,17 @@ jobs:
             bin: rterm
           - target: x86_64-pc-windows-msvc
             os: windows-latest
+            archive: zip
+            bin: rterm.exe
+            msi_arch: x86_64
+          # Native Windows/ARM64 runner. The MSI step is skipped on
+          # this leg — WiX v3's candle/light ship as x86 binaries
+          # that only run under emulation on ARM64, and the
+          # toolchain isn't reliable enough on the new runner image
+          # yet. ARM64 users get the zip; an ARM64 MSI can land in a
+          # follow-up once the WiX v4 (native) port stabilises.
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
             archive: zip
             bin: rterm.exe
 
@@ -122,14 +140,14 @@ jobs:
       # built binary. Skipped on Linux/macOS (deb / pkg are out of
       # scope today).
       - name: Install cargo-wix
-        if: matrix.target == 'x86_64-pc-windows-msvc'
+        if: matrix.msi_arch != ''
         run: cargo install cargo-wix --locked
 
       - name: Build MSI
-        if: matrix.target == 'x86_64-pc-windows-msvc'
+        if: matrix.msi_arch != ''
         shell: pwsh
         run: |
-          $msi = "rterm-${{ steps.ver.outputs.version }}-x86_64.msi"
+          $msi = "rterm-${{ steps.ver.outputs.version }}-${{ matrix.msi_arch }}.msi"
           cargo wix --no-build --package rterm-app --target ${{ matrix.target }} `
             --nocapture --output "target/wix/$msi"
           "MSI_ARTIFACT=target/wix/$msi" | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -142,7 +160,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload MSI
-        if: matrix.target == 'x86_64-pc-windows-msvc'
+        if: matrix.msi_arch != ''
         uses: actions/upload-artifact@v4
         with:
           name: msi-${{ matrix.target }}
