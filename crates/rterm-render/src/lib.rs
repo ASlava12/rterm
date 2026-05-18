@@ -6085,13 +6085,55 @@ impl App {
             self.close_palette();
             return false;
         }
-        // Paste-confirmation modal owns the click while it's up.
-        // Click on a button activates it (Paste / Edit / Cancel);
-        // click anywhere else inside the modal is absorbed; click
-        // outside is also absorbed (the modal is blocking — we
-        // don't want a stray click to focus a pane underneath).
+        // Paste-confirmation modal is up. Clicks INSIDE the modal
+        // card go to its own handler (buttons / cursor placement).
+        // Clicks OUTSIDE the card pass through to the window
+        // chrome only — resize edges, min/max/close, title-bar
+        // drag — so the user can still move / resize / close the
+        // window while the modal is open. All other outside clicks
+        // (tab strip, hamburger, pane area) are absorbed so a
+        // stray click can't quietly shift focus underneath.
         if self.paste_confirmation.is_some() {
-            self.handle_paste_confirmation_press(x, y);
+            let modal_rect = self
+                .paste_confirmation
+                .as_ref()
+                .and_then(|m| self.paste_confirmation_rect(m));
+            let inside_modal = modal_rect.is_some_and(|r| {
+                let xf = x as f32;
+                let yf = y as f32;
+                xf >= r.left
+                    && xf < r.left + r.width
+                    && yf >= r.top
+                    && yf < r.top + r.height
+            });
+            if inside_modal {
+                self.handle_paste_confirmation_press(x, y);
+                return false;
+            }
+            if !self.os_decorations {
+                if let Some(dir) = self.window_edge_at(x, y) {
+                    if let Some(state) = self.state.as_ref() {
+                        let _ = state.window.drag_resize_window(dir);
+                    }
+                    return false;
+                }
+            }
+            if let Some(which) = self.window_control_at(x, y) {
+                return self.click_window_control(which);
+            }
+            if let Some(rect) = self.header_rect() {
+                let yf = y as f32;
+                if yf >= rect.top && yf < rect.top + rect.height {
+                    let on_chrome = self.tab_at(x, y).is_some()
+                        || self.hamburger_at(x, y)
+                        || self.new_tab_button_at(x, y);
+                    if !on_chrome && !self.os_decorations {
+                        if let Some(state) = self.state.as_ref() {
+                            let _ = state.window.drag_window();
+                        }
+                    }
+                }
+            }
             return false;
         }
         // Suggestion popup: a click inside the popup picks the row
