@@ -21,6 +21,7 @@ use rterm_render::palette::Palette;
 use rterm_render::{EventSink, Pane, PaneSpawner, SharedTerminal, TerminalIo, UserBinding};
 
 mod icon;
+mod update_check;
 
 struct PtyAdapter(PtyControl);
 
@@ -684,6 +685,58 @@ fn main() -> Result<()> {
     // without spawning a PTY. Cheap CLI parsing — no clap dep.
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
+            "--check-update" => {
+                // One-shot version probe against the GitHub releases
+                // API. Prints either `up to date: rterm <ver>` or
+                // `newer release: <tag> (<url>)` and exits. Useful
+                // from scripts and as a quick sanity test that the
+                // network path works.
+                let json = std::env::args().any(|a| a == "--json");
+                match update_check::check_latest() {
+                    Ok(Some(info)) => {
+                        if json {
+                            let obj = serde_json::json!({
+                                "status": "outdated",
+                                "current": env!("CARGO_PKG_VERSION"),
+                                "latest": info.latest_tag,
+                                "url": info.html_url,
+                            });
+                            println!("{obj}");
+                        } else {
+                            println!(
+                                "newer release: {} (current {}); see {}",
+                                info.latest_tag,
+                                env!("CARGO_PKG_VERSION"),
+                                info.html_url,
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        if json {
+                            let obj = serde_json::json!({
+                                "status": "up_to_date",
+                                "current": env!("CARGO_PKG_VERSION"),
+                            });
+                            println!("{obj}");
+                        } else {
+                            println!("up to date: rterm {}", env!("CARGO_PKG_VERSION"));
+                        }
+                    }
+                    Err(e) => {
+                        if json {
+                            let obj = serde_json::json!({
+                                "status": "error",
+                                "error": e.to_string(),
+                            });
+                            println!("{obj}");
+                        } else {
+                            eprintln!("update check failed: {e}");
+                        }
+                        std::process::exit(1);
+                    }
+                }
+                return Ok(());
+            }
             "--version" | "-V" => {
                 if std::env::args().any(|a| a == "--json") {
                     // `{"rterm":"<v>","target_os":"linux","target_arch":"x86_64","profile":"debug"}`
@@ -747,6 +800,12 @@ fn main() -> Result<()> {
                                        bash)\"`. Supported: bash, zsh, fish,\n  \
                                        powershell.\n  \
                        --check         Validate config and exit (non-zero on parse error)\n  \
+                       --check-update [--json]  Hit the GitHub releases API and report\n  \
+                                       whether a newer rterm version is available.\n  \
+                                       Exits 0 (up-to-date or update found) or 1 on\n  \
+                                       network failure. The GUI runs the same probe in\n  \
+                                       the background on startup; set\n  \
+                                       `RTERM_NO_UPDATE_CHECK=1` to disable.\n  \
                        --font-size <pt>  Override font size for this run\n  \
                        --font-family <s> Override font family for this run\n  \
                        --version [--json]  Print version and exit; --json emits\n  \
@@ -1592,6 +1651,15 @@ fn run_gui(
     render_test_only: bool,
     config_path: Option<PathBuf>,
 ) -> Result<()> {
+    // Fire-and-forget update probe against the GitHub releases API.
+    // Runs on a detached thread so it never blocks startup; the
+    // result is logged via tracing if a newer release exists, and
+    // silenced otherwise. Skipped when `RTERM_NO_UPDATE_CHECK` is
+    // set so corporate / offline environments stay quiet.
+    if std::env::var_os("RTERM_NO_UPDATE_CHECK").is_none() {
+        update_check::check_in_background();
+    }
+
     // Theme order: 1) built-in by name from `[appearance] theme = "..."`,
     // 2) explicit `[colors]` overrides on top. This lets a user pick a
     // ready-made theme and still tweak individual cells.

@@ -33,7 +33,7 @@ tokio = { workspace = true }
 # Update-check feature talks to the GitHub releases REST API. Pulled
 # in here so the runtime binary depends on it; ureq is sync, blocking,
 # and tiny — fine for a one-shot HTTP GET on a background thread.
-ureq = { version = "2", default-features = false, features = ["tls"] }
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 
 # Build-time PNG decode + downscale to 256×256 RGBA for the window
 # icon. The pre-decoded bytes are include_bytes!'d at runtime so
