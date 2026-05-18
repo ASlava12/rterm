@@ -11,6 +11,7 @@ mod clipboard;
 use clipboard::clipboard_set;
 mod command_capture;
 mod global_hotkey;
+mod suggestion_popup;
 mod keybind;
 mod layout;
 mod window_ops;
@@ -2575,6 +2576,38 @@ pub enum UserEvent {
     GuakeGlobalHotkey,
 }
 
+/// Popup tuning carried inside [`RunConfig`]. Mirrors
+/// `rterm_config::HistoryConfig` but lives here so the renderer
+/// doesn't depend on the config crate. Equivalent to passing the
+/// individual fields directly; collapsed into a struct so future
+/// knobs land without touching every RunConfig caller.
+#[derive(Debug, Clone, Copy)]
+pub struct HistoryPopupConfig {
+    /// `false` disables capture AND popup. The renderer keeps the
+    /// store handle alive (so existing entries stay queryable via
+    /// the CLI) but never queries or injects.
+    pub enabled: bool,
+    /// Visible row count of the popup. Suggestions beyond this scroll.
+    pub popup_rows: u8,
+    /// Milliseconds the user must pause typing before the popup
+    /// queries history. Short enough to feel responsive, long enough
+    /// to avoid flicker per keystroke.
+    pub popup_debounce_ms: u32,
+    /// Minimum prefix length before the popup arms.
+    pub min_prefix_len: u8,
+}
+
+impl Default for HistoryPopupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            popup_rows: 5,
+            popup_debounce_ms: 150,
+            min_prefix_len: 1,
+        }
+    }
+}
+
 /// Guake-style drop-down snapshot. Mirrors `rterm_config::GuakeConfig`
 /// but lives in the render crate so the renderer doesn't depend on the
 /// config crate.
@@ -2664,6 +2697,14 @@ pub struct RunConfig {
     pub allow_osc52: bool,
     /// Guake-style drop-down configuration. `None` disables the action.
     pub guake: Option<GuakeRunConfig>,
+    /// Shared command-history store. `None` disables the popup +
+    /// capture entirely. When `Some`, the App holds an Arc clone
+    /// to query suggestions and `Pane`s clone it again for capture.
+    pub history: Option<Arc<Mutex<rterm_history::History>>>,
+    /// Popup tuning — debounce / row count / minimum prefix length.
+    /// Carried as a struct (rather than three individual fields) so
+    /// future knobs land without touching every RunConfig caller.
+    pub history_popup: HistoryPopupConfig,
 }
 
 pub struct App {
@@ -2833,6 +2874,24 @@ pub struct App {
     /// the worker thread before the EventLoopProxy is dropped.
     #[allow(dead_code)] // held purely for its Drop side effect
     global_hotkey: Option<global_hotkey::GlobalHotkeyHandle>,
+    /// Shared command-history store. Cloned per pane (in
+    /// `Pane::command_capture`) and queried here from the popup
+    /// refresh path. `None` disables the feature.
+    history: Option<Arc<Mutex<rterm_history::History>>>,
+    /// Popup tuning: row count, debounce, prefix gate.
+    history_popup_cfg: HistoryPopupConfig,
+    /// `Some` when the suggestion popup is on screen. Owns the
+    /// suggestion list, current selection, scroll offset, and the
+    /// last-seen capture generation for debounce comparisons.
+    suggestion_popup: Option<suggestion_popup::SuggestionPopup>,
+    /// `Instant` of the most recent input change in the focused
+    /// pane. Set every time `CommandCapture::generation` increases;
+    /// the popup arms `popup_debounce_ms` after this stamp.
+    last_input_change_at: Option<Instant>,
+    /// Capture generation snapshot at the previous frame's check.
+    /// Detects "did the user type since last redraw?" without
+    /// having to compare prefix strings.
+    last_capture_generation: u64,
     /// Set after the FIRST `RedrawRequested` has issued a clear-only frame
     /// to kick the Wayland compositor's `configure` → `Resized` chain.
     /// Until then we render `render_clear_only` rather than the full
@@ -2934,6 +2993,8 @@ impl App {
             os_decorations,
             allow_osc52,
             guake,
+            history,
+            history_popup,
         } = cfg;
         // Clamp here so a hand-written config with a negative/zero/huge
         // value can't crash glyphon (Metrics expects positive sizes) or
@@ -3022,6 +3083,11 @@ impl App {
             guake,
             guake_dropped: false,
             global_hotkey: None,
+            history,
+            history_popup_cfg: history_popup,
+            suggestion_popup: None,
+            last_input_change_at: None,
+            last_capture_generation: 0,
             first_frame_done: false,
             render_test_only,
             last_frame_tick: None,
@@ -7061,6 +7127,119 @@ impl App {
     /// previous word, Ctrl+U clears, Backspace pops one grapheme. The
     /// "pristine" flag mimics browser select-all-on-focus: the first
     /// printable character replaces the prefilled title in one shot.
+    /// Process a keystroke while the suggestion popup is visible.
+    /// Returns `true` when the key was consumed (don't forward to
+    /// the PTY). Returns `false` when the popup decided to let the
+    /// key through — for `Enter` (submit) the caller handles the
+    /// keystroke normally and the popup closes; for `TAB` with no
+    /// selection the popup closes and the TAB forwards to the
+    /// shell for normal completion.
+    fn handle_suggestion_popup_key(&mut self, event: &KeyEvent) -> bool {
+        let visible_rows = self.history_popup_cfg.popup_rows.max(1) as usize;
+        let Some(popup) = self.suggestion_popup.as_mut() else { return false };
+        match &event.logical_key {
+            Key::Named(NamedKey::ArrowDown) => {
+                popup.nav_down(visible_rows);
+                true
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                popup.nav_up(visible_rows);
+                true
+            }
+            Key::Named(NamedKey::Escape) => {
+                self.suggestion_popup = None;
+                true
+            }
+            Key::Named(NamedKey::Tab) => {
+                if popup.has_selection() {
+                    let text = popup.take_selected();
+                    self.suggestion_popup = None;
+                    if let Some(text) = text {
+                        // ^U clears the line in bash/zsh/fish and
+                        // PowerShell+psreadline (BackwardDeleteLine);
+                        // then we type the suggestion in literally.
+                        // Both bytes go through send_input so our own
+                        // capture buffer ends up holding the
+                        // suggestion text for the next Enter.
+                        if let Some(pane) = self.focused_pane() {
+                            pane.send_input(b"\x15");
+                            pane.send_input(text.as_bytes());
+                        }
+                    }
+                    true
+                } else {
+                    // No selection → close and let the shell's
+                    // own TAB-completion handle the keystroke.
+                    self.suggestion_popup = None;
+                    false
+                }
+            }
+            Key::Named(NamedKey::Enter) => {
+                // User is submitting — close the popup but let
+                // Enter through to the PTY (the regular submit
+                // path will record the command via the capture).
+                self.suggestion_popup = None;
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Per-frame refresh: query the history store when input has
+    /// settled, install / dismiss the popup. Called from the redraw
+    /// branch. The cost is one `Instant::now()` + one mutex lock on
+    /// the focused pane's capture buffer when nothing changed, and
+    /// a `SELECT … LIMIT N` against the SQLite store when the
+    /// debounce window has elapsed.
+    fn refresh_suggestion_popup(&mut self) {
+        if !self.history_popup_cfg.enabled {
+            // Master kill switch — never arm. Existing popup gets
+            // closed if the user flipped the toggle hot.
+            self.suggestion_popup = None;
+            return;
+        }
+        let Some(history) = self.history.clone() else {
+            self.suggestion_popup = None;
+            return;
+        };
+        let Some(pane) = self.focused_pane() else {
+            self.suggestion_popup = None;
+            return;
+        };
+        let pane_uid = pane.uid;
+        let current_input = pane.command_capture.current_input();
+        let generation = pane.command_capture.generation();
+        // Detect "did the user type something new?" by watching
+        // the generation counter; bumps mean we should re-arm the
+        // debouncer.
+        let now = Instant::now();
+        if generation != self.last_capture_generation {
+            self.last_capture_generation = generation;
+            self.last_input_change_at = Some(now);
+        }
+        let last_input_at = self.last_input_change_at;
+        let existing_ref = self.suggestion_popup.as_ref();
+        let transition = suggestion_popup::compute(
+            &self.history_popup_cfg,
+            &history,
+            existing_ref,
+            pane_uid,
+            generation,
+            &current_input,
+            last_input_at,
+            now,
+        );
+        match transition {
+            suggestion_popup::StateTransition::Open(popup) => {
+                self.suggestion_popup = Some(popup);
+            }
+            suggestion_popup::StateTransition::Close => {
+                self.suggestion_popup = None;
+            }
+            suggestion_popup::StateTransition::Keep => {}
+        }
+    }
+
     fn handle_rename_key(&mut self, event: &KeyEvent) -> bool {
         if event.state != ElementState::Pressed {
             return false;
@@ -7823,6 +8002,14 @@ impl App {
     /// Top-level keyboard entry. Returns `true` if the window should exit.
     fn handle_key(&mut self, event: &KeyEvent) -> bool {
         if event.state != ElementState::Pressed {
+            return false;
+        }
+        // Suggestion popup gets first dibs on ↓ / ↑ / TAB / Esc /
+        // Enter so a popup-driven nav doesn't accidentally also
+        // walk the cursor in the shell. Returns `true` when the
+        // popup handled the key (no further forwarding); falls
+        // through otherwise.
+        if self.suggestion_popup.is_some() && self.handle_suggestion_popup_key(event) {
             return false;
         }
         // Rename tab overlay owns the keyboard while editing.
@@ -9308,6 +9495,12 @@ impl ApplicationHandler<UserEvent> for App {
                         );
                     });
                 }
+                // Re-arm / refresh / dismiss the suggestion popup
+                // every frame. Cheap when nothing has changed
+                // (compare-against-generation in the popup-state
+                // compute), at most one SQLite query when the
+                // debounce window elapses.
+                self.refresh_suggestion_popup();
                 // Wayland/wgpu egg-and-chicken: the compositor only sends
                 // its `configure` after the client commits a buffer, and
                 // the client doesn't know its actual surface size until

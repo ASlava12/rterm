@@ -1585,6 +1585,13 @@ fn run_gui(
             width_pct: config.guake.width_pct,
             global_hotkey: config.guake.global_hotkey.clone(),
         }),
+        history: history.clone(),
+        history_popup: rterm_render::HistoryPopupConfig {
+            enabled: config.history.enabled,
+            popup_rows: config.history.popup_rows,
+            popup_debounce_ms: config.history.popup_debounce_ms,
+            min_prefix_len: config.history.min_prefix_len,
+        },
     })
 }
 
