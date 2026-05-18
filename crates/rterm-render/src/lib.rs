@@ -7401,7 +7401,32 @@ impl App {
         // adds before each line.
         const LINE_INDENT_CELLS: f32 = 2.0;
         let raw_col_cells = ((xf - rect.left) / cell_w - LINE_INDENT_CELLS).max(0.0);
-        let target_col = raw_col_cells.round() as usize;
+        // `floor` (cast to usize via `as`) rather than `round` —
+        // clicking on the visible glyph of column N should land
+        // the cursor BEFORE that char, matching how every text
+        // editor does mouse-positioning. `round` made the cursor
+        // land AFTER the clicked char on the right half, which
+        // read as a "click missed by one cell" bug.
+        let mut target_col = raw_col_cells as usize;
+        // The renderer paints the cursor as a real `▏` glyph that
+        // occupies one full cell on its line. Everything AFTER
+        // the cursor on that line is shifted right by one cell
+        // visually. Our `line_text` (no cursor mark) doesn't have
+        // that shift, so a click past the cursor maps to one
+        // column too far without compensation. Subtract one cell
+        // back to recover the actual char index in the source
+        // line.
+        if absolute_line == cursor_line {
+            let cursor_col_chars = modal_ref.text[..cursor_byte]
+                .rsplit('\n')
+                .next()
+                .unwrap_or("")
+                .chars()
+                .count();
+            if target_col > cursor_col_chars {
+                target_col = target_col.saturating_sub(1);
+            }
+        }
         // Walk the target line's chars to find the byte offset at
         // `target_col`. Clamps to end-of-line if the click was past
         // the visible text. UTF-8 safe by construction.
