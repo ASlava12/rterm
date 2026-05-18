@@ -293,24 +293,21 @@ impl App {
                 }
                 storage.push("\n".to_string());
                 spans.push((storage.len() - 1, fg, false));
-                // Button row. Selected button gets [▸ label ◂]
-                // brackets + accent colour; others get plain
-                // brackets. Hot-key letters are underscored in
-                // their labels via parens convention.
-                let render_button = |b: PasteButton| -> String {
-                    let (open, close) = if b == *selected { ("[▸ ", " ◂]") } else { ("[ ", " ]") };
-                    let label = match b {
-                        PasteButton::Paste => "(P)aste",
-                        PasteButton::Edit => "(E)dit",
-                        PasteButton::Cancel => "(C)ancel",
-                    };
-                    format!("{open}{label}{close}")
-                };
+                // Button row — fixed-width labels so the mouse
+                // hit-test math (in `paste_button_hit_test`) stays
+                // a pure column-arithmetic computation rather than
+                // a font-metric query. Selected button gets accent
+                // colour; the brackets stay the same width either
+                // way so the rest of the row doesn't shift.
+                //
+                // `crate::paste_confirm::BUTTON_LABEL_CELLS` /
+                // `BUTTON_GAP_CELLS` document the constants the
+                // hit-test re-reads.
                 let row = format!(
                     "  {}  {}  {}\n",
-                    render_button(PasteButton::Paste),
-                    render_button(PasteButton::Edit),
-                    render_button(PasteButton::Cancel),
+                    crate::paste_confirm::render_button_label(PasteButton::Paste, *selected),
+                    crate::paste_confirm::render_button_label(PasteButton::Edit, *selected),
+                    crate::paste_confirm::render_button_label(PasteButton::Cancel, *selected),
                 );
                 storage.push(row);
                 spans.push((storage.len() - 1, accent, true));

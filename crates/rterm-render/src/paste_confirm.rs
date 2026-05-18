@@ -62,6 +62,45 @@ pub(crate) enum PasteButton {
     Cancel,
 }
 
+/// Width (in monospaced cells) of one rendered button bracket pair
+/// including label. Re-read by the hit-test in `App` so the layout
+/// stays in lock-step with the renderer.
+pub(crate) const BUTTON_LABEL_CELLS: usize = 10;
+/// Gap (in cells) between adjacent buttons.
+pub(crate) const BUTTON_GAP_CELLS: usize = 2;
+/// Leading indent (in cells) before the first button on the row.
+pub(crate) const BUTTON_LEADING_CELLS: usize = 2;
+
+/// Render one button's fixed-width text bracket. Format:
+/// `[ Paste  ]` (10 cells) — always the same width regardless of
+/// selection so the row layout stays stable and the hit-test math
+/// in `App::paste_button_hit_test` doesn't have to look at glyph
+/// widths.
+pub(crate) fn render_button_label(b: PasteButton, selected: PasteButton) -> String {
+    let label = match b {
+        PasteButton::Paste => "Paste",
+        PasteButton::Edit => "Edit",
+        PasteButton::Cancel => "Cancel",
+    };
+    // Inner width = BUTTON_LABEL_CELLS - 2 brackets = 8 cells.
+    // Selected button gets `[> Paste <]` markers; others get a
+    // plain `[ Paste  ]`. Both render to exactly 10 cells.
+    if b == selected {
+        // Two chars eaten by `> ` / ` <`, 8 - 4 = 4 chars of
+        // label area. Truncate the longest label (`Cancel`, 6
+        // chars) to 4? That'd hurt readability. So instead drop
+        // the inner padding and use `[>Paste<]` / `[>Cancel<]`
+        // — still 10 cells if we hard-pad.
+        let padded = format!(">{label:<width$}<", width = BUTTON_LABEL_CELLS - 4);
+        // Final form: `[>Cancel<]` — 10 cells exactly because
+        // BUTTON_LABEL_CELLS - 4 = 6 chars between markers.
+        format!("[{padded}]")
+    } else {
+        let padded = format!(" {label:<width$} ", width = BUTTON_LABEL_CELLS - 4);
+        format!("[{padded}]")
+    }
+}
+
 impl PasteButton {
     #[allow(dead_code)] // exposed for future test scaffolding
     pub(crate) fn label(self) -> &'static str {
@@ -273,6 +312,39 @@ impl PasteConfirmation {
         let new_col = col.min(prev_line_len);
         let raw = prev_line_start + new_col;
         *cursor = floor_char_boundary(&self.text, raw);
+    }
+
+    /// Move cursor up `n` lines. Used by PageUp (n = viewport-1).
+    pub(crate) fn edit_up_n(&mut self, n: usize) {
+        for _ in 0..n {
+            let before = match self.mode {
+                PasteMode::Edit { cursor } => cursor,
+                _ => return,
+            };
+            self.edit_up();
+            // Stop when we hit the top — `edit_up` becomes a no-op
+            // on line 0, but loops would still spin. Early-exit on
+            // a fixed-point.
+            match self.mode {
+                PasteMode::Edit { cursor } if cursor == before && before == 0 => return,
+                _ => {}
+            }
+        }
+    }
+
+    /// Move cursor down `n` lines. Used by PageDown.
+    pub(crate) fn edit_down_n(&mut self, n: usize) {
+        for _ in 0..n {
+            let before = match self.mode {
+                PasteMode::Edit { cursor } => cursor,
+                _ => return,
+            };
+            self.edit_down();
+            match self.mode {
+                PasteMode::Edit { cursor } if cursor == before => return,
+                _ => {}
+            }
+        }
     }
 
     /// Move cursor down one line. Mirror of `edit_up`.

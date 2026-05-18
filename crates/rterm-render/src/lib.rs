@@ -6067,6 +6067,15 @@ impl App {
             self.close_palette();
             return false;
         }
+        // Paste-confirmation modal owns the click while it's up.
+        // Click on a button activates it (Paste / Edit / Cancel);
+        // click anywhere else inside the modal is absorbed; click
+        // outside is also absorbed (the modal is blocking — we
+        // don't want a stray click to focus a pane underneath).
+        if self.paste_confirmation.is_some() {
+            self.handle_paste_confirmation_press(x, y);
+            return false;
+        }
         // Suggestion popup: a click inside the popup picks the row
         // under the cursor + injects it (same effect as TAB after
         // ↓ nav). A click OUTSIDE the popup closes it but lets the
@@ -7195,6 +7204,11 @@ impl App {
     /// * `Esc` → cancel outright (drops the edited buffer).
     fn handle_paste_confirmation_key(&mut self, event: &KeyEvent) {
         use paste_confirm::{PasteButton, PasteMode};
+        // Compute the viewport up front: the PageUp / PageDown
+        // arms need it for `edit_up_n` / `edit_down_n`, and calling
+        // `paste_modal_visible_rows(&self)` from inside the
+        // `&mut modal` scope below would trigger E0502.
+        let viewport = self.paste_modal_visible_rows().saturating_sub(1).max(1);
         let Some(modal) = self.paste_confirmation.as_mut() else { return };
         let ctrl = self.modifiers.contains(ModifiersState::CONTROL);
         let shift = self.modifiers.contains(ModifiersState::SHIFT);
@@ -7242,12 +7256,93 @@ impl App {
                 Key::Named(NamedKey::ArrowDown) => modal.edit_down(),
                 Key::Named(NamedKey::Home) => modal.edit_home(),
                 Key::Named(NamedKey::End) => modal.edit_end(),
+                Key::Named(NamedKey::PageUp) => modal.edit_up_n(viewport),
+                Key::Named(NamedKey::PageDown) => modal.edit_down_n(viewport),
                 Key::Named(NamedKey::Tab) => modal.edit_insert('\t'),
                 Key::Named(NamedKey::Space) => modal.edit_insert(' '),
                 Key::Character(c) => modal.edit_insert_str(c.as_str()),
                 _ => {}
             },
         }
+    }
+
+    /// Mouse-click on the paste-confirmation modal. In Confirm
+    /// mode, find which button the click landed on and activate
+    /// it; clicks outside any button (but inside the modal) are
+    /// just absorbed. In Edit mode, all clicks are absorbed —
+    /// `Ctrl+Enter` / `Esc` are the only ways to leave the editor,
+    /// matching how modal text-areas usually work.
+    fn handle_paste_confirmation_press(&mut self, x: f64, y: f64) {
+        use paste_confirm::PasteMode;
+        let Some(modal) = self.paste_confirmation.clone() else { return };
+        let PasteMode::Confirm { selected: _ } = modal.mode else {
+            // Edit mode — absorb the click, no further action.
+            return;
+        };
+        let Some(rect) = self.paste_confirmation_rect(&modal) else { return };
+        let Some(state) = self.state.as_ref() else { return };
+        let cell_w = state.text.cell_width();
+        let line_h = state.text.line_height();
+        if cell_w <= 0.0 || line_h <= 0.0 {
+            return;
+        }
+        // Re-derive the button-row Y from the same layout the
+        // renderer used: header (1) + blank (1) + preview rows +
+        // optional "+N more" line + blank (1) = button row index.
+        let preview_total = modal.line_count();
+        let preview_rendered = preview_total.min(12);
+        let more_line = usize::from(preview_total > 12);
+        let button_row_index = 1 + 1 + preview_rendered + more_line + 1;
+        let row_y = rect.top + button_row_index as f32 * line_h;
+        let yf = y as f32;
+        if yf < row_y || yf >= row_y + line_h {
+            return; // Click missed the button row.
+        }
+        // Column math: leading 2 cells of indent, then per-button
+        // BUTTON_LABEL_CELLS wide blocks separated by BUTTON_GAP
+        // cells. Walk left → right and report the first hit.
+        let xf = x as f32;
+        let mut col = paste_confirm::BUTTON_LEADING_CELLS as f32;
+        for btn in [
+            paste_confirm::PasteButton::Paste,
+            paste_confirm::PasteButton::Edit,
+            paste_confirm::PasteButton::Cancel,
+        ] {
+            let left = rect.left + col * cell_w;
+            let right = left + paste_confirm::BUTTON_LABEL_CELLS as f32 * cell_w;
+            if xf >= left && xf < right {
+                self.activate_paste_button(btn);
+                return;
+            }
+            col += paste_confirm::BUTTON_LABEL_CELLS as f32
+                + paste_confirm::BUTTON_GAP_CELLS as f32;
+        }
+        // Click landed in the modal but on no button — absorbed.
+    }
+
+    /// Number of visible buffer rows in the paste-modal's edit
+    /// viewport. Mirrors the math in
+    /// `paste_confirmation_spans`'s Edit branch so PageUp / PageDown
+    /// move by exactly one viewport-minus-one regardless of the
+    /// current rect height. Fallback (cell metrics not ready
+    /// yet) of 10 rows is conservative enough to feel responsive
+    /// without overshooting.
+    fn paste_modal_visible_rows(&self) -> usize {
+        let Some(modal) = self.paste_confirmation.as_ref() else { return 10 };
+        let line_h = self
+            .state
+            .as_ref()
+            .map(|s| s.text.line_height())
+            .filter(|h| *h > 0.0)
+            .unwrap_or(20.0);
+        let rect_h = self
+            .paste_confirmation_rect(modal)
+            .map(|r| r.height)
+            .unwrap_or(400.0);
+        let total_rows = (rect_h / line_h) as usize;
+        // Same reservation as the renderer: 2 header rows + 1
+        // bottom-padding row.
+        total_rows.saturating_sub(3).max(1)
     }
 
     /// Apply the user's button choice in the confirm modal.
