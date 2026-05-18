@@ -138,8 +138,25 @@ impl PasteButton {
 
 impl PasteConfirmation {
     pub(crate) fn new_confirm(text: String, pane_uid: u64) -> Self {
+        // Normalize CR / CRLF → LF before storing. Windows
+        // clipboards routinely deliver `\r\n` line endings;
+        // cosmic-text treats `\r` as its own line break, which
+        // renders every `\r\n` as TWO visual rows (the `\r`
+        // produces an empty row, then `\n` advances). Result:
+        // a clipboard payload of N lines paints 2N visual rows
+        // with empty gaps between content, AND the click/scroll
+        // math (which counts logical newlines) falls out of sync
+        // with the visual layout, so clicks land far from where
+        // the user aimed. Normalizing here is safe: the actual
+        // PTY commit (`commit_paste_now`) does its own line-end
+        // mapping back to `\r` / `\n` per bracketed-paste mode.
+        let normalized = if text.contains('\r') {
+            text.replace("\r\n", "\n").replace('\r', "\n")
+        } else {
+            text
+        };
         Self {
-            text,
+            text: normalized,
             pane_uid,
             mode: PasteMode::Confirm {
                 selected: PasteButton::Paste,
@@ -507,6 +524,19 @@ mod tests {
         assert_eq!(pc("one").line_count(), 1);
         assert_eq!(pc("one\ntwo").line_count(), 2);
         assert_eq!(pc("one\ntwo\n").line_count(), 3, "trailing \\n counts");
+    }
+
+    #[test]
+    fn crlf_is_normalised_to_lf() {
+        // cosmic-text treats `\r` as its own break, so a raw `\r\n`
+        // payload would render every line twice (once for `\r`, once
+        // for `\n`) and skew click hit-tests by N rows on line N.
+        let p = pc("one\r\ntwo\r\nthree");
+        assert_eq!(p.line_count(), 3);
+        assert!(!p.text.contains('\r'));
+        // Bare CR (old Mac) collapses too.
+        let p = pc("a\rb\rc");
+        assert_eq!(p.line_count(), 3);
     }
 
     #[test]

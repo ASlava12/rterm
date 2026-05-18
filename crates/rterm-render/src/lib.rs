@@ -7479,28 +7479,6 @@ impl App {
             byte_to_line_start += l.len() + 1; // +1 for the '\n'
         }
         let new_cursor = byte_to_line_start + byte_in_line;
-        tracing::info!(
-            click_x = xf,
-            click_y = yf,
-            rect_left = rect.left,
-            rect_top = rect.top,
-            rect_w = rect.width,
-            rect_h = rect.height,
-            cell_w,
-            line_h,
-            row_in_modal,
-            viewport_row,
-            visible_rows,
-            lines_total = lines.len(),
-            cursor_byte_before = cursor_byte,
-            cursor_line_before = cursor_line,
-            scroll,
-            absolute_line,
-            target_col,
-            byte_in_line,
-            new_cursor,
-            "paste-modal click",
-        );
         if let Some(m) = self.paste_confirmation.as_mut() {
             if let paste_confirm::PasteMode::Edit { cursor, .. } = &mut m.mode {
                 *cursor = new_cursor.min(m.text.len());
