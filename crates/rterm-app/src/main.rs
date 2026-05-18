@@ -119,6 +119,102 @@ fn cache_dir() -> Option<std::path::PathBuf> {
     Some(base.join("rterm"))
 }
 
+/// Resolve the path of the persistent command-history SQLite store.
+/// Returns `None` when no cache dir is available (e.g. a sandboxed
+/// run with neither `XDG_CACHE_HOME` nor `HOME` exported). Shared by
+/// the GUI bootstrap and the `--history` CLI so both see the same
+/// file.
+fn history_db_path() -> Option<std::path::PathBuf> {
+    cache_dir().map(|d| d.join("history.sqlite3"))
+}
+
+/// Dispatch table for `rterm --history <subcommand>`. Parses the
+/// first positional after `--history` and runs it. Unknown / missing
+/// subcommand → usage hint + exit 0 (matches `rterm --help` style:
+/// info-only commands never fail).
+fn run_history_subcommand<I: IntoIterator<Item = String>>(args: I) -> Result<()> {
+    let mut iter = args.into_iter();
+    let sub = iter.next().unwrap_or_default();
+    let Some(path) = history_db_path() else {
+        eprintln!("--history: no cache directory available on this platform");
+        return Ok(());
+    };
+    let h = match rterm_history::History::open(&path) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("--history: cannot open {}: {e:#}", path.display());
+            return Ok(());
+        }
+    };
+    match sub.as_str() {
+        "list" => {
+            // Optional `[prefix]` after `list` filters by prefix;
+            // optional `--limit N` clamps output (default 50, to
+            // keep one screen on a typical terminal).
+            let mut limit: usize = 50;
+            let mut prefix = String::new();
+            while let Some(a) = iter.next() {
+                if a == "--limit" {
+                    if let Some(n) = iter.next().and_then(|s| s.parse::<usize>().ok()) {
+                        limit = n;
+                    }
+                } else if let Some(s) = a.strip_prefix("--limit=") {
+                    if let Ok(n) = s.parse::<usize>() {
+                        limit = n;
+                    }
+                } else if prefix.is_empty() {
+                    prefix = a;
+                }
+            }
+            let rows = h.suggest(&prefix, limit).context("--history list")?;
+            if rows.is_empty() {
+                if prefix.is_empty() {
+                    eprintln!("--history: empty (capture is on but no commands have been submitted yet)");
+                } else {
+                    eprintln!("--history: no entries match prefix {prefix:?}");
+                }
+                return Ok(());
+            }
+            // Header row uses padded literals directly so clippy's
+            // `print_literal` lint doesn't fire — it's right that
+            // `println!("{}", "command")` is silly, even if the
+            // padding made it readable in source.
+            println!("count  last_used   command");
+            for s in rows {
+                println!("{:>5}  {:>10}  {}", s.count, s.last_used, s.text);
+            }
+        }
+        "count" => {
+            println!("{}", h.len()?);
+        }
+        "clear" => {
+            h.clear()?;
+            eprintln!("--history: cleared");
+        }
+        "forget" => {
+            let Some(target) = iter.next() else {
+                eprintln!("--history forget <text>: missing argument");
+                return Ok(());
+            };
+            if h.forget(&target)? {
+                eprintln!("--history: forgot {target:?}");
+            } else {
+                eprintln!("--history: no entry for {target:?}");
+            }
+        }
+        _ => {
+            eprintln!(
+                "Usage: rterm --history <subcommand>\n  \
+                 list [prefix] [--limit N]   most-frequent commands matching prefix\n  \
+                 count                       number of unique commands recorded\n  \
+                 forget <text>               drop one entry\n  \
+                 clear                       drop every entry",
+            );
+        }
+    }
+    Ok(())
+}
+
 struct PluginBridge(Arc<Mutex<PluginHost>>);
 
 impl EventSink for PluginBridge {
@@ -509,6 +605,10 @@ fn main() -> Result<()> {
                                        priority); `--lang` overrides that for the dump\n  \
                                        only. Currently supported: en (default), ru.\n  \
                        --print-paths [--json]  Print resolved config / plugins / cache paths and exit\n  \
+                       --history <subcmd>  Inspect / manage the command-history\n  \
+                                       SQLite store. Subcommands: list [prefix]\n  \
+                                       [--limit N] | count | forget <text> | clear.\n  \
+                                       The store lives at <cache>/history.sqlite3.\n  \
                        --check         Validate config and exit (non-zero on parse error)\n  \
                        --font-size <pt>  Override font size for this run\n  \
                        --font-family <s> Override font family for this run\n  \
@@ -921,6 +1021,7 @@ fn main() -> Result<()> {
                 let plugins = resolved_dir.as_ref().map(|d| d.join("plugins"));
                 let cache = cache_dir();
                 let session = cache.as_ref().map(|d| d.join("session.toml"));
+                let history = history_db_path();
                 // `--json` switches to single-line JSON so shell
                 // scripts / jq pipelines don't have to parse the
                 // labelled lines. Bare flag is the default text form.
@@ -935,6 +1036,7 @@ fn main() -> Result<()> {
                         "plugins": to_str(plugins.as_deref()),
                         "cache": to_str(cache.as_deref()),
                         "session": to_str(session.as_deref()),
+                        "history": to_str(history.as_deref()),
                     });
                     println!("{obj}");
                 } else {
@@ -949,8 +1051,19 @@ fn main() -> Result<()> {
                     show("plugins:", plugins.as_deref());
                     show("cache:", cache.as_deref());
                     show("session:", session.as_deref());
+                    show("history:", history.as_deref());
                 }
                 return Ok(());
+            }
+            "--history" => {
+                // Subcommand router for the rterm-history store
+                // (`list` / `count` / `clear` / `forget <text>`).
+                // Sister to `--list-actions` / `--list-events`: opens
+                // the DB at the same path the GUI uses, runs one
+                // operation, prints, exits. Designed so users can
+                // verify the capture is working end-to-end without
+                // having to bring up the popup UI.
+                return run_history_subcommand(std::env::args().skip(2));
             }
             "--print-default-config" => {
                 // Emit the bundled `default.toml` template verbatim
@@ -1385,8 +1498,7 @@ fn run_gui(
     // Open the persistent command-history database. Failures are
     // non-fatal — disable the feature and warn, so a corrupted /
     // unreadable file can't keep rterm from launching at all.
-    let history = cache_dir()
-        .map(|d| d.join("history.sqlite3"))
+    let history = history_db_path()
         .and_then(|path| match rterm_history::History::open(&path) {
             Ok(h) => Some(Arc::new(Mutex::new(h))),
             Err(e) => {
