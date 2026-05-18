@@ -2771,6 +2771,11 @@ pub struct App {
     cursor_pos: PhysicalPosition<f64>,
     selection: Option<ActiveSelection>,
     mouse_dragging: bool,
+    /// True while the left mouse button is held inside the paste-
+    /// confirmation modal's Edit area. Each CursorMoved event re-
+    /// projects the cursor position and extends the selection from
+    /// the anchor planted on press. Cleared on `handle_release`.
+    paste_modal_dragging: bool,
     last_click: Option<(Instant, SelectionPoint, usize)>,
     /// Timestamp of the most recent click on header-bar empty space (not
     /// on a tab). A second click within `MAX_DBL_CLICK_MS` opens a new
@@ -3092,6 +3097,7 @@ impl App {
             cursor_pos: PhysicalPosition::new(0.0, 0.0),
             selection: None,
             mouse_dragging: false,
+            paste_modal_dragging: false,
             last_click: None,
             last_header_empty_click: None,
             mouse_pty_pane: None,
@@ -6690,6 +6696,7 @@ impl App {
             return;
         }
         self.mouse_dragging = false;
+        self.paste_modal_dragging = false;
         if let Some(sel) = self.selection {
             if sel.is_empty() {
                 self.selection = None;
@@ -7295,34 +7302,106 @@ impl App {
                 },
                 _ => {}
             },
-            PasteMode::Edit { .. } => match &event.logical_key {
-                Key::Named(NamedKey::Enter) if ctrl => {
-                    // Ctrl+Enter applies the edited buffer.
-                    let text = modal.text.clone();
-                    self.paste_confirmation = None;
-                    self.commit_paste_now(&text);
+            PasteMode::Edit { .. } => {
+                // Shift+nav extends the selection; bare nav clears
+                // it. Decide BEFORE the move so the anchor is in
+                // place when `edit_*` updates the cursor.
+                let is_nav = matches!(
+                    &event.logical_key,
+                    Key::Named(
+                        NamedKey::ArrowLeft
+                            | NamedKey::ArrowRight
+                            | NamedKey::ArrowUp
+                            | NamedKey::ArrowDown
+                            | NamedKey::Home
+                            | NamedKey::End
+                            | NamedKey::PageUp
+                            | NamedKey::PageDown,
+                    ),
+                );
+                if is_nav {
+                    if shift {
+                        modal.start_extending();
+                    } else {
+                        modal.clear_selection();
+                    }
                 }
-                Key::Named(NamedKey::Enter) => {
-                    modal.edit_insert('\n');
+                match &event.logical_key {
+                    Key::Named(NamedKey::Enter) if ctrl => {
+                        // Ctrl+Enter applies the edited buffer.
+                        let text = modal.text.clone();
+                        self.paste_confirmation = None;
+                        self.commit_paste_now(&text);
+                    }
+                    Key::Named(NamedKey::Enter) => {
+                        modal.edit_insert('\n');
+                    }
+                    Key::Named(NamedKey::Escape) => {
+                        self.paste_confirmation = None;
+                    }
+                    Key::Named(NamedKey::Backspace) => modal.edit_backspace(),
+                    Key::Named(NamedKey::Delete) => modal.edit_delete(),
+                    Key::Named(NamedKey::ArrowLeft) => modal.edit_left(),
+                    Key::Named(NamedKey::ArrowRight) => modal.edit_right(),
+                    Key::Named(NamedKey::ArrowUp) => modal.edit_up(),
+                    Key::Named(NamedKey::ArrowDown) => modal.edit_down(),
+                    Key::Named(NamedKey::Home) => modal.edit_home(),
+                    Key::Named(NamedKey::End) => modal.edit_end(),
+                    Key::Named(NamedKey::PageUp) => modal.edit_up_n(viewport),
+                    Key::Named(NamedKey::PageDown) => modal.edit_down_n(viewport),
+                    Key::Named(NamedKey::Tab) => modal.edit_insert('\t'),
+                    Key::Named(NamedKey::Space) => modal.edit_insert(' '),
+                    // Ctrl shortcuts come before the generic
+                    // Character arm so they don't fall through to
+                    // `edit_insert_str("v")`. Both Ctrl+X and
+                    // Ctrl+Shift+X are accepted — Linux terminals
+                    // historically used the Shift form to avoid
+                    // collision with shell signals, but the modal
+                    // is past the shell so either feels natural.
+                    Key::Character(c) if ctrl && c.eq_ignore_ascii_case("a") => {
+                        modal.select_all();
+                    }
+                    Key::Character(c) if ctrl && c.eq_ignore_ascii_case("c") => {
+                        if let Some(sel) = modal.selected_text() {
+                            let s = sel.to_string();
+                            if let Ok(mut cb) = arboard::Clipboard::new() {
+                                let _ = cb.set_text(s);
+                            }
+                        }
+                    }
+                    Key::Character(c) if ctrl && c.eq_ignore_ascii_case("x") => {
+                        if let Some(sel) = modal.selected_text() {
+                            let s = sel.to_string();
+                            if let Ok(mut cb) = arboard::Clipboard::new() {
+                                let _ = cb.set_text(s);
+                            }
+                            modal.delete_selection();
+                        }
+                    }
+                    Key::Character(c) if ctrl && c.eq_ignore_ascii_case("v") => {
+                        // Skip the multi-line safety prompt — we're
+                        // already inside it. Just splice the
+                        // clipboard text in at the cursor (replacing
+                        // the active selection if any).
+                        if let Ok(mut cb) = arboard::Clipboard::new() {
+                            if let Ok(text) = cb.get_text() {
+                                // Mirror `new_confirm`'s CRLF
+                                // collapse so a Windows clipboard
+                                // payload doesn't render as
+                                // double-spaced.
+                                let normalized = if text.contains('\r') {
+                                    text.replace("\r\n", "\n").replace('\r', "\n")
+                                } else {
+                                    text
+                                };
+                                modal.edit_insert_str(&normalized);
+                            }
+                        }
+                    }
+                    Key::Character(c) => modal.edit_insert_str(c.as_str()),
+                    _ => {}
                 }
-                Key::Named(NamedKey::Escape) => {
-                    self.paste_confirmation = None;
-                }
-                Key::Named(NamedKey::Backspace) => modal.edit_backspace(),
-                Key::Named(NamedKey::Delete) => modal.edit_delete(),
-                Key::Named(NamedKey::ArrowLeft) => modal.edit_left(),
-                Key::Named(NamedKey::ArrowRight) => modal.edit_right(),
-                Key::Named(NamedKey::ArrowUp) => modal.edit_up(),
-                Key::Named(NamedKey::ArrowDown) => modal.edit_down(),
-                Key::Named(NamedKey::Home) => modal.edit_home(),
-                Key::Named(NamedKey::End) => modal.edit_end(),
-                Key::Named(NamedKey::PageUp) => modal.edit_up_n(viewport),
-                Key::Named(NamedKey::PageDown) => modal.edit_down_n(viewport),
-                Key::Named(NamedKey::Tab) => modal.edit_insert('\t'),
-                Key::Named(NamedKey::Space) => modal.edit_insert(' '),
-                Key::Character(c) => modal.edit_insert_str(c.as_str()),
-                _ => {}
-            },
+            }
         }
         // Any cursor-moving key (arrows, typing, PgUp/PgDn, ...)
         // may have moved the caret out of the visible viewport;
@@ -7400,24 +7479,20 @@ impl App {
         }
     }
 
-    /// Click-to-position in the Edit mini-editor. Pixel coords →
-    /// (visible_row, cell_col) → absolute (line, char column) →
-    /// byte offset in the buffer, then `cursor` jumps there.
-    fn paste_modal_press_edit(&mut self, x: f64, y: f64) {
-        // Snapshot what we need from the renderer state and the
-        // modal layout. After this, the actual cursor update
-        // takes `&mut self` via `paste_confirmation.as_mut()`.
-        let Some(state) = self.state.as_ref() else { return };
+    /// Project a pixel `(x, y)` inside the paste modal's Edit area
+    /// onto a byte offset in the buffer. Returns `None` when the
+    /// click landed on the modal header / footer / outside the rect.
+    /// Shared by the click-down handler (which seeds the selection
+    /// anchor) and the drag handler (which extends from the anchor).
+    fn paste_modal_hit_test(&self, x: f64, y: f64) -> Option<usize> {
+        let state = self.state.as_ref()?;
         let cell_w = state.text.cell_width();
         let line_h = state.text.line_height();
         if cell_w <= 0.0 || line_h <= 0.0 {
-            return;
+            return None;
         }
-        let modal_ref = match self.paste_confirmation.as_ref() {
-            Some(m) => m.clone(),
-            None => return,
-        };
-        let Some(rect) = self.paste_confirmation_rect(&modal_ref) else { return };
+        let modal_ref = self.paste_confirmation.as_ref()?;
+        let rect = self.paste_confirmation_rect(modal_ref)?;
         let yf = y as f32;
         let xf = x as f32;
         if xf < rect.left
@@ -7425,36 +7500,22 @@ impl App {
             || yf < rect.top
             || yf >= rect.top + rect.height
         {
-            return;
+            return None;
         }
-        // Header eats 2 rows (matches the renderer's
-        // `HEADER_ROWS`). Lines below that are buffer rows.
         const HEADER_ROWS: usize = 2;
         let row_in_modal = ((yf - rect.top) / line_h) as usize;
         if row_in_modal < HEADER_ROWS {
-            // Click landed on the header — absorbed, no nav.
-            return;
+            return None;
         }
         let viewport_row = row_in_modal - HEADER_ROWS;
         let visible_rows = self.paste_modal_visible_rows();
         if viewport_row >= visible_rows {
-            // Below the viewport (footer hint, padding) — absorbed.
-            return;
+            return None;
         }
-        // `paste_modal_visible_rows` mirrors the renderer's row
-        // computation; the scroll is centered on cursor_line.
         let lines: Vec<&str> = modal_ref.text.split('\n').collect();
-        // Read the SAME `scroll_line` the renderer used last frame.
-        // Persisted in `PasteMode::Edit` so the visible viewport
-        // is stable across frames — a click on a visible row maps
-        // to exactly the absolute line drawn there, without the
-        // re-centring drift that the old "scroll = cursor - half"
-        // formula produced (which made every click jump the
-        // viewport so the cursor landed mid-viewport instead of
-        // where the user clicked).
         let cursor_byte = match modal_ref.mode {
             paste_confirm::PasteMode::Edit { cursor, .. } => cursor,
-            _ => return,
+            _ => return None,
         };
         let cursor_line = modal_ref.text[..cursor_byte.min(modal_ref.text.len())]
             .bytes()
@@ -7463,35 +7524,14 @@ impl App {
         let scroll = modal_ref.scroll_line();
         let absolute_line = scroll + viewport_row;
         if absolute_line >= lines.len() {
-            // Click below the last buffer line (e.g. in the
-            // bottom padding row) — clamp to the end of the
-            // buffer.
-            if let Some(m) = self.paste_confirmation.as_mut() {
-                if let paste_confirm::PasteMode::Edit { cursor, .. } = &mut m.mode {
-                    *cursor = m.text.len();
-                }
-            }
-            return;
+            return Some(modal_ref.text.len());
         }
-        // Column: subtract the 2-cell leading indent the renderer
-        // adds before each line.
         const LINE_INDENT_CELLS: f32 = 2.0;
         let raw_col_cells = ((xf - rect.left) / cell_w - LINE_INDENT_CELLS).max(0.0);
-        // `floor` (cast to usize via `as`) rather than `round` —
-        // clicking on the visible glyph of column N should land
-        // the cursor BEFORE that char, matching how every text
-        // editor does mouse-positioning. `round` made the cursor
-        // land AFTER the clicked char on the right half, which
-        // read as a "click missed by one cell" bug.
         let mut target_col = raw_col_cells as usize;
-        // The renderer paints the cursor as a real `▏` glyph that
-        // occupies one full cell on its line. Everything AFTER
-        // the cursor on that line is shifted right by one cell
-        // visually. Our `line_text` (no cursor mark) doesn't have
-        // that shift, so a click past the cursor maps to one
-        // column too far without compensation. Subtract one cell
-        // back to recover the actual char index in the source
-        // line.
+        // Cursor mark `▏` occupies a full cell on its line; clicks
+        // past the caret pick up one extra column visually. Pull it
+        // back so the projected byte matches the source text.
         if absolute_line == cursor_line {
             let cursor_col_chars = modal_ref.text[..cursor_byte]
                 .rsplit('\n')
@@ -7503,9 +7543,6 @@ impl App {
                 target_col = target_col.saturating_sub(1);
             }
         }
-        // Walk the target line's chars to find the byte offset at
-        // `target_col`. Clamps to end-of-line if the click was past
-        // the visible text. UTF-8 safe by construction.
         let line_text = lines[absolute_line];
         let mut byte_in_line = line_text.len();
         for (i, (offset, _)) in line_text.char_indices().enumerate() {
@@ -7514,25 +7551,54 @@ impl App {
                 break;
             }
         }
-        // Translate (absolute_line, byte_in_line) → buffer byte
-        // offset by re-walking the buffer up to that line. Could
-        // be cached but `split('\n')` already linear-scans the
-        // buffer and the buffer is by construction bounded by the
-        // clipboard payload size.
         let mut byte_to_line_start = 0usize;
         for (i, l) in lines.iter().enumerate() {
             if i == absolute_line {
                 break;
             }
-            byte_to_line_start += l.len() + 1; // +1 for the '\n'
+            byte_to_line_start += l.len() + 1;
         }
-        let new_cursor = byte_to_line_start + byte_in_line;
+        Some(byte_to_line_start + byte_in_line)
+    }
+
+    /// Click-to-position in the Edit mini-editor. Pixel coords →
+    /// (visible_row, cell_col) → absolute (line, char column) →
+    /// byte offset in the buffer, then `cursor` jumps there.
+    /// Also plants the selection anchor at the new cursor position
+    /// and arms the drag flag so a subsequent mouse-move extends
+    /// the selection from this point.
+    fn paste_modal_press_edit(&mut self, x: f64, y: f64) {
+        let Some(new_cursor) = self.paste_modal_hit_test(x, y) else { return };
         if let Some(m) = self.paste_confirmation.as_mut() {
+            let pos = new_cursor.min(m.text.len());
+            if let paste_confirm::PasteMode::Edit { cursor, selection_anchor, .. } = &mut m.mode {
+                *cursor = pos;
+                // Anchor at the click position so a subsequent
+                // drag extends from here. A release without any
+                // drag leaves anchor == cursor → no selection.
+                *selection_anchor = Some(pos);
+            }
+        }
+        self.paste_modal_dragging = true;
+        self.clamp_paste_modal_scroll();
+    }
+
+    /// Mouse-move while LMB is held inside the modal Edit area.
+    /// Moves the cursor to the new pixel position; the anchor that
+    /// `paste_modal_press_edit` planted stays put, so the selection
+    /// range grows / shrinks as the user drags.
+    fn paste_modal_drag_edit(&mut self, x: f64, y: f64) {
+        let Some(new_cursor) = self.paste_modal_hit_test(x, y) else { return };
+        if let Some(m) = self.paste_confirmation.as_mut() {
+            let pos = new_cursor.min(m.text.len());
             if let paste_confirm::PasteMode::Edit { cursor, .. } = &mut m.mode {
-                *cursor = new_cursor.min(m.text.len());
+                *cursor = pos;
             }
         }
         self.clamp_paste_modal_scroll();
+        if let Some(state) = self.state.as_ref() {
+            state.window.request_redraw();
+        }
     }
 
     /// Mouse-wheel handling for the paste-confirmation modal. In
@@ -7609,6 +7675,84 @@ impl App {
         // Same reservation as the renderer: 2 header rows + 1
         // bottom-padding row.
         total_rows.saturating_sub(3).max(1)
+    }
+
+    /// Rectangles for the active text selection inside the paste-
+    /// modal Edit area. One quad per visible line that intersects
+    /// the selection range. Sits behind the overlay text so the
+    /// selected glyphs render on top with their normal colour.
+    /// Returns an empty vec when there's no modal / no selection
+    /// or when the modal isn't in Edit mode.
+    fn paste_modal_selection_quads(&self) -> Vec<bg::BgQuad> {
+        let modal = match self.paste_confirmation.as_ref() {
+            Some(m) => m,
+            None => return Vec::new(),
+        };
+        let (sel_lo, sel_hi) = match modal.selection_range() {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
+        let Some(state) = self.state.as_ref() else { return Vec::new() };
+        let cell_w = state.text.cell_width();
+        let line_h = state.text.line_height();
+        if cell_w <= 0.0 || line_h <= 0.0 {
+            return Vec::new();
+        }
+        let Some(rect) = self.paste_confirmation_rect(modal) else { return Vec::new() };
+        const HEADER_ROWS: usize = 2;
+        const LINE_INDENT_CELLS: f32 = 2.0;
+        let visible_rows = self.paste_modal_visible_rows();
+        let scroll = modal.scroll_line();
+        let text = modal.text.as_str();
+        let lines: Vec<&str> = text.split('\n').collect();
+        // Pre-compute byte offset of each line's start so we can
+        // map (sel_lo, sel_hi) onto per-line column spans cheaply.
+        let mut line_starts: Vec<usize> = Vec::with_capacity(lines.len() + 1);
+        let mut off = 0usize;
+        for l in &lines {
+            line_starts.push(off);
+            off += l.len() + 1; // +1 = '\n'
+        }
+        line_starts.push(off); // sentinel past end
+        let end_visible = (scroll + visible_rows).min(lines.len());
+        let mut quads: Vec<bg::BgQuad> = Vec::new();
+        let accent = palette::default_fg().map(|c| c.saturating_sub(40));
+        for i in scroll..end_visible {
+            let line_start = line_starts[i];
+            let line_end_excl = line_starts[i + 1].saturating_sub(1); // exclude the trailing '\n'
+            // Range of the selection that falls within this line.
+            let lo = sel_lo.max(line_start);
+            let hi = sel_hi.min(line_end_excl);
+            if hi < lo {
+                continue;
+            }
+            // Selection that ends exactly at end-of-line (i.e.
+            // includes the trailing newline) gets a 1-cell wide
+            // trailing highlight so the user sees the newline was
+            // selected too — matches VS Code / most editors.
+            let trailing_newline = sel_hi > line_end_excl;
+            if hi == lo && !trailing_newline {
+                continue;
+            }
+            let pre_chars = text[line_start..lo].chars().count();
+            let in_chars = text[lo..hi].chars().count();
+            let left = rect.left + (LINE_INDENT_CELLS + pre_chars as f32) * cell_w;
+            let mut width = in_chars as f32 * cell_w;
+            if trailing_newline {
+                width += cell_w;
+            }
+            if width <= 0.0 {
+                continue;
+            }
+            let row_top = rect.top + (HEADER_ROWS + (i - scroll)) as f32 * line_h;
+            quads.push(bg::BgQuad::from_srgb(
+                [left, row_top],
+                [width, line_h],
+                accent,
+                0.35,
+            ));
+        }
+        quads
     }
 
     /// Apply the user's button choice in the confirm modal.
@@ -10026,6 +10170,9 @@ impl ApplicationHandler<UserEvent> for App {
                 {
                     self.handle_drag(position.x, position.y);
                 }
+                if self.paste_modal_dragging {
+                    self.paste_modal_drag_edit(position.x, position.y);
+                }
                 if self.context_menu.is_some() {
                     self.update_context_menu_hover(position.x, position.y);
                 }
@@ -11899,6 +12046,10 @@ impl ApplicationHandler<UserEvent> for App {
                 // so the after-panes assembly inside the state borrow
                 // can just move-extend them.
                 let resize_marker_quads = self.resize_marker_quads();
+                // Paste-modal selection highlight: computed here in
+                // `&self` context so it can be moved into the
+                // mut-borrowed render block below without conflict.
+                let paste_modal_selection_quads = self.paste_modal_selection_quads();
                 // Cell width for header right-clip computation —
                 // captured here so it's available inside the
                 // `self.state.as_mut()` block below without re-
@@ -12122,6 +12273,12 @@ impl ApplicationHandler<UserEvent> for App {
                             0.85,
                         ));
                     }
+                    // Selection highlight inside the paste-modal
+                    // Edit area. Sits on top of the panel body and
+                    // below the overlay text so the selected glyphs
+                    // render with their normal foreground on the
+                    // highlight rectangle.
+                    after_panes_quads.extend(paste_modal_selection_quads);
                     let flash = self
                         .flash_until
                         .map(|t| t > Instant::now())

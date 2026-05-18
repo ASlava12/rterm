@@ -60,6 +60,14 @@ pub(crate) enum PasteMode {
         /// by arrow / PageUp/Down / wheel navigation, and clamped
         /// every frame via [`PasteConfirmation::ensure_cursor_visible`].
         scroll_line: usize,
+        /// Byte offset where the active selection began, or `None`
+        /// when nothing is selected. The selected range is
+        /// `[min(anchor, cursor), max(anchor, cursor))`. Maintained
+        /// through Shift+arrow extends, click-drag selects, and
+        /// Ctrl+A select-all. Cleared by non-extending cursor moves
+        /// and by typing / Backspace / Delete (which delete the
+        /// range first).
+        selection_anchor: Option<usize>,
     },
 }
 
@@ -170,6 +178,7 @@ impl PasteConfirmation {
         self.mode = PasteMode::Edit {
             cursor: self.text.len(),
             scroll_line: 0,
+            selection_anchor: None,
         };
     }
 
@@ -189,7 +198,7 @@ impl PasteConfirmation {
     /// the cursor is already in view, `scroll_line` is unchanged.
     pub(crate) fn ensure_cursor_visible(&mut self, visible_rows: usize) {
         let (cursor, scroll_line) = match &mut self.mode {
-            PasteMode::Edit { cursor, scroll_line } => (cursor, scroll_line),
+            PasteMode::Edit { cursor, scroll_line, .. } => (cursor, scroll_line),
             _ => return,
         };
         let visible = visible_rows.max(1);
@@ -264,8 +273,11 @@ impl PasteConfirmation {
     }
 
     /// Insert a single character at the cursor in edit mode. Bumps
-    /// the cursor by the char's byte length (UTF-8 safe).
+    /// the cursor by the char's byte length (UTF-8 safe). When a
+    /// selection is active, deletes it first (insertion replaces
+    /// the selected range — standard editor behaviour).
     pub(crate) fn edit_insert(&mut self, ch: char) {
+        self.delete_selection();
         let cursor = match &mut self.mode {
             PasteMode::Edit { cursor, .. } => cursor,
             _ => return,
@@ -281,7 +293,9 @@ impl PasteConfirmation {
 
     /// Insert a string (e.g. bracketed paste of another payload —
     /// rare but possible). Same UTF-8-safe rules as `edit_insert`.
+    /// Replaces any active selection.
     pub(crate) fn edit_insert_str(&mut self, s: &str) {
+        self.delete_selection();
         let cursor = match &mut self.mode {
             PasteMode::Edit { cursor, .. } => cursor,
             _ => return,
@@ -291,8 +305,12 @@ impl PasteConfirmation {
         *cursor = pos + s.len();
     }
 
-    /// Backspace: delete the char before the cursor.
+    /// Backspace: delete the char before the cursor — or the active
+    /// selection if one exists.
     pub(crate) fn edit_backspace(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let cursor = match &mut self.mode {
             PasteMode::Edit { cursor, .. } => cursor,
             _ => return,
@@ -305,8 +323,12 @@ impl PasteConfirmation {
         *cursor = start;
     }
 
-    /// Forward Delete: drop the char AT the cursor.
+    /// Forward Delete: drop the char AT the cursor, or the active
+    /// selection if one exists.
     pub(crate) fn edit_delete(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let cursor = match &mut self.mode {
             PasteMode::Edit { cursor, .. } => cursor,
             _ => return,
@@ -317,6 +339,75 @@ impl PasteConfirmation {
         // The next char boundary AFTER cursor.
         let end = ceil_char_boundary(&self.text, *cursor + 1);
         self.text.replace_range(*cursor..end, "");
+    }
+
+    /// Current selection as `[start, end)` byte offsets, sorted, or
+    /// `None` when no selection / anchor coincides with cursor.
+    pub(crate) fn selection_range(&self) -> Option<(usize, usize)> {
+        let (cursor, anchor) = match self.mode {
+            PasteMode::Edit { cursor, selection_anchor: Some(a), .. } => (cursor, a),
+            _ => return None,
+        };
+        if cursor == anchor {
+            return None;
+        }
+        let (lo, hi) = if cursor < anchor { (cursor, anchor) } else { (anchor, cursor) };
+        Some((lo.min(self.text.len()), hi.min(self.text.len())))
+    }
+
+    /// Slice of the buffer currently under selection. `None` when
+    /// no active selection. Used by Ctrl+C to populate the clipboard.
+    pub(crate) fn selected_text(&self) -> Option<&str> {
+        let (s, e) = self.selection_range()?;
+        Some(&self.text[s..e])
+    }
+
+    /// Forget the selection without touching the cursor. Called when
+    /// the user makes a non-extending cursor move (plain arrow,
+    /// Home/End, click) or when the selected text has just been
+    /// replaced.
+    pub(crate) fn clear_selection(&mut self) {
+        if let PasteMode::Edit { selection_anchor, .. } = &mut self.mode {
+            *selection_anchor = None;
+        }
+    }
+
+    /// Anchor the selection at the current cursor if there isn't one
+    /// already. Called before any Shift+nav key so the subsequent
+    /// cursor move extends the highlight from the anchor.
+    pub(crate) fn start_extending(&mut self) {
+        if let PasteMode::Edit { cursor, selection_anchor, .. } = &mut self.mode {
+            if selection_anchor.is_none() {
+                *selection_anchor = Some(*cursor);
+            }
+        }
+    }
+
+    /// Ctrl+A — select the entire buffer.
+    pub(crate) fn select_all(&mut self) {
+        let len = self.text.len();
+        if let PasteMode::Edit { cursor, selection_anchor, .. } = &mut self.mode {
+            *selection_anchor = Some(0);
+            *cursor = len;
+        }
+    }
+
+    /// Remove the selected range from the buffer. Cursor lands at
+    /// the start of the deleted range; the anchor clears. Returns
+    /// `true` when something was deleted, `false` when there was
+    /// no active selection (caller should fall through to its
+    /// normal single-char behaviour).
+    pub(crate) fn delete_selection(&mut self) -> bool {
+        let (s, e) = match self.selection_range() {
+            Some(r) => r,
+            None => return false,
+        };
+        self.text.replace_range(s..e, "");
+        if let PasteMode::Edit { cursor, selection_anchor, .. } = &mut self.mode {
+            *cursor = s;
+            *selection_anchor = None;
+        }
+        true
     }
 
     /// Move the cursor left one UTF-8 char.
@@ -537,6 +628,66 @@ mod tests {
         // Bare CR (old Mac) collapses too.
         let p = pc("a\rb\rc");
         assert_eq!(p.line_count(), 3);
+    }
+
+    #[test]
+    fn select_all_anchors_zero_and_cursor_at_end() {
+        let mut p = pc("one\ntwo");
+        p.enter_edit_mode();
+        p.select_all();
+        let (lo, hi) = p.selection_range().expect("range");
+        assert_eq!((lo, hi), (0, p.text.len()));
+        assert_eq!(p.selected_text(), Some("one\ntwo"));
+    }
+
+    #[test]
+    fn typing_replaces_selection() {
+        let mut p = pc("hello world");
+        p.enter_edit_mode();
+        // Select "world".
+        if let PasteMode::Edit {
+            cursor, selection_anchor, ..
+        } = &mut p.mode {
+            *selection_anchor = Some(6);
+            *cursor = 11;
+        }
+        p.edit_insert_str("rust");
+        assert_eq!(p.text, "hello rust");
+        // Selection cleared after the insert.
+        assert!(p.selection_range().is_none());
+    }
+
+    #[test]
+    fn backspace_with_selection_deletes_range_not_single_char() {
+        let mut p = pc("abcdef");
+        p.enter_edit_mode();
+        if let PasteMode::Edit {
+            cursor, selection_anchor, ..
+        } = &mut p.mode {
+            *selection_anchor = Some(2);
+            *cursor = 5;
+        }
+        p.edit_backspace();
+        assert_eq!(p.text, "abf");
+        assert!(p.selection_range().is_none());
+    }
+
+    #[test]
+    fn shift_extend_then_clear_resets_anchor() {
+        let mut p = pc("abc");
+        p.enter_edit_mode();
+        // Move to start, then extend with shift+right twice.
+        if let PasteMode::Edit { cursor, .. } = &mut p.mode {
+            *cursor = 0;
+        }
+        p.start_extending();
+        p.edit_right();
+        p.edit_right();
+        assert_eq!(p.selection_range(), Some((0, 2)));
+        // Plain right clears the selection.
+        p.clear_selection();
+        p.edit_right();
+        assert!(p.selection_range().is_none());
     }
 
     #[test]
