@@ -52,6 +52,14 @@ pub(crate) enum PasteMode {
         /// UTF-8 char boundary (the editor enforces this on every
         /// mutation).
         cursor: usize,
+        /// Top of the visible viewport, as a buffer line index.
+        /// Persisted between frames so a click on a visible line
+        /// doesn't trigger a re-centring scroll that visually
+        /// drops the cursor in the middle of a fresh viewport
+        /// instead of where the user clicked. Updated explicitly
+        /// by arrow / PageUp/Down / wheel navigation, and clamped
+        /// every frame via [`PasteConfirmation::ensure_cursor_visible`].
+        scroll_line: usize,
     },
 }
 
@@ -144,7 +152,73 @@ impl PasteConfirmation {
     pub(crate) fn enter_edit_mode(&mut self) {
         self.mode = PasteMode::Edit {
             cursor: self.text.len(),
+            scroll_line: 0,
         };
+    }
+
+    /// Read the current scroll_line (top of viewport) in edit mode.
+    /// `0` for non-edit modes.
+    pub(crate) fn scroll_line(&self) -> usize {
+        match self.mode {
+            PasteMode::Edit { scroll_line, .. } => scroll_line,
+            _ => 0,
+        }
+    }
+
+    /// Clamp `scroll_line` so the cursor stays inside the visible
+    /// `[scroll_line, scroll_line + visible_rows)` window. Called
+    /// every frame by the renderer (in `&mut self` context, before
+    /// cloning) AND on every cursor-moving edit. Idempotent — if
+    /// the cursor is already in view, `scroll_line` is unchanged.
+    pub(crate) fn ensure_cursor_visible(&mut self, visible_rows: usize) {
+        let (cursor, scroll_line) = match &mut self.mode {
+            PasteMode::Edit { cursor, scroll_line } => (cursor, scroll_line),
+            _ => return,
+        };
+        let visible = visible_rows.max(1);
+        let total_lines = if self.text.is_empty() {
+            1
+        } else {
+            self.text.matches('\n').count() + 1
+        };
+        let cursor_line = self.text[..(*cursor).min(self.text.len())]
+            .bytes()
+            .filter(|b| *b == b'\n')
+            .count();
+        // If cursor is above the viewport top → snap viewport to it.
+        if cursor_line < *scroll_line {
+            *scroll_line = cursor_line;
+        }
+        // If cursor is at or below the viewport bottom → snap up.
+        let bottom = scroll_line.saturating_add(visible);
+        if cursor_line >= bottom {
+            *scroll_line = cursor_line + 1 - visible;
+        }
+        // Clamp against the buffer's end so we don't scroll past
+        // the last line.
+        let max_scroll = total_lines.saturating_sub(visible);
+        if *scroll_line > max_scroll {
+            *scroll_line = max_scroll;
+        }
+    }
+
+    /// Move the viewport (independently of cursor) by `delta` lines.
+    /// Positive = scroll DOWN (later lines). Negative = scroll UP.
+    /// Used by the mouse wheel handler.
+    pub(crate) fn scroll_by(&mut self, delta: i64, visible_rows: usize) {
+        let scroll_line = match &mut self.mode {
+            PasteMode::Edit { scroll_line, .. } => scroll_line,
+            _ => return,
+        };
+        let total_lines = if self.text.is_empty() {
+            1
+        } else {
+            self.text.matches('\n').count() + 1
+        };
+        let max_scroll = total_lines.saturating_sub(visible_rows.max(1));
+        let cur = *scroll_line as i64;
+        let next = (cur + delta).clamp(0, max_scroll as i64);
+        *scroll_line = next as usize;
     }
 
     /// Lines for the modal preview. Used by the renderer to draw
@@ -176,7 +250,7 @@ impl PasteConfirmation {
     /// the cursor by the char's byte length (UTF-8 safe).
     pub(crate) fn edit_insert(&mut self, ch: char) {
         let cursor = match &mut self.mode {
-            PasteMode::Edit { cursor } => cursor,
+            PasteMode::Edit { cursor, .. } => cursor,
             _ => return,
         };
         let pos = (*cursor).min(self.text.len());
@@ -192,7 +266,7 @@ impl PasteConfirmation {
     /// rare but possible). Same UTF-8-safe rules as `edit_insert`.
     pub(crate) fn edit_insert_str(&mut self, s: &str) {
         let cursor = match &mut self.mode {
-            PasteMode::Edit { cursor } => cursor,
+            PasteMode::Edit { cursor, .. } => cursor,
             _ => return,
         };
         let pos = floor_char_boundary(&self.text, (*cursor).min(self.text.len()));
@@ -203,7 +277,7 @@ impl PasteConfirmation {
     /// Backspace: delete the char before the cursor.
     pub(crate) fn edit_backspace(&mut self) {
         let cursor = match &mut self.mode {
-            PasteMode::Edit { cursor } => cursor,
+            PasteMode::Edit { cursor, .. } => cursor,
             _ => return,
         };
         if *cursor == 0 {
@@ -217,7 +291,7 @@ impl PasteConfirmation {
     /// Forward Delete: drop the char AT the cursor.
     pub(crate) fn edit_delete(&mut self) {
         let cursor = match &mut self.mode {
-            PasteMode::Edit { cursor } => cursor,
+            PasteMode::Edit { cursor, .. } => cursor,
             _ => return,
         };
         if *cursor >= self.text.len() {
@@ -231,7 +305,7 @@ impl PasteConfirmation {
     /// Move the cursor left one UTF-8 char.
     pub(crate) fn edit_left(&mut self) {
         let cursor = match &mut self.mode {
-            PasteMode::Edit { cursor } => cursor,
+            PasteMode::Edit { cursor, .. } => cursor,
             _ => return,
         };
         if *cursor == 0 {
@@ -243,7 +317,7 @@ impl PasteConfirmation {
     /// Move the cursor right one UTF-8 char.
     pub(crate) fn edit_right(&mut self) {
         let cursor = match &mut self.mode {
-            PasteMode::Edit { cursor } => cursor,
+            PasteMode::Edit { cursor, .. } => cursor,
             _ => return,
         };
         if *cursor >= self.text.len() {
@@ -255,7 +329,7 @@ impl PasteConfirmation {
     /// Move cursor to the start of the current line.
     pub(crate) fn edit_home(&mut self) {
         let cursor = match &mut self.mode {
-            PasteMode::Edit { cursor } => cursor,
+            PasteMode::Edit { cursor, .. } => cursor,
             _ => return,
         };
         let bytes = self.text.as_bytes();
@@ -269,7 +343,7 @@ impl PasteConfirmation {
     /// Move cursor to the end of the current line.
     pub(crate) fn edit_end(&mut self) {
         let cursor = match &mut self.mode {
-            PasteMode::Edit { cursor } => cursor,
+            PasteMode::Edit { cursor, .. } => cursor,
             _ => return,
         };
         let bytes = self.text.as_bytes();
@@ -287,7 +361,7 @@ impl PasteConfirmation {
     /// multi-byte char at the same position.
     pub(crate) fn edit_up(&mut self) {
         let cursor = match &mut self.mode {
-            PasteMode::Edit { cursor } => cursor,
+            PasteMode::Edit { cursor, .. } => cursor,
             _ => return,
         };
         let bytes = self.text.as_bytes();
@@ -318,7 +392,7 @@ impl PasteConfirmation {
     pub(crate) fn edit_up_n(&mut self, n: usize) {
         for _ in 0..n {
             let before = match self.mode {
-                PasteMode::Edit { cursor } => cursor,
+                PasteMode::Edit { cursor, .. } => cursor,
                 _ => return,
             };
             self.edit_up();
@@ -326,7 +400,7 @@ impl PasteConfirmation {
             // on line 0, but loops would still spin. Early-exit on
             // a fixed-point.
             match self.mode {
-                PasteMode::Edit { cursor } if cursor == before && before == 0 => return,
+                PasteMode::Edit { cursor, .. } if cursor == before && before == 0 => return,
                 _ => {}
             }
         }
@@ -336,12 +410,12 @@ impl PasteConfirmation {
     pub(crate) fn edit_down_n(&mut self, n: usize) {
         for _ in 0..n {
             let before = match self.mode {
-                PasteMode::Edit { cursor } => cursor,
+                PasteMode::Edit { cursor, .. } => cursor,
                 _ => return,
             };
             self.edit_down();
             match self.mode {
-                PasteMode::Edit { cursor } if cursor == before => return,
+                PasteMode::Edit { cursor, .. } if cursor == before => return,
                 _ => {}
             }
         }
@@ -350,7 +424,7 @@ impl PasteConfirmation {
     /// Move cursor down one line. Mirror of `edit_up`.
     pub(crate) fn edit_down(&mut self) {
         let cursor = match &mut self.mode {
-            PasteMode::Edit { cursor } => cursor,
+            PasteMode::Edit { cursor, .. } => cursor,
             _ => return,
         };
         let bytes = self.text.as_bytes();
@@ -481,7 +555,7 @@ mod tests {
         let mut p = pc("hello\nworld");
         p.enter_edit_mode();
         match p.mode {
-            PasteMode::Edit { cursor } => assert_eq!(cursor, p.text.len()),
+            PasteMode::Edit { cursor, .. } => assert_eq!(cursor, p.text.len()),
             _ => panic!("expected Edit mode"),
         }
     }
@@ -496,7 +570,7 @@ mod tests {
         p.edit_insert('X');
         assert_eq!(p.text, "Xab");
         match p.mode {
-            PasteMode::Edit { cursor } => assert_eq!(cursor, 1),
+            PasteMode::Edit { cursor, .. } => assert_eq!(cursor, 1),
             _ => panic!(),
         }
     }
@@ -508,7 +582,7 @@ mod tests {
         p.edit_backspace();
         assert_eq!(p.text, "ab");
         match p.mode {
-            PasteMode::Edit { cursor } => assert_eq!(cursor, 2),
+            PasteMode::Edit { cursor, .. } => assert_eq!(cursor, 2),
             _ => panic!(),
         }
     }
@@ -532,7 +606,7 @@ mod tests {
         // Walk up — should land on column 10 of line 2, etc.
         p.edit_up();
         match p.mode {
-            PasteMode::Edit { cursor } => {
+            PasteMode::Edit { cursor, .. } => {
                 // line 2 = "second line", len 11. col 10 of line 3
                 // exceeds line 2 length? No — both lines are 11
                 // chars, col 10 fits.
@@ -543,7 +617,7 @@ mod tests {
         }
         p.edit_up();
         match p.mode {
-            PasteMode::Edit { cursor } => {
+            PasteMode::Edit { cursor, .. } => {
                 // Line 1 starts at 0 — col 10.
                 assert_eq!(cursor, 10);
             }
@@ -557,12 +631,12 @@ mod tests {
         p.enter_edit_mode(); // cursor at end (15)
         p.edit_home();
         match p.mode {
-            PasteMode::Edit { cursor } => assert_eq!(cursor, 11, "start of 'gamma'"),
+            PasteMode::Edit { cursor, .. } => assert_eq!(cursor, 11, "start of 'gamma'"),
             _ => panic!(),
         }
         p.edit_end();
         match p.mode {
-            PasteMode::Edit { cursor } => assert_eq!(cursor, 16, "end of 'gamma'"),
+            PasteMode::Edit { cursor, .. } => assert_eq!(cursor, 16, "end of 'gamma'"),
             _ => panic!(),
         }
     }
@@ -575,7 +649,7 @@ mod tests {
         p.edit_insert_str("XYZ");
         assert_eq!(p.text, "aXYZb");
         match p.mode {
-            PasteMode::Edit { cursor } => assert_eq!(cursor, 4),
+            PasteMode::Edit { cursor, .. } => assert_eq!(cursor, 4),
             _ => panic!(),
         }
     }

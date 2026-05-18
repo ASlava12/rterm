@@ -317,7 +317,7 @@ impl App {
                     .push("  Tab / ← → cycle  ·  Enter activate  ·  Esc cancel\n".to_string());
                 spans.push((storage.len() - 1, muted, false));
             }
-            PasteMode::Edit { cursor } => {
+            PasteMode::Edit { cursor, .. } => {
                 storage.push("Edit paste — Ctrl+Enter apply, Esc cancel\n".to_string());
                 spans.push((storage.len() - 1, warn, true));
                 storage.push("\n".to_string());
@@ -374,13 +374,14 @@ impl App {
                 let visible_rows = total_rows
                     .saturating_sub(HEADER_ROWS + BOTTOM_PAD_ROWS)
                     .max(1);
-                // Centre the cursor in the viewport, but clamp so
-                // we never scroll past the document edges. Result:
-                // cursor stays comfortably visible while the user
-                // arrows up/down through the buffer.
-                let half = visible_rows / 2;
-                let max_scroll = lines.len().saturating_sub(visible_rows);
-                let scroll = cursor_line.saturating_sub(half).min(max_scroll);
+                // Use the persisted `scroll_line` — the App's
+                // pre-render hook (`clamp_paste_modal_scroll`)
+                // already adjusted it for this frame so the cursor
+                // is in view but otherwise the viewport is stable
+                // across frames. Click-to-position relies on this:
+                // the click handler reads the SAME scroll_line, so
+                // a click on a visible row maps to that exact line.
+                let scroll = modal.scroll_line().min(lines.len().saturating_sub(1));
                 let end = (scroll + visible_rows).min(lines.len());
                 for (i, line) in lines[scroll..end].iter().enumerate() {
                     let absolute_line = scroll + i;

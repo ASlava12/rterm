@@ -7396,27 +7396,30 @@ impl App {
         // `paste_modal_visible_rows` mirrors the renderer's row
         // computation; the scroll is centered on cursor_line.
         let lines: Vec<&str> = modal_ref.text.split('\n').collect();
-        // Reconstruct cursor_line + scroll using the same formula
-        // the renderer uses, so the click maps to exactly the
-        // line the user sees under their cursor.
+        // Read the SAME `scroll_line` the renderer used last frame.
+        // Persisted in `PasteMode::Edit` so the visible viewport
+        // is stable across frames — a click on a visible row maps
+        // to exactly the absolute line drawn there, without the
+        // re-centring drift that the old "scroll = cursor - half"
+        // formula produced (which made every click jump the
+        // viewport so the cursor landed mid-viewport instead of
+        // where the user clicked).
         let cursor_byte = match modal_ref.mode {
-            paste_confirm::PasteMode::Edit { cursor } => cursor,
+            paste_confirm::PasteMode::Edit { cursor, .. } => cursor,
             _ => return,
         };
         let cursor_line = modal_ref.text[..cursor_byte.min(modal_ref.text.len())]
             .bytes()
             .filter(|b| *b == b'\n')
             .count();
-        let half = visible_rows / 2;
-        let max_scroll = lines.len().saturating_sub(visible_rows);
-        let scroll = cursor_line.saturating_sub(half).min(max_scroll);
+        let scroll = modal_ref.scroll_line();
         let absolute_line = scroll + viewport_row;
         if absolute_line >= lines.len() {
             // Click below the last buffer line (e.g. in the
             // bottom padding row) — clamp to the end of the
             // buffer.
             if let Some(m) = self.paste_confirmation.as_mut() {
-                if let paste_confirm::PasteMode::Edit { cursor } = &mut m.mode {
+                if let paste_confirm::PasteMode::Edit { cursor, .. } = &mut m.mode {
                     *cursor = m.text.len();
                 }
             }
@@ -7499,7 +7502,7 @@ impl App {
             "paste-modal click",
         );
         if let Some(m) = self.paste_confirmation.as_mut() {
-            if let paste_confirm::PasteMode::Edit { cursor } = &mut m.mode {
+            if let paste_confirm::PasteMode::Edit { cursor, .. } = &mut m.mode {
                 *cursor = new_cursor.min(m.text.len());
             }
         }
@@ -7513,6 +7516,9 @@ impl App {
     /// keep a stray scroll from leaking through to the pane below.
     fn handle_paste_confirmation_wheel(&mut self, delta: MouseScrollDelta) {
         use paste_confirm::PasteMode;
+        // Take viewport rows in a pre-pass so we don't hold a
+        // mut borrow across the call.
+        let visible_rows = self.paste_modal_visible_rows();
         let Some(modal) = self.paste_confirmation.as_mut() else { return };
         let PasteMode::Edit { .. } = modal.mode else {
             return; // Confirm mode: absorb only.
@@ -7529,11 +7535,22 @@ impl App {
             return;
         }
         // Wheel up (positive delta in winit) → scroll buffer UP
-        // visually = move cursor toward the top.
-        if lines > 0 {
-            modal.edit_up_n(lines as usize);
-        } else {
-            modal.edit_down_n((-lines) as usize);
+        // visually = view EARLIER lines. We shift the viewport
+        // WITHOUT moving the cursor — matches every editor's
+        // wheel-scroll convention. Cursor stays where the user
+        // left it; the renderer's clamp will pull the viewport
+        // back when the user types again.
+        modal.scroll_by(-(lines as i64), visible_rows);
+    }
+
+    /// Pre-render hook: clamp the paste modal's scroll_line so
+    /// the cursor stays inside the viewport. Idempotent — when
+    /// the cursor is already in view, scroll_line is untouched.
+    /// Called once per frame from the redraw branch.
+    fn clamp_paste_modal_scroll(&mut self) {
+        let visible = self.paste_modal_visible_rows();
+        if let Some(modal) = self.paste_confirmation.as_mut() {
+            modal.ensure_cursor_visible(visible);
         }
     }
 
@@ -10065,6 +10082,12 @@ impl ApplicationHandler<UserEvent> for App {
                 // compute), at most one SQLite query when the
                 // debounce window elapses.
                 self.refresh_suggestion_popup();
+                // Clamp the paste modal's scroll so the cursor
+                // stays in view this frame. Runs in `&mut self`
+                // here, BEFORE the overlay-build path clones the
+                // modal — so the spans builder + the click hit-
+                // test both observe the same scroll value.
+                self.clamp_paste_modal_scroll();
                 // Wayland/wgpu egg-and-chicken: the compositor only sends
                 // its `configure` after the client commits a buffer, and
                 // the client doesn't know its actual surface size until
