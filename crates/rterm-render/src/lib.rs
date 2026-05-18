@@ -2750,6 +2750,22 @@ pub struct RunConfig {
     /// true`, pasted text containing a newline goes through a
     /// modal first (Paste / Edit / Cancel).
     pub paste_confirm: PasteConfirmConfig,
+    /// Optional window icon (taskbar / titlebar / Alt-Tab). Pre-
+    /// decoded RGBA8 so this crate doesn't need a PNG decoder.
+    /// `None` falls back to whatever the OS / WM uses by default.
+    pub icon: Option<AppIcon>,
+}
+
+/// Raw RGBA8 pixel buffer + dimensions for the window icon. The
+/// renderer turns this into a [`winit::window::Icon`] at window-
+/// creation time. Held separately from `RunConfig` so the
+/// build-time icon pipeline (in `rterm-app/build.rs`) can hand the
+/// bytes through without taking a dep on winit.
+#[derive(Clone)]
+pub struct AppIcon {
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
 }
 
 pub struct App {
@@ -2767,6 +2783,10 @@ pub struct App {
     active_tab: usize,
     spawner: Arc<dyn PaneSpawner>,
     events: Arc<dyn EventSink>,
+    /// Pre-decoded window icon bytes (set from `RunConfig::icon`).
+    /// Converted into `winit::window::Icon` and applied via
+    /// `WindowAttributes::with_window_icon` in `resumed`.
+    icon: Option<AppIcon>,
     modifiers: ModifiersState,
     cursor_pos: PhysicalPosition<f64>,
     selection: Option<ActiveSelection>,
@@ -3052,6 +3072,7 @@ impl App {
             history,
             history_popup,
             paste_confirm,
+            icon,
         } = cfg;
         // Clamp here so a hand-written config with a negative/zero/huge
         // value can't crash glyphon (Metrics expects positive sizes) or
@@ -3092,6 +3113,7 @@ impl App {
             active_tab: 0,
             spawner,
             events,
+            icon,
             user_bindings,
             modifiers: ModifiersState::empty(),
             cursor_pos: PhysicalPosition::new(0.0, 0.0),
@@ -9910,7 +9932,7 @@ impl ApplicationHandler<UserEvent> for App {
         if self.state.is_some() {
             return;
         }
-        let attrs = WindowAttributes::default()
+        let mut attrs = WindowAttributes::default()
             .with_title(&self.title)
             .with_inner_size(winit::dpi::LogicalSize::new(
                 self.initial_size.0 as f64,
@@ -9932,6 +9954,18 @@ impl ApplicationHandler<UserEvent> for App {
             // edge hit tests below. Falls back to OS decorations on
             // platforms that don't support borderless windows.
             .with_decorations(self.os_decorations);
+        if let Some(icon) = self.icon.as_ref() {
+            // `Icon::from_rgba` validates `rgba.len() == 4 * w * h`
+            // and refuses anything else — pass through the error
+            // path rather than crashing if the build pipeline ever
+            // produces mismatched dimensions.
+            match winit::window::Icon::from_rgba(icon.rgba.clone(), icon.width, icon.height) {
+                Ok(winit_icon) => {
+                    attrs = attrs.with_window_icon(Some(winit_icon));
+                }
+                Err(e) => tracing::warn!("window icon rejected: {e}"),
+            }
+        }
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {

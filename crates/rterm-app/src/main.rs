@@ -20,6 +20,8 @@ use rterm_pty::{Pty, PtyControl};
 use rterm_render::palette::Palette;
 use rterm_render::{EventSink, Pane, PaneSpawner, SharedTerminal, TerminalIo, UserBinding};
 
+mod icon;
+
 struct PtyAdapter(PtyControl);
 
 impl TerminalIo for PtyAdapter {
@@ -1751,6 +1753,7 @@ fn run_gui(
             confirm_multiline: config.paste.confirm_multiline,
             min_bytes: config.paste.confirm_min_bytes,
         },
+        icon: Some(icon::app_icon()),
     })
 }
 

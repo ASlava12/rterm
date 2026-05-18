@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "rterm — cross-platform terminal with Lua plugins"
+build = "build.rs"
 
 [[bin]]
 name = "rterm"
@@ -28,3 +29,22 @@ toml_edit = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
+
+# Update-check feature talks to the GitHub releases REST API. Pulled
+# in here so the runtime binary depends on it; ureq is sync, blocking,
+# and tiny — fine for a one-shot HTTP GET on a background thread.
+ureq = { version = "2", default-features = false, features = ["tls"] }
+
+# Build-time PNG decode + downscale to 256×256 RGBA for the window
+# icon. The pre-decoded bytes are include_bytes!'d at runtime so
+# there's no PNG-decoder dep in the resulting binary. The full
+# `image` dependency tree only runs during `cargo build`.
+[build-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Windows-only build deps: assemble a multi-resolution .ico and
+# embed it into the .exe via the standard Win32 RT_ICON resource
+# so Explorer / taskbar / Alt-Tab show the rterm logo.
+[target.'cfg(windows)'.build-dependencies]
+ico = "0.3"
+winresource = "0.1"
