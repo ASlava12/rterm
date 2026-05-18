@@ -33,7 +33,16 @@ tokio = { workspace = true }
 # Update-check feature talks to the GitHub releases REST API. Pulled
 # in here so the runtime binary depends on it; ureq is sync, blocking,
 # and tiny — fine for a one-shot HTTP GET on a background thread.
-ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+#
+# `native-tls` instead of the default rustls backend: rustls drags in
+# `ring`, which on `aarch64-pc-windows-msvc` needs clang to compile
+# its hand-written ASM, breaking dev builds on Windows-on-ARM where
+# the user only has the MSVC toolchain. native-tls uses SChannel on
+# Windows (built into the OS, including ARM64), Secure Transport on
+# macOS, and OpenSSL on Linux (already present on every Ubuntu CI
+# image). One HTTP request per startup doesn't justify pulling in
+# the crypto-from-scratch stack.
+ureq = { version = "2", default-features = false, features = ["native-tls", "json"] }
 
 # Build-time PNG decode + downscale to 256×256 RGBA for the window
 # icon. The pre-decoded bytes are include_bytes!'d at runtime so

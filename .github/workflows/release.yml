@@ -91,6 +91,7 @@ jobs:
             libxcb-shape0-dev \
             libxcb-xfixes0-dev \
             libxcb1-dev \
+            libssl-dev \
             pkg-config
 
       - name: Pre-release sanity (clippy + lib tests)
