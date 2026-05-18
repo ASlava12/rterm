@@ -7282,6 +7282,12 @@ impl App {
                 _ => {}
             },
         }
+        // Any cursor-moving key (arrows, typing, PgUp/PgDn, ...)
+        // may have moved the caret out of the visible viewport;
+        // pull it back in. NOT called on wheel — wheel deliberately
+        // decouples viewport from cursor so the user can scan above
+        // / below the caret without it being yanked back.
+        self.clamp_paste_modal_scroll();
     }
 
     /// Mouse-click on the paste-confirmation modal. Confirm mode:
@@ -7484,14 +7490,17 @@ impl App {
                 *cursor = new_cursor.min(m.text.len());
             }
         }
+        self.clamp_paste_modal_scroll();
     }
 
     /// Mouse-wheel handling for the paste-confirmation modal. In
-    /// edit mode, the wheel scrolls the cursor up / down by a few
-    /// lines per tick (the viewport is centred on cursor, so
-    /// "scroll the cursor" produces the visual effect of a scrolled
-    /// editor). In confirm mode, the wheel is absorbed silently to
-    /// keep a stray scroll from leaking through to the pane below.
+    /// edit mode, the wheel shifts the VIEWPORT (not the cursor) by
+    /// a few lines per tick — same convention as every text editor.
+    /// The cursor stays where the user left it; if they keep
+    /// scrolling past it, the caret simply scrolls off-screen. As
+    /// soon as they type / arrow, the clamp pulls the viewport back.
+    /// In confirm mode, the wheel is absorbed silently to keep a
+    /// stray scroll from leaking through to the pane below.
     fn handle_paste_confirmation_wheel(&mut self, delta: MouseScrollDelta) {
         use paste_confirm::PasteMode;
         // Take viewport rows in a pre-pass so we don't hold a
@@ -7521,10 +7530,13 @@ impl App {
         modal.scroll_by(-(lines as i64), visible_rows);
     }
 
-    /// Pre-render hook: clamp the paste modal's scroll_line so
-    /// the cursor stays inside the viewport. Idempotent — when
-    /// the cursor is already in view, scroll_line is untouched.
-    /// Called once per frame from the redraw branch.
+    /// Clamp the paste modal's `scroll_line` so the cursor stays
+    /// inside the viewport. Idempotent — when the cursor is
+    /// already in view, `scroll_line` is untouched. Called from
+    /// every cursor-moving path (key handler, click positioner,
+    /// `enter_edit_mode`). DELIBERATELY NOT called per frame:
+    /// doing so would yank the viewport back to the cursor and
+    /// fight the wheel handler's intentional decoupling.
     fn clamp_paste_modal_scroll(&mut self) {
         let visible = self.paste_modal_visible_rows();
         if let Some(modal) = self.paste_confirmation.as_mut() {
@@ -7570,6 +7582,10 @@ impl App {
                 if let Some(modal) = self.paste_confirmation.as_mut() {
                     modal.enter_edit_mode();
                 }
+                // Caret lands at end-of-buffer on entry; pull the
+                // viewport down to it so a long paste doesn't open
+                // with the cursor invisibly past the bottom.
+                self.clamp_paste_modal_scroll();
             }
             PasteButton::Cancel => {
                 self.paste_confirmation = None;
@@ -10060,12 +10076,6 @@ impl ApplicationHandler<UserEvent> for App {
                 // compute), at most one SQLite query when the
                 // debounce window elapses.
                 self.refresh_suggestion_popup();
-                // Clamp the paste modal's scroll so the cursor
-                // stays in view this frame. Runs in `&mut self`
-                // here, BEFORE the overlay-build path clones the
-                // modal — so the spans builder + the click hit-
-                // test both observe the same scroll value.
-                self.clamp_paste_modal_scroll();
                 // Wayland/wgpu egg-and-chicken: the compositor only sends
                 // its `configure` after the client commits a buffer, and
                 // the client doesn't know its actual surface size until
