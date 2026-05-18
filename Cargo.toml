@@ -16,7 +16,7 @@ edition = "2021"
 rust-version = "1.80"
 license = "MIT OR Apache-2.0"
 authors = ["rterm contributors"]
-repository = "https://github.com/example/rterm"
+repository = "https://github.com/ASlava12/rterm"
 
 [workspace.dependencies]
 # Internal crates

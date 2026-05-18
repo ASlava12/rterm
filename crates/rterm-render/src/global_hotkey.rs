@@ -340,11 +340,10 @@ mod windows_impl {
         let tid = rx
             .recv()
             .map_err(|e| format!("worker handshake closed: {e}"))?
-            .map_err(|e| {
+            .inspect_err(|_| {
                 // Reap the spawned thread that's now exiting on its own
                 // so we don't leak the OS handle.
                 let _ = thread;
-                e
             })?;
 
         Ok(WorkerHandle {
