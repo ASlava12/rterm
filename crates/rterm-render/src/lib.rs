@@ -676,6 +676,15 @@ pub struct StatusBarDraw<'a> {
 pub struct OverlayDraw<'a> {
     pub spans: SpanList<'a>,
     pub rect: PaneRect,
+    /// When `true`, the overlay text is rendered with `Wrap::None`
+    /// — long lines extend past the right edge of the rect and
+    /// clip at the bounds rather than wrap onto a second visual
+    /// row. The paste-confirmation editor uses this so the
+    /// click-to-cursor hit test can rely on "1 logical line == 1
+    /// visual row." Defaults to `false` (= cosmic-text's
+    /// default word wrap) so help / palette / settings keep
+    /// behaving as before.
+    pub nowrap: bool,
 }
 
 /// Enumerate monospace family names installed on the system, deduplicated
@@ -1378,6 +1387,15 @@ impl TextLayer {
                 &mut self.font_system,
                 Some(o.rect.width),
                 Some(o.rect.height),
+            );
+            // Edit-mode mini-editor needs `Wrap::None` so a long
+            // line stays on one visual row (clipping on the right
+            // edge of the rect). Everyone else gets the default
+            // word wrap so help / palette text breaks at word
+            // boundaries.
+            self.overlay_buffer.set_wrap(
+                &mut self.font_system,
+                if o.nowrap { Wrap::None } else { Wrap::WordOrGlyph },
             );
             self.overlay_buffer.set_rich_text(
                 &mut self.font_system,
@@ -7304,9 +7322,16 @@ impl App {
         let preview_rendered = preview_total.min(12);
         let more_line = usize::from(preview_total > 12);
         let button_row_index = 1 + 1 + preview_rendered + more_line + 1;
-        let row_y = rect.top + button_row_index as f32 * line_h;
+        // Hit-zone is 4 rows tall: the actual button row plus 3
+        // rows below it (the blank row, the hint line, and one row
+        // of slack). Real-world clicks routinely landed 1–2 rows
+        // below the visual button when the modal was densely
+        // packed with a long preview; widening the zone catches
+        // them without overlapping the preview text above.
         let yf = y as f32;
-        if yf < row_y || yf >= row_y + line_h {
+        let row_top = rect.top + button_row_index as f32 * line_h;
+        let row_bottom = rect.top + (button_row_index + 4) as f32 * line_h;
+        if yf < row_top || yf >= row_bottom {
             return;
         }
         let xf = x as f32;
@@ -11980,9 +12005,18 @@ impl ApplicationHandler<UserEvent> for App {
                         title_bar.map(|(spans, rect)| TitleBarDraw { spans, rect });
                     let status_bar_draw =
                         status_bar.map(|(spans, rect)| StatusBarDraw { spans, rect });
+                    // Paste-confirmation modal in Edit mode wants
+                    // wrap-off so its mini-editor reads "1 buffer
+                    // line == 1 visual row" — the click-to-cursor
+                    // hit-test math relies on this.
+                    let overlay_nowrap = matches!(
+                        self.paste_confirmation.as_ref().map(|m| &m.mode),
+                        Some(paste_confirm::PasteMode::Edit { .. }),
+                    );
                     let overlay_draw = overlay_rect.map(|rect| OverlayDraw {
                         spans: overlay_spans,
                         rect,
+                        nowrap: overlay_nowrap,
                     });
                     // Solid backdrop card behind any modal overlay so
                     // its text doesn't visually mix with pane content
