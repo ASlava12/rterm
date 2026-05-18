@@ -325,20 +325,93 @@ impl App {
                 spans.push((storage.len() - 1, warn, true));
                 storage.push("\n".to_string());
                 spans.push((storage.len() - 1, fg, false));
-                // Render the buffer with a `▏` cursor mark inserted
-                // at the cursor offset. Single span per line so
-                // cosmic-text breaks correctly; rounds the cursor
-                // to a char boundary just in case.
-                let mut cursor = (*cursor).min(modal.text.len());
-                while cursor > 0 && !modal.text.is_char_boundary(cursor) {
-                    cursor -= 1;
+                // Scrollable viewport. The previous implementation
+                // dumped the whole buffer into one TextArea — for a
+                // multi-page paste the cursor + trailing lines fell
+                // outside the overlay rect with no way to recover.
+                //
+                // New layout: split the buffer into lines, compute
+                // how many fit in the rect (modal_rows - 2 header
+                // rows), and slice a viewport centred on the cursor
+                // line. The cursor mark `▏` lives inside the
+                // visible slice at the correct byte offset.
+                let mut cursor_byte = (*cursor).min(modal.text.len());
+                while cursor_byte > 0 && !modal.text.is_char_boundary(cursor_byte) {
+                    cursor_byte -= 1;
                 }
-                let (pre, post) = modal.text.split_at(cursor);
-                // Display: pre + cursor mark + post. Each "line"
-                // gets a leading "  " for indent.
-                let combined = format!("  {pre}▏{post}\n");
-                storage.push(combined);
-                spans.push((storage.len() - 1, fg, false));
+                // Collapse the buffer into newline-delimited lines.
+                // `split('\n')` keeps a trailing empty entry when
+                // the buffer ends with `\n` — which is what the
+                // user expects to see (an editable empty line).
+                let lines: Vec<&str> = modal.text.split('\n').collect();
+                // Find cursor's line + offset within that line.
+                let cursor_line = modal.text[..cursor_byte]
+                    .bytes()
+                    .filter(|b| *b == b'\n')
+                    .count();
+                let line_start_byte = modal.text[..cursor_byte]
+                    .rfind('\n')
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                let cursor_in_line = cursor_byte - line_start_byte;
+                // Viewport height in rows, computed from the
+                // overlay rect. Falls back to a sensible default
+                // when cell metrics aren't ready yet (first frame
+                // after a wgpu resize).
+                let line_h = self
+                    .state
+                    .as_ref()
+                    .map(|s| s.text.line_height())
+                    .filter(|h| *h > 0.0)
+                    .unwrap_or(20.0);
+                let rect_h = self
+                    .paste_confirmation_rect(modal)
+                    .map(|r| r.height)
+                    .unwrap_or(400.0);
+                // Header eats 2 rows ("Edit paste …", blank); leave
+                // 1 row of bottom padding so the last line doesn't
+                // get clipped by the rounded panel corner.
+                const HEADER_ROWS: usize = 2;
+                const BOTTOM_PAD_ROWS: usize = 1;
+                let total_rows = (rect_h / line_h) as usize;
+                let visible_rows = total_rows
+                    .saturating_sub(HEADER_ROWS + BOTTOM_PAD_ROWS)
+                    .max(1);
+                // Centre the cursor in the viewport, but clamp so
+                // we never scroll past the document edges. Result:
+                // cursor stays comfortably visible while the user
+                // arrows up/down through the buffer.
+                let half = visible_rows / 2;
+                let max_scroll = lines.len().saturating_sub(visible_rows);
+                let scroll = cursor_line.saturating_sub(half).min(max_scroll);
+                let end = (scroll + visible_rows).min(lines.len());
+                for (i, line) in lines[scroll..end].iter().enumerate() {
+                    let absolute_line = scroll + i;
+                    let rendered = if absolute_line == cursor_line {
+                        // Insert cursor mark at byte offset within
+                        // this line (already char-boundary-aligned
+                        // by the cursor invariants).
+                        let split = cursor_in_line.min(line.len());
+                        let (pre, post) = line.split_at(split);
+                        format!("  {pre}▏{post}\n")
+                    } else {
+                        format!("  {line}\n")
+                    };
+                    storage.push(rendered);
+                    spans.push((storage.len() - 1, fg, false));
+                }
+                // Scroll-position hint at the bottom — same idiom
+                // as the suggestion-popup's `↓ N more`.
+                if scroll > 0 || end < lines.len() {
+                    let total = lines.len();
+                    storage.push(format!(
+                        "  ─ line {}–{} / {} ─\n",
+                        scroll + 1,
+                        end,
+                        total,
+                    ));
+                    spans.push((storage.len() - 1, muted, false));
+                }
             }
         }
         spans
