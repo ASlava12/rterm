@@ -11,6 +11,7 @@ mod clipboard;
 use clipboard::clipboard_set;
 mod command_capture;
 mod global_hotkey;
+mod paste_confirm;
 mod suggestion_popup;
 mod keybind;
 mod layout;
@@ -2608,6 +2609,28 @@ impl Default for HistoryPopupConfig {
     }
 }
 
+/// Renderer-side mirror of `rterm_config::PasteConfig`.
+#[derive(Debug, Clone, Copy)]
+pub struct PasteConfirmConfig {
+    /// When `true`, multi-line pastes ≥ `min_bytes` show the
+    /// confirmation modal first. `false` skips the modal — the
+    /// legacy "just paste" behaviour.
+    pub confirm_multiline: bool,
+    /// Multi-line pastes shorter than this many bytes skip the
+    /// modal even when `confirm_multiline = true`. Avoids
+    /// prompting on tiny `cd && ls` chains.
+    pub min_bytes: u32,
+}
+
+impl Default for PasteConfirmConfig {
+    fn default() -> Self {
+        Self {
+            confirm_multiline: true,
+            min_bytes: 80,
+        }
+    }
+}
+
 /// Guake-style drop-down snapshot. Mirrors `rterm_config::GuakeConfig`
 /// but lives in the render crate so the renderer doesn't depend on the
 /// config crate.
@@ -2705,6 +2728,10 @@ pub struct RunConfig {
     /// Carried as a struct (rather than three individual fields) so
     /// future knobs land without touching every RunConfig caller.
     pub history_popup: HistoryPopupConfig,
+    /// Multi-line paste safety prompt. When `confirm_multiline =
+    /// true`, pasted text containing a newline goes through a
+    /// modal first (Paste / Edit / Cancel).
+    pub paste_confirm: PasteConfirmConfig,
 }
 
 pub struct App {
@@ -2880,6 +2907,12 @@ pub struct App {
     history: Option<Arc<Mutex<rterm_history::History>>>,
     /// Popup tuning: row count, debounce, prefix gate.
     history_popup_cfg: HistoryPopupConfig,
+    /// Multi-line-paste safety-prompt tuning.
+    paste_confirm_cfg: PasteConfirmConfig,
+    /// `Some` when the paste-confirmation modal is up. Blocks
+    /// the rest of the keyboard / mouse pipeline; the modal
+    /// resolves to "paste original" / "paste edited" / "cancel".
+    paste_confirmation: Option<paste_confirm::PasteConfirmation>,
     /// `Some` when the suggestion popup is on screen. Owns the
     /// suggestion list, current selection, scroll offset, and the
     /// last-seen capture generation for debounce comparisons.
@@ -2995,6 +3028,7 @@ impl App {
             guake,
             history,
             history_popup,
+            paste_confirm,
         } = cfg;
         // Clamp here so a hand-written config with a negative/zero/huge
         // value can't crash glyphon (Metrics expects positive sizes) or
@@ -3085,6 +3119,8 @@ impl App {
             global_hotkey: None,
             history,
             history_popup_cfg: history_popup,
+            paste_confirm_cfg: paste_confirm,
+            paste_confirmation: None,
             suggestion_popup: None,
             last_input_change_at: None,
             last_capture_generation: 0,
@@ -7139,6 +7175,101 @@ impl App {
     /// previous word, Ctrl+U clears, Backspace pops one grapheme. The
     /// "pristine" flag mimics browser select-all-on-focus: the first
     /// printable character replaces the prefilled title in one shot.
+    /// Keyboard input while the paste-confirmation modal is up.
+    ///
+    /// In `Confirm` mode:
+    /// * `Tab` / `Shift+Tab` cycle the focused button.
+    /// * `←` / `→` also cycle (mirror Tab nav — both feel natural).
+    /// * `Enter` activates the focused button.
+    /// * `Esc` cancels outright.
+    /// * `P` / `E` / `C` shortcuts jump straight to Paste / Edit /
+    ///   Cancel respectively (first-letter accelerators).
+    ///
+    /// In `Edit` mode:
+    /// * Printable chars + Enter → insert at cursor (Enter inserts
+    ///   `\n`, NOT submit — multi-line content is the point).
+    /// * `Backspace` / `Delete` → mutate.
+    /// * `←` / `→` / `↑` / `↓` → cursor nav.
+    /// * `Home` / `End` → start / end of current line.
+    /// * `Ctrl+Enter` → finish editing, paste the buffer.
+    /// * `Esc` → cancel outright (drops the edited buffer).
+    fn handle_paste_confirmation_key(&mut self, event: &KeyEvent) {
+        use paste_confirm::{PasteButton, PasteMode};
+        let Some(modal) = self.paste_confirmation.as_mut() else { return };
+        let ctrl = self.modifiers.contains(ModifiersState::CONTROL);
+        let shift = self.modifiers.contains(ModifiersState::SHIFT);
+        match &mut modal.mode {
+            PasteMode::Confirm { selected } => match &event.logical_key {
+                Key::Named(NamedKey::Tab) | Key::Named(NamedKey::ArrowRight) => {
+                    *selected = if shift { selected.prev() } else { selected.next() };
+                }
+                Key::Named(NamedKey::ArrowLeft) => {
+                    *selected = selected.prev();
+                }
+                Key::Named(NamedKey::Enter) => {
+                    let action = *selected;
+                    self.activate_paste_button(action);
+                }
+                Key::Named(NamedKey::Escape) => {
+                    self.paste_confirmation = None;
+                }
+                Key::Character(c) => match c.as_str() {
+                    "p" | "P" => self.activate_paste_button(PasteButton::Paste),
+                    "e" | "E" => self.activate_paste_button(PasteButton::Edit),
+                    "c" | "C" => self.activate_paste_button(PasteButton::Cancel),
+                    _ => {}
+                },
+                _ => {}
+            },
+            PasteMode::Edit { .. } => match &event.logical_key {
+                Key::Named(NamedKey::Enter) if ctrl => {
+                    // Ctrl+Enter applies the edited buffer.
+                    let text = modal.text.clone();
+                    self.paste_confirmation = None;
+                    self.commit_paste_now(&text);
+                }
+                Key::Named(NamedKey::Enter) => {
+                    modal.edit_insert('\n');
+                }
+                Key::Named(NamedKey::Escape) => {
+                    self.paste_confirmation = None;
+                }
+                Key::Named(NamedKey::Backspace) => modal.edit_backspace(),
+                Key::Named(NamedKey::Delete) => modal.edit_delete(),
+                Key::Named(NamedKey::ArrowLeft) => modal.edit_left(),
+                Key::Named(NamedKey::ArrowRight) => modal.edit_right(),
+                Key::Named(NamedKey::ArrowUp) => modal.edit_up(),
+                Key::Named(NamedKey::ArrowDown) => modal.edit_down(),
+                Key::Named(NamedKey::Home) => modal.edit_home(),
+                Key::Named(NamedKey::End) => modal.edit_end(),
+                Key::Named(NamedKey::Tab) => modal.edit_insert('\t'),
+                Key::Named(NamedKey::Space) => modal.edit_insert(' '),
+                Key::Character(c) => modal.edit_insert_str(c.as_str()),
+                _ => {}
+            },
+        }
+    }
+
+    /// Apply the user's button choice in the confirm modal.
+    fn activate_paste_button(&mut self, btn: paste_confirm::PasteButton) {
+        use paste_confirm::PasteButton;
+        match btn {
+            PasteButton::Paste => {
+                if let Some(modal) = self.paste_confirmation.take() {
+                    self.commit_paste_now(&modal.text);
+                }
+            }
+            PasteButton::Edit => {
+                if let Some(modal) = self.paste_confirmation.as_mut() {
+                    modal.enter_edit_mode();
+                }
+            }
+            PasteButton::Cancel => {
+                self.paste_confirmation = None;
+            }
+        }
+    }
+
     /// Process a keystroke while the suggestion popup is visible.
     /// Returns `true` when the key was consumed (don't forward to
     /// the PTY); `false` lets the key reach the shell.
@@ -7945,7 +8076,7 @@ impl App {
         self.events.emit("scroll", &next.to_string());
     }
 
-    fn paste_clipboard(&self) {
+    fn paste_clipboard(&mut self) {
         let text = match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
             Ok(t) => t,
             Err(e) => {
@@ -7959,7 +8090,7 @@ impl App {
     /// Read PRIMARY selection (X11 / Wayland) and feed it to the focused
     /// pane. On non-Linux falls back to the regular clipboard so the
     /// middle-click gesture still does something sensible.
-    fn paste_primary(&self) {
+    fn paste_primary(&mut self) {
         #[cfg(target_os = "linux")]
         let text = {
             use arboard::{GetExtLinux, LinuxClipboardKind};
@@ -7978,7 +8109,34 @@ impl App {
 
     /// Common paste path — line-ending normalisation + optional bracketed
     /// paste wrap, then writes to the focused pane's PTY.
-    fn write_paste(&self, text: &str) {
+    fn write_paste(&mut self, text: &str) {
+        let Some(pane) = self.focused_pane() else { return };
+        let pane_uid = pane.uid;
+        // Multi-line paste safety prompt. The modal blocks the
+        // actual PTY write until the user resolves it via Paste /
+        // Edit / Cancel; if armed, return immediately — the modal's
+        // own dispatch will replay the (possibly edited) text
+        // through `commit_paste_now` later.
+        if paste_confirm::should_confirm(text, &self.paste_confirm_cfg) {
+            self.paste_confirmation = Some(
+                paste_confirm::PasteConfirmation::new_confirm(text.to_string(), pane_uid),
+            );
+            // Force a redraw so the modal appears even if the
+            // continuous-redraw chain was idle.
+            if let Some(state) = self.state.as_ref() {
+                state.window.request_redraw();
+            }
+            return;
+        }
+        self.commit_paste_now(text);
+    }
+
+    /// Send `text` to the focused pane's PTY without going through
+    /// the multi-line safety prompt. Resolves bracketed-paste-aware
+    /// line-ending normalisation + strips embedded markers. Used by
+    /// both the unconfirmed paste path and the modal's "Paste" /
+    /// "Apply" actions.
+    fn commit_paste_now(&mut self, text: &str) {
         let Some(pane) = self.focused_pane() else { return };
         // Strip embedded bracketed-paste markers first so a malicious
         // clipboard payload can't include a literal `\x1b[201~` to "close"
@@ -8080,6 +8238,13 @@ impl App {
     /// Top-level keyboard entry. Returns `true` if the window should exit.
     fn handle_key(&mut self, event: &KeyEvent) -> bool {
         if event.state != ElementState::Pressed {
+            return false;
+        }
+        // Paste-confirmation modal owns the keyboard. It either
+        // resolves the paste (Paste / Apply / Cancel) and clears
+        // itself, or stays open absorbing every keystroke.
+        if self.paste_confirmation.is_some() {
+            self.handle_paste_confirmation_key(event);
             return false;
         }
         // Suggestion popup gets first dibs on ↓ / ↑ / TAB / Esc /
@@ -11297,7 +11462,16 @@ impl ApplicationHandler<UserEvent> for App {
                 // help. One overlay at a time keeps input routing tidy.
                 let mut help_storage: Vec<String> = Vec::new();
                 let (overlay_spans, overlay_rect) =
-                    if let Some(rt) = self.rename_tab.clone() {
+                    if let Some(modal) = self.paste_confirmation.clone() {
+                        // Paste-confirmation modal beats every
+                        // other overlay — it's blocking input
+                        // delivery, so the user must resolve it
+                        // first.
+                        (
+                            self.paste_confirmation_spans(&modal, &mut help_storage),
+                            self.paste_confirmation_rect(&modal),
+                        )
+                    } else if let Some(rt) = self.rename_tab.clone() {
                         (
                             self.rename_spans(&rt, &mut help_storage),
                             self.rename_rect(),

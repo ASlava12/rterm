@@ -24,6 +24,37 @@ pub struct Config {
     pub appearance: AppearanceConfig,
     pub guake: GuakeConfig,
     pub history: HistoryConfig,
+    pub paste: PasteConfig,
+}
+
+/// Bulk-paste safety prompt. When enabled, pasting text that
+/// contains newlines triggers a modal confirmation before any byte
+/// reaches the PTY — protects against an accidental drag-paste of a
+/// half-formed multi-line command (a real footgun: pasting a list of
+/// hostnames with embedded newlines auto-submits each one as a
+/// command if the shell is at a prompt).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PasteConfig {
+    /// Master toggle. `true` (default) shows the confirmation modal
+    /// on every multi-line paste; `false` falls back to the legacy
+    /// "just paste" behaviour.
+    pub confirm_multiline: bool,
+    /// Skip the modal for pastes shorter than this many bytes even
+    /// when they contain newlines. A two-line `cd` + `ls` chain is
+    /// usually intentional and doesn't warrant a prompt. Default
+    /// 80 bytes — empirically the size below which pastes are
+    /// almost always user-curated snippets rather than blob dumps.
+    pub confirm_min_bytes: u32,
+}
+
+impl Default for PasteConfig {
+    fn default() -> Self {
+        Self {
+            confirm_multiline: true,
+            confirm_min_bytes: 80,
+        }
+    }
 }
 
 /// Terminal-side command-history settings. Controls when the

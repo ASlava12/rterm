@@ -191,6 +191,29 @@ impl App {
         Some(PaneRect { left, top, width: menu_w.min(w), height: menu_h.min(h) })
     }
 
+    /// Rect for the paste-confirmation modal. Centred card, sized
+    /// generously so the preview / mini-editor have room to breathe.
+    /// Mirrors `help_rect` shape: max 720×(h-80), capped to fit.
+    pub(crate) fn paste_confirmation_rect(
+        &self,
+        _modal: &crate::paste_confirm::PasteConfirmation,
+    ) -> Option<crate::PaneRect> {
+        let state = self.state.as_ref()?;
+        let w = state.config.width as f32;
+        let h = state.config.height as f32;
+        let max_w = 720.0_f32.min(w - 40.0).max(200.0);
+        let max_h = (h - 80.0).max(180.0);
+        if w < max_w + 1.0 || h < max_h + 1.0 {
+            return None;
+        }
+        Some(crate::PaneRect {
+            left: (w - max_w) * 0.5,
+            top: (h - max_h) * 0.5,
+            width: max_w,
+            height: max_h,
+        })
+    }
+
     /// Rect for the suggestion popup. Anchored to the bottom-left
     /// of the focused pane (above the status bar) so the dropdown
     /// reads like an inline auto-complete tray. Width: longest

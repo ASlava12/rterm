@@ -217,6 +217,24 @@ width_pct = 100
 #   Default: "".
 global_hotkey = ""
 
+# ── [paste] ───────────────────────────────────────────────────────────
+# Bulk-paste safety prompt. A multi-line clipboard payload pasted into
+# a shell at a prompt can auto-submit each line as a command — that's
+# accidentally happened to most terminal users at least once
+# (e.g. drag-paste of a hostname list ends up running each hostname
+# as a command). When enabled, multi-line pastes ≥ `confirm_min_bytes`
+# show a modal: Paste, Edit (mini-editor for the buffer), Cancel.
+[paste]
+# confirm_multiline — master toggle.
+#   Type:   bool. `false` skips the modal entirely (legacy behaviour).
+#   Default: true.
+confirm_multiline = true
+# confirm_min_bytes — short pastes skip the modal even when multi-
+# line, because a 2-line `cd && ls` chain is usually intentional.
+#   Type:   u32. Counted in bytes (not chars / not lines).
+#   Default: 80.
+confirm_min_bytes = 80
+
 # ── [colors] ──────────────────────────────────────────────────────────
 # Terminal palette overrides. Every entry is an optional `[r, g, b]`
 # byte triple (each channel 0..=255); missing fields keep the built-in

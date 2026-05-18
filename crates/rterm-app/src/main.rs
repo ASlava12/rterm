@@ -1747,6 +1747,10 @@ fn run_gui(
             popup_debounce_ms: config.history.popup_debounce_ms,
             min_prefix_len: config.history.min_prefix_len,
         },
+        paste_confirm: rterm_render::PasteConfirmConfig {
+            confirm_multiline: config.paste.confirm_multiline,
+            min_bytes: config.paste.confirm_min_bytes,
+        },
     })
 }
 

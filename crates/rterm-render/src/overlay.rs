@@ -249,6 +249,104 @@ impl App {
         Some((spans, rect))
     }
 
+    /// Build the per-row text spans for the paste-confirmation
+    /// modal. Renders differently depending on `modal.mode`:
+    /// * `Confirm` — header (line count) + preview of the first
+    ///   ~12 lines + button row.
+    /// * `Edit` — header explaining Ctrl+Enter / Esc + the full
+    ///   editable buffer + a `▏` cursor mark at the cursor offset.
+    pub(crate) fn paste_confirmation_spans<'a>(
+        &self,
+        modal: &crate::paste_confirm::PasteConfirmation,
+        storage: &'a mut Vec<String>,
+    ) -> Vec<(&'a str, [u8; 3], bool)> {
+        use crate::paste_confirm::{PasteButton, PasteMode};
+        storage.clear();
+        let mut spans: Vec<(usize, [u8; 3], bool)> = Vec::new();
+        let fg = palette::default_fg();
+        let muted = fg.map(|c| c.saturating_sub(80));
+        let accent: [u8; 3] = [121, 192, 255];
+        let warn: [u8; 3] = [220, 200, 120];
+        match &modal.mode {
+            PasteMode::Confirm { selected } => {
+                let lines = modal.line_count();
+                storage.push(format!("Paste {lines} lines into terminal?\n"));
+                spans.push((storage.len() - 1, warn, true));
+                storage.push("\n".to_string());
+                spans.push((storage.len() - 1, fg, false));
+                let (preview, total) = modal.preview(12);
+                for line in preview {
+                    // Truncate per-line so a 500-char log entry
+                    // doesn't push the modal off-screen.
+                    let display = if line.chars().count() > 80 {
+                        let head: String = line.chars().take(78).collect();
+                        format!("  │ {head}…\n")
+                    } else {
+                        format!("  │ {line}\n")
+                    };
+                    storage.push(display);
+                    spans.push((storage.len() - 1, fg, false));
+                }
+                if total > 12 {
+                    storage.push(format!("  │ … {} more lines\n", total - 12));
+                    spans.push((storage.len() - 1, muted, false));
+                }
+                storage.push("\n".to_string());
+                spans.push((storage.len() - 1, fg, false));
+                // Button row. Selected button gets [▸ label ◂]
+                // brackets + accent colour; others get plain
+                // brackets. Hot-key letters are underscored in
+                // their labels via parens convention.
+                let render_button = |b: PasteButton| -> String {
+                    let (open, close) = if b == *selected { ("[▸ ", " ◂]") } else { ("[ ", " ]") };
+                    let label = match b {
+                        PasteButton::Paste => "(P)aste",
+                        PasteButton::Edit => "(E)dit",
+                        PasteButton::Cancel => "(C)ancel",
+                    };
+                    format!("{open}{label}{close}")
+                };
+                let row = format!(
+                    "  {}  {}  {}\n",
+                    render_button(PasteButton::Paste),
+                    render_button(PasteButton::Edit),
+                    render_button(PasteButton::Cancel),
+                );
+                storage.push(row);
+                spans.push((storage.len() - 1, accent, true));
+                storage.push("\n".to_string());
+                spans.push((storage.len() - 1, fg, false));
+                storage
+                    .push("  Tab / ← → cycle  ·  Enter activate  ·  Esc cancel\n".to_string());
+                spans.push((storage.len() - 1, muted, false));
+            }
+            PasteMode::Edit { cursor } => {
+                storage.push("Edit paste — Ctrl+Enter apply, Esc cancel\n".to_string());
+                spans.push((storage.len() - 1, warn, true));
+                storage.push("\n".to_string());
+                spans.push((storage.len() - 1, fg, false));
+                // Render the buffer with a `▏` cursor mark inserted
+                // at the cursor offset. Single span per line so
+                // cosmic-text breaks correctly; rounds the cursor
+                // to a char boundary just in case.
+                let mut cursor = (*cursor).min(modal.text.len());
+                while cursor > 0 && !modal.text.is_char_boundary(cursor) {
+                    cursor -= 1;
+                }
+                let (pre, post) = modal.text.split_at(cursor);
+                // Display: pre + cursor mark + post. Each "line"
+                // gets a leading "  " for indent.
+                let combined = format!("  {pre}▏{post}\n");
+                storage.push(combined);
+                spans.push((storage.len() - 1, fg, false));
+            }
+        }
+        spans
+            .into_iter()
+            .map(|(idx, c, b)| (storage[idx].as_str(), c, b))
+            .collect()
+    }
+
     /// Build the per-row text spans for the suggestion popup. One
     /// line per visible entry; the selected row (when present) is
     /// rendered in an accent colour with a leading `▸`. A `↓ N
