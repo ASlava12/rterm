@@ -215,6 +215,136 @@ fn run_history_subcommand<I: IntoIterator<Item = String>>(args: I) -> Result<()>
     Ok(())
 }
 
+/// Print a shell-init snippet that emits the OSC 133 semantic-
+/// prompt markers rterm consumes for prompt-jump navigation, the
+/// slow-command event, and (in upcoming work) the command-history
+/// capture. Output is meant for `eval "$(rterm --shell-integration
+/// bash)"` so users don't have to copy-paste the snippet by hand
+/// — it stays in lock-step with whatever future markers rterm
+/// learns to read.
+///
+/// Supported shells:
+/// * `bash` (also accepts `sh`)
+/// * `zsh`
+/// * `fish`
+/// * `powershell` (also accepts `pwsh`)
+///
+/// Unknown / missing argument prints usage to stderr and exits 0.
+fn run_shell_integration(shell: &str) -> Result<()> {
+    let snippet = match shell.to_ascii_lowercase().as_str() {
+        "bash" | "sh" => BASH_SNIPPET,
+        "zsh" => ZSH_SNIPPET,
+        "fish" => FISH_SNIPPET,
+        "powershell" | "pwsh" => POWERSHELL_SNIPPET,
+        "" => {
+            eprintln!(
+                "Usage: rterm --shell-integration <shell>\n  \
+                 Supported: bash, zsh, fish, powershell.\n  \
+                 Typical use: add `eval \"$(rterm --shell-integration bash)\"`\n  \
+                 (or the equivalent for your shell) to your rc file.",
+            );
+            return Ok(());
+        }
+        other => {
+            eprintln!(
+                "--shell-integration: unknown shell {other:?}. \
+                 Supported: bash, zsh, fish, powershell.",
+            );
+            return Ok(());
+        }
+    };
+    print!("{snippet}");
+    Ok(())
+}
+
+/// Bash hook set. `PROMPT_COMMAND` runs before every prompt; we use
+/// it to emit `133;A` (start) then `133;B` (input start) wrapping
+/// the actual prompt via a `PS1` injection. `DEBUG` trap fires
+/// just before each command runs → `133;C`. `133;D` carries the
+/// exit code after each command.
+const BASH_SNIPPET: &str = r#"# rterm shell integration (bash).
+# Emits OSC 133 semantic-prompt markers so rterm can detect prompt
+# boundaries, jump between prior commands, and (future) feed its
+# command-history popup with what the remote shell actually ran.
+#
+# Add to ~/.bashrc:
+#
+#   eval "$(rterm --shell-integration bash)"
+#
+__rterm_133_A() { printf '\e]133;A\e\\'; }
+__rterm_133_B() { printf '\e]133;B\e\\'; }
+__rterm_133_C() { printf '\e]133;C\e\\'; }
+__rterm_133_D() { printf '\e]133;D;%s\e\\' "$?"; }
+case "$PROMPT_COMMAND" in
+    *__rterm_133_D*) ;;
+    "") PROMPT_COMMAND='__rterm_133_D' ;;
+    *)  PROMPT_COMMAND='__rterm_133_D;'"$PROMPT_COMMAND" ;;
+esac
+PS1='\[\e]133;A\e\\\]'"$PS1"'\[\e]133;B\e\\\]'
+trap '__rterm_133_C' DEBUG
+"#;
+
+/// Zsh hook set — preexec / precmd already give us the right
+/// edges; OSC 133;A goes at the start of the prompt, 133;B just
+/// before the user gets to type, 133;C right before the command
+/// runs, 133;D with the exit code after it finishes.
+const ZSH_SNIPPET: &str = r#"# rterm shell integration (zsh).
+# Adds OSC 133 semantic-prompt markers via preexec / precmd hooks.
+#
+# Add to ~/.zshrc:
+#
+#   eval "$(rterm --shell-integration zsh)"
+#
+__rterm_preexec() { printf '\e]133;C\e\\'; }
+__rterm_precmd()  { printf '\e]133;D;%s\e\\' "$?"; printf '\e]133;A\e\\'; }
+typeset -ga preexec_functions precmd_functions
+preexec_functions+=(__rterm_preexec)
+precmd_functions+=(__rterm_precmd)
+PS1=$'%{\e]133;A\e\\%}'$PS1$'%{\e]133;B\e\\%}'
+"#;
+
+/// Fish hook set — uses fish's event-driven hooks
+/// (`fish_prompt` / `fish_preexec` / `fish_postexec`).
+const FISH_SNIPPET: &str = r#"# rterm shell integration (fish).
+# Wires fish_prompt / fish_preexec / fish_postexec to OSC 133.
+#
+# Add to ~/.config/fish/config.fish:
+#
+#   rterm --shell-integration fish | source
+#
+function __rterm_prompt --on-event fish_prompt
+    printf '\e]133;A\e\\'
+end
+function __rterm_preexec --on-event fish_preexec
+    printf '\e]133;C\e\\'
+end
+function __rterm_postexec --on-event fish_postexec
+    printf '\e]133;D;%s\e\\' "$status"
+end
+"#;
+
+/// PowerShell hook — wraps the `prompt` function so each prompt
+/// emits the OSC sequence at the right edges. Works with both
+/// Windows PowerShell 5.1 and PowerShell Core 7+.
+const POWERSHELL_SNIPPET: &str = r#"# rterm shell integration (PowerShell).
+# Add to $PROFILE:
+#
+#   Invoke-Expression (& rterm --shell-integration powershell | Out-String)
+#
+$global:__RtermOriginalPrompt = if (Test-Path Function:\prompt) { Get-Item Function:\prompt | Select-Object -ExpandProperty Definition } else { $null }
+function global:prompt {
+    $exit = $LASTEXITCODE
+    if ($null -ne $exit) {
+        [Console]::Write([char]27 + "]133;D;" + $exit + [char]27 + "\")
+    }
+    [Console]::Write([char]27 + "]133;A" + [char]27 + "\")
+    $body = if ($global:__RtermOriginalPrompt) { Invoke-Expression $global:__RtermOriginalPrompt } else { "PS " + (Get-Location) + "> " }
+    [Console]::Write($body)
+    [Console]::Write([char]27 + "]133;B" + [char]27 + "\")
+    ""
+}
+"#;
+
 struct PluginBridge(Arc<Mutex<PluginHost>>);
 
 impl EventSink for PluginBridge {
@@ -609,6 +739,11 @@ fn main() -> Result<()> {
                                        SQLite store. Subcommands: list [prefix]\n  \
                                        [--limit N] | count | forget <text> | clear.\n  \
                                        The store lives at <cache>/history.sqlite3.\n  \
+                       --shell-integration <shell>  Print a shell-init snippet that\n  \
+                                       emits OSC 133 semantic-prompt markers. Wire\n  \
+                                       via `eval \"$(rterm --shell-integration\n  \
+                                       bash)\"`. Supported: bash, zsh, fish,\n  \
+                                       powershell.\n  \
                        --check         Validate config and exit (non-zero on parse error)\n  \
                        --font-size <pt>  Override font size for this run\n  \
                        --font-family <s> Override font family for this run\n  \
@@ -1054,6 +1189,17 @@ fn main() -> Result<()> {
                     show("history:", history.as_deref());
                 }
                 return Ok(());
+            }
+            "--shell-integration" => {
+                // Print a shell-init snippet that emits OSC 133;A
+                // / 133;B / 133;C / 133;D markers. Users wire it
+                // into their shell rc via `eval "$(rterm
+                // --shell-integration bash)"`. The markers feed
+                // rterm's existing prompt-jump / slow-command
+                // detection, and (once OSC 133-based capture
+                // lands) the command-history capture too.
+                let shell = std::env::args().nth(2).unwrap_or_default();
+                return run_shell_integration(&shell);
             }
             "--history" => {
                 // Subcommand router for the rterm-history store

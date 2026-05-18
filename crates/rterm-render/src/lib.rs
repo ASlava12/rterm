@@ -6031,6 +6031,18 @@ impl App {
             self.close_palette();
             return false;
         }
+        // Suggestion popup: a click inside the popup picks the row
+        // under the cursor + injects it (same effect as TAB after
+        // ↓ nav). A click OUTSIDE the popup closes it but lets the
+        // event continue to the normal pane-click handlers, so the
+        // user can e.g. click a different pane to shift focus
+        // while a popup was visible.
+        if self.suggestion_popup.is_some() {
+            if self.handle_suggestion_popup_press(x, y) {
+                return false;
+            }
+            self.suggestion_popup = None;
+        }
         // Window-edge resize zone — only meaningful when we own the
         // decorations. The OS handles edge resize when its title bar
         // is visible.
@@ -7201,6 +7213,54 @@ impl App {
             }
             _ => false,
         }
+    }
+
+    /// Mouse-click on the suggestion popup. Returns `true` when the
+    /// click landed inside the popup rect (and was therefore
+    /// consumed); `false` lets the caller treat the click as
+    /// "outside" and close the popup before continuing normal
+    /// dispatch.
+    ///
+    /// Hit-test: convert the click's row inside the popup to an
+    /// entry index via `(y - rect.top - pad) / line_h + scroll`.
+    /// Out-of-range rows (e.g. clicking the "↓ N more" trailer
+    /// line) still count as inside the rect, but no row is
+    /// selected — the popup closes and nothing is injected.
+    fn handle_suggestion_popup_press(&mut self, x: f64, y: f64) -> bool {
+        let Some(popup) = self.suggestion_popup.clone() else { return false };
+        let Some(rect) = self.suggestion_popup_rect(&popup) else { return false };
+        let xf = x as f32;
+        let yf = y as f32;
+        if xf < rect.left
+            || xf >= rect.left + rect.width
+            || yf < rect.top
+            || yf >= rect.top + rect.height
+        {
+            return false;
+        }
+        // Convert pixel offset → entry index. The spans builder
+        // uses `line_height()` per row and a 2px vertical pad.
+        let line_h = self
+            .state
+            .as_ref()
+            .map(|s| s.text.line_height())
+            .filter(|h| *h > 0.0)
+            .unwrap_or(16.0);
+        let row_in_popup = ((yf - rect.top - 2.0) / line_h) as usize;
+        let entry_idx = popup.scroll + row_in_popup;
+        if let Some(entry) = popup.entries.get(entry_idx) {
+            let text = entry.text.clone();
+            self.suggestion_popup = None;
+            if let Some(pane) = self.focused_pane() {
+                pane.send_input(b"\x15");
+                pane.send_input(text.as_bytes());
+            }
+        } else {
+            // Click on the trailer / past the last row → just
+            // close, no inject.
+            self.suggestion_popup = None;
+        }
+        true
     }
 
     /// Per-frame refresh: query the history store when input has
