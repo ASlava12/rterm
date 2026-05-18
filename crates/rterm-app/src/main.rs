@@ -1644,8 +1644,13 @@ fn run_gui(
     // Open the persistent command-history database. Failures are
     // non-fatal — disable the feature and warn, so a corrupted /
     // unreadable file can't keep rterm from launching at all.
-    let history = history_db_path()
-        .and_then(|path| match rterm_history::History::open(&path) {
+    // Master kill switch: `[history].enabled = false` skips opening
+    // the DB entirely — that disables capture (panes are constructed
+    // with `history: None`) AND popup queries (the renderer's
+    // refresh path bails when `App.history` is None). Users who want
+    // the feature off get neither side-effect.
+    let history = if config.history.enabled {
+        history_db_path().and_then(|path| match rterm_history::History::open(&path) {
             Ok(h) => Some(Arc::new(Mutex::new(h))),
             Err(e) => {
                 tracing::warn!(
@@ -1655,7 +1660,11 @@ fn run_gui(
                 );
                 None
             }
-        });
+        })
+    } else {
+        tracing::info!("[history].enabled = false — capture + popup disabled");
+        None
+    };
     let spawner: Arc<dyn PaneSpawner> = Arc::new(GuiSpawner {
         config: config.clone(),
         history: history.clone(),
