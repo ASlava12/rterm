@@ -6,3 +6,8 @@ Cargo.lock.bak
 .vscode/
 .claude/
 *.log
+# Stray scratch files an IDE / shell helper occasionally drops at
+# the repo root — never part of the project, twice committed by
+# accident already.
+/test.txt
+/scratch.txt
