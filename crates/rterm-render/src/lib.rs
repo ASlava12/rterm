@@ -7129,50 +7129,68 @@ impl App {
     /// printable character replaces the prefilled title in one shot.
     /// Process a keystroke while the suggestion popup is visible.
     /// Returns `true` when the key was consumed (don't forward to
-    /// the PTY). Returns `false` when the popup decided to let the
-    /// key through — for `Enter` (submit) the caller handles the
-    /// keystroke normally and the popup closes; for `TAB` with no
-    /// selection the popup closes and the TAB forwards to the
-    /// shell for normal completion.
+    /// the PTY); `false` lets the key reach the shell.
+    ///
+    /// UX rules — refined after two rounds of user feedback:
+    /// * Both `↑` and `↓` pass through to the shell WITHOUT a
+    ///   selection — the user must be able to use the shell's
+    ///   own history-recall (readline / psreadline) at any time.
+    /// * `Ctrl+Space` focuses the popup (= selects the top row).
+    ///   Standard IDE "show / focus completion" gesture.
+    /// * Once focused, `↑` / `↓` navigate; `TAB` injects; `Esc`
+    ///   blurs the popup (back to shell-arrow-passthrough); a
+    ///   second `Esc` closes the popup outright.
+    /// * `Enter` always closes (the user is submitting); the
+    ///   keystroke itself passes through to the PTY.
+    /// * Mouse click on an entry injects directly — handled in
+    ///   the mouse-click path, not here.
     fn handle_suggestion_popup_key(&mut self, event: &KeyEvent) -> bool {
         let visible_rows = self.history_popup_cfg.popup_rows.max(1) as usize;
         let Some(popup) = self.suggestion_popup.as_mut() else { return false };
+        let ctrl = self.modifiers.contains(ModifiersState::CONTROL);
         match &event.logical_key {
-            Key::Named(NamedKey::ArrowDown) => {
+            Key::Named(NamedKey::Space) if ctrl => {
+                // Ctrl+Space focuses the popup. Selects row 0 if
+                // nothing selected; otherwise advances by one (so
+                // repeated presses cycle through suggestions).
                 popup.nav_down(visible_rows);
                 true
             }
-            Key::Named(NamedKey::ArrowUp) => {
+            Key::Named(NamedKey::ArrowDown) if popup.has_selection() => {
+                popup.nav_down(visible_rows);
+                true
+            }
+            Key::Named(NamedKey::ArrowUp) if popup.has_selection() => {
                 popup.nav_up(visible_rows);
                 true
             }
             Key::Named(NamedKey::Escape) => {
-                self.suggestion_popup = None;
+                if popup.has_selection() {
+                    // First Esc blurs the popup (= deselect).
+                    popup.selected = None;
+                    popup.scroll = 0;
+                } else {
+                    // Second Esc closes outright.
+                    self.suggestion_popup = None;
+                }
                 true
             }
-            Key::Named(NamedKey::Tab) => {
-                if popup.has_selection() {
-                    let text = popup.take_selected();
-                    self.suggestion_popup = None;
-                    if let Some(text) = text {
-                        // ^U clears the line in bash/zsh/fish and
-                        // PowerShell+psreadline (BackwardDeleteLine);
-                        // then we type the suggestion in literally.
-                        // Both bytes go through send_input so our own
-                        // capture buffer ends up holding the
-                        // suggestion text for the next Enter.
-                        if let Some(pane) = self.focused_pane() {
-                            pane.send_input(b"\x15");
-                            pane.send_input(text.as_bytes());
-                        }
+            Key::Named(NamedKey::Tab) if popup.has_selection() => {
+                let text = popup.take_selected();
+                self.suggestion_popup = None;
+                if let Some(text) = text {
+                    // ^U clears the line in bash/zsh/fish and in
+                    // PowerShell+psreadline (BackwardDeleteLine);
+                    // then we type the suggestion in literally.
+                    // Both bytes go through send_input so our own
+                    // capture buffer ends up holding the
+                    // suggestion text for the next Enter.
+                    if let Some(pane) = self.focused_pane() {
+                        pane.send_input(b"\x15");
+                        pane.send_input(text.as_bytes());
                     }
-                    true
-                } else {
-                    // No selection → close and let the shell's
-                    // own TAB-completion handle the keystroke.
-                    self.suggestion_popup = None;
-                    false
                 }
+                true
             }
             Key::Named(NamedKey::Enter) => {
                 // User is submitting — close the popup but let
@@ -11238,6 +11256,17 @@ impl ApplicationHandler<UserEvent> for App {
                         (self.settings_spans(&mut help_storage), self.help_rect())
                     } else if self.show_help {
                         (self.help_spans(&mut help_storage), self.help_rect())
+                    } else if let Some(popup) = self.suggestion_popup.clone() {
+                        // Suggestion popup lives at the bottom of
+                        // the overlay precedence — modal overlays
+                        // (palette / settings / help / rename /
+                        // context menu) all hide it. When none of
+                        // them are up, the popup renders as an
+                        // inline auto-complete tray.
+                        (
+                            self.suggestion_popup_spans(&popup, &mut help_storage),
+                            self.suggestion_popup_rect(&popup),
+                        )
                     } else {
                         (Vec::new(), None)
                     };

@@ -191,6 +191,68 @@ impl App {
         Some(PaneRect { left, top, width: menu_w.min(w), height: menu_h.min(h) })
     }
 
+    /// Rect for the suggestion popup. Anchored to the bottom-left
+    /// of the focused pane (above the status bar) so the dropdown
+    /// reads like an inline auto-complete tray. Width: longest
+    /// visible entry + padding, capped at pane width. Height: a
+    /// row per visible suggestion + a small vertical pad. Returns
+    /// `None` when the cell metrics aren't ready (pre-first-frame)
+    /// or when no pane is focused.
+    pub(crate) fn suggestion_popup_rect(
+        &self,
+        popup: &crate::suggestion_popup::SuggestionPopup,
+    ) -> Option<crate::PaneRect> {
+        let state = self.state.as_ref()?;
+        let cell_w = state.text.cell_width();
+        let line_h = state.text.line_height();
+        if cell_w <= 0.0 || line_h <= 0.0 {
+            return None;
+        }
+        // The focused pane's rect is what we want — popup hugs its
+        // bottom-left corner. layout_active_tab returns rects in
+        // DFS-leaf order, matching `Tab::panes()`.
+        let tab = self.active_tab()?;
+        let focus_idx = tab.focused_index()?;
+        let rects = self.layout_active_tab();
+        let pane_rect = rects.get(focus_idx)?;
+        // Decide how many rows are visible: capped at config, AND
+        // by how many entries actually remain past `popup.scroll`.
+        let visible_rows = (self.history_popup_cfg.popup_rows as usize)
+            .min(popup.entries.len().saturating_sub(popup.scroll))
+            .max(1);
+        // Account for a possible "↓ N more" indicator at the
+        // bottom (one extra row when there are entries below the
+        // visible window).
+        let trailer = if popup.scroll + visible_rows < popup.entries.len() {
+            1
+        } else {
+            0
+        };
+        let height = (visible_rows + trailer) as f32 * line_h + 4.0;
+        // Width: longest visible text + padding for the cursor /
+        // count column. Clamp to pane width so a 70-char command
+        // doesn't push the popup off the right edge.
+        let max_text_cells = popup
+            .entries
+            .iter()
+            .skip(popup.scroll)
+            .take(visible_rows)
+            .map(|e| e.text.chars().count())
+            .max()
+            .unwrap_or(0);
+        let width = ((max_text_cells as f32) + 6.0) * cell_w;
+        let width = width.min(pane_rect.width).max(cell_w * 12.0);
+        // Anchor: pane bottom minus popup height, clamped to the
+        // pane top so a too-tall popup just sits flush at the top.
+        let top = (pane_rect.top + pane_rect.height - height).max(pane_rect.top);
+        Some(crate::PaneRect {
+            left: pane_rect.left,
+            top,
+            width,
+            height,
+        })
+    }
+
     /// Compute the outer rect inside which panes are laid out — below
     /// the header, with PAD on every edge, shrunk by the bottom-bar
     /// height when the bar reserves space.

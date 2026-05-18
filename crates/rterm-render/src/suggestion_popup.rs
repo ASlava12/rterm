@@ -20,7 +20,13 @@ use rterm_history::{History, Suggestion};
 use crate::HistoryPopupConfig;
 
 /// Current popup state, owned by `App`.
-#[derive(Debug)]
+///
+/// `Clone` is intentional: the renderer's overlay-build path snapshots
+/// the popup once at the top of a redraw frame so the `(spans, rect)`
+/// pair can survive the long-lived `state.as_mut()` borrow inside the
+/// render call. The clone is cheap — entries are `Suggestion` value
+/// types (`String + u32 + i64`).
+#[derive(Debug, Clone)]
 pub(crate) struct SuggestionPopup {
     /// Which pane is the source of the prefix. Closing the popup on
     /// a pane switch / tab switch reads this.

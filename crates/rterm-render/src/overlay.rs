@@ -249,6 +249,46 @@ impl App {
         Some((spans, rect))
     }
 
+    /// Build the per-row text spans for the suggestion popup. One
+    /// line per visible entry; the selected row (when present) is
+    /// rendered in an accent colour with a leading `▸`. A `↓ N
+    /// more` trailer appears when there are entries past the
+    /// visible window.
+    pub(crate) fn suggestion_popup_spans<'a>(
+        &self,
+        popup: &crate::suggestion_popup::SuggestionPopup,
+        storage: &'a mut Vec<String>,
+    ) -> Vec<(&'a str, [u8; 3], bool)> {
+        storage.clear();
+        let mut spans: Vec<(usize, [u8; 3], bool)> = Vec::new();
+        let fg = palette::default_fg();
+        let muted = fg.map(|c| c.saturating_sub(80));
+        let accent: [u8; 3] = [121, 192, 255];
+        let visible_rows = (self.history_popup_cfg.popup_rows as usize).max(1);
+        let end = (popup.scroll + visible_rows).min(popup.entries.len());
+        for i in popup.scroll..end {
+            let entry = &popup.entries[i];
+            let is_selected = popup.selected == Some(i);
+            let prefix = if is_selected { " ▸ " } else { "   " };
+            // Trailing newline so cosmic-text breaks the line for
+            // us; the overlay text buffer is single-block.
+            let line = format!("{prefix}{}\n", entry.text);
+            storage.push(line);
+            let color = if is_selected { accent } else { fg };
+            spans.push((storage.len() - 1, color, is_selected));
+        }
+        // Scroll indicator at the bottom — matches the
+        // palette-overlay convention so users learn the cue once.
+        if end < popup.entries.len() {
+            storage.push(format!("   ↓ {} more\n", popup.entries.len() - end));
+            spans.push((storage.len() - 1, muted, false));
+        }
+        spans
+            .into_iter()
+            .map(|(idx, c, b)| (storage[idx].as_str(), c, b))
+            .collect()
+    }
+
     /// Build the per-row text spans for the context menu (or app menu).
     pub(crate) fn context_menu_spans<'a>(
         &self,
