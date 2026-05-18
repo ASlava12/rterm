@@ -1,0 +1,181 @@
+name: release
+
+# Tag-triggered multi-platform release pipeline.
+#
+# Trigger: push a SemVer-shaped tag (e.g. `v0.0.2`, `v1.2.3-rc.1`).
+# Run: `git tag v0.0.2 && git push origin v0.0.2`.
+#
+# What it does:
+#   1. On every supported platform, run the lib tests + clippy as a
+#      release-quality gate (a tag should never publish on broken
+#      master). Then build a `--release` `rterm` binary.
+#   2. Package per-platform: tarball on Linux/macOS, zip on Windows,
+#      plus a WiX-generated MSI on Windows for double-click install.
+#   3. Upload everything to a GitHub Release that softprops/action-
+#      gh-release creates (or updates) for the tag. The Release is
+#      published as a draft if the tag is a pre-release (`-rc.1`,
+#      `-alpha.2`, etc.) — easier to amend before the public push.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            bin: rterm
+          - target: x86_64-apple-darwin
+            os: macos-13
+            archive: tar.gz
+            bin: rterm
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive: tar.gz
+            bin: rterm
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            bin: rterm.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.target }}
+
+      - name: Install Linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxcb1-dev \
+            pkg-config
+
+      - name: Pre-release sanity (clippy + lib tests)
+        run: |
+          cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
+          cargo test --workspace --lib --target ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release -p rterm-app --target ${{ matrix.target }}
+
+      # Tag minus the leading `v` — used as the on-disk version
+      # string inside packaged filenames. Set as a step output so
+      # later steps can reference it without re-parsing the ref.
+      - name: Derive version
+        id: ver
+        shell: bash
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Package (tarball)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          stage="rterm-${{ steps.ver.outputs.tag }}-${{ matrix.target }}"
+          mkdir -p "$stage"
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$stage/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$stage/" 2>/dev/null || true
+          tar -czf "$stage.tar.gz" "$stage"
+          echo "ARTIFACT=$stage.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $stage = "rterm-${{ steps.ver.outputs.tag }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" $stage
+          if (Test-Path README.md) { Copy-Item README.md $stage }
+          Compress-Archive -Path $stage -DestinationPath "$stage.zip"
+          "ARTIFACT=$stage.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # Windows-only: package an MSI installer for the double-click
+      # install flow. cargo-wix consumes `crates/rterm-app/wix/main.wxs`
+      # plus `[package.metadata.wix]` and emits an MSI next to the
+      # built binary. Skipped on Linux/macOS (deb / pkg are out of
+      # scope today).
+      - name: Install cargo-wix
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: cargo install cargo-wix --locked
+
+      - name: Build MSI
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $msi = "rterm-${{ steps.ver.outputs.version }}-x86_64.msi"
+          cargo wix --no-build --package rterm-app --target ${{ matrix.target }} `
+            --nocapture --output "target/wix/$msi"
+          "MSI_ARTIFACT=target/wix/$msi" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.target }}
+          path: ${{ env.ARTIFACT }}
+          if-no-files-found: error
+
+      - name: Upload MSI
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        uses: actions/upload-artifact@v4
+        with:
+          name: msi-${{ matrix.target }}
+          path: ${{ env.MSI_ARTIFACT }}
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Mark pre-release tags as drafts so the maintainer can
+          # polish the notes before flipping to public.
+          draft: ${{ contains(github.ref, '-') }}
+          prerelease: ${{ contains(github.ref, '-') }}
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.msi

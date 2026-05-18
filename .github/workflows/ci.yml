@@ -1,0 +1,67 @@
+name: ci
+
+# Runs on every push / PR to main. Catches breakage before tagging
+# triggers the release pipeline, which is much more expensive to
+# re-run.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Share caches across CI runs but bust on Cargo.lock changes;
+          # the heavy deps (winit/wgpu/glyphon/cosmic-text/mlua) take
+          # ~3 min to compile from cold.
+          shared-key: ci-${{ matrix.os }}
+
+      # winit + wgpu need a handful of dev headers on Linux. macOS /
+      # Windows pull the equivalents from their SDKs.
+      - name: Install Linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxcb1-dev \
+            pkg-config
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --lib
+
+      # Headless sanity check — exercises the PTY + parser pipeline
+      # without needing a display. Linux only because spawn'ing a
+      # shell on the macOS / Windows runners introduces shell-quoting
+      # noise that the smoke test doesn't account for.
+      - name: cargo run --smoke
+        if: runner.os == 'Linux'
+        run: cargo run -p rterm-app -- --smoke

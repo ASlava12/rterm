@@ -48,3 +48,11 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 [target.'cfg(windows)'.build-dependencies]
 ico = "0.3"
 winresource = "0.1"
+
+# cargo-wix metadata. Read by the CLI when invoked as
+# `cargo wix --package rterm-app ...` to point at the bundled
+# `wix/main.wxs` template. Path is relative to this Cargo.toml.
+[package.metadata.wix]
+name = "rterm"
+no-build = true
+output = "target/wix"

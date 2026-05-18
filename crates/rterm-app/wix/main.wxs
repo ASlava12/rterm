@@ -1,0 +1,113 @@
+<?xml version="1.0" encoding="windows-1252"?>
+<!--
+  WiX 3 installer source for rterm.
+
+  Consumed by `cargo-wix` (`cargo install cargo-wix`). The
+  `cargo wix` command substitutes `$(var.CargoProfileDir)`,
+  `$(var.Version)`, and friends from the surrounding crate
+  metadata before invoking `candle` + `light`.
+
+  Upgrade flow: a major-upgrade is detected automatically by the
+  fixed `UpgradeCode` GUID below. Installing v0.0.3 over v0.0.1
+  removes the old install and replaces with the new one without
+  user intervention.
+
+  Install layout: a single `Program Files\rterm\rterm.exe`. A
+  Start-menu shortcut points at it. Uninstall reaps both.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+    <Product
+        Id="*"
+        Name="rterm"
+        UpgradeCode="415b0cc8-1ce7-4a5c-aab7-2bf07fc2c9f7"
+        Manufacturer="rterm contributors"
+        Language="1033"
+        Codepage="1252"
+        Version="$(var.Version)">
+
+        <Package
+            Id="*"
+            Keywords="Installer"
+            Description="rterm — cross-platform GPU-accelerated terminal"
+            Manufacturer="rterm contributors"
+            InstallerVersion="450"
+            Languages="1033"
+            Compressed="yes"
+            InstallScope="perMachine"
+            SummaryCodepage="1252" />
+
+        <!--
+            Block reinstalling an older version on top of newer.
+            Otherwise, do a clean replace (RemoveExistingProducts
+            scheduled afterInstallInitialize is cargo-wix's default
+            major-upgrade mode).
+        -->
+        <MajorUpgrade
+            Schedule="afterInstallInitialize"
+            DowngradeErrorMessage="A newer version of rterm is already installed. Uninstall it before installing this older version." />
+
+        <Media Id="1" Cabinet="rterm.cab" EmbedCab="yes" DiskPrompt="CD-ROM #1" />
+        <Property Id="DiskPrompt" Value="rterm Installation" />
+
+        <Directory Id="TARGETDIR" Name="SourceDir">
+            <Directory Id="ProgramFiles64Folder" Name="PFiles">
+                <Directory Id="APPLICATIONFOLDER" Name="rterm">
+                    <Component Id="Binary" Guid="aab726ef-582f-41f7-92b6-00f10ceec124" Win64="yes">
+                        <File
+                            Id="exe0"
+                            Name="rterm.exe"
+                            DiskId="1"
+                            Source="$(var.CargoTargetBinDir)\rterm.exe"
+                            KeyPath="yes" />
+                    </Component>
+                </Directory>
+            </Directory>
+
+            <Directory Id="ProgramMenuFolder">
+                <Directory Id="ApplicationProgramsFolder" Name="rterm" />
+            </Directory>
+        </Directory>
+
+        <!--
+            Start-menu shortcut. RegistryValue acts as the
+            component's key path (MSI requires every component to
+            have one; `Shortcut` itself can't be a key path).
+        -->
+        <DirectoryRef Id="ApplicationProgramsFolder">
+            <Component Id="ApplicationShortcut" Guid="*">
+                <Shortcut
+                    Id="ApplicationStartMenuShortcut"
+                    Name="rterm"
+                    Description="rterm — cross-platform terminal emulator"
+                    Target="[APPLICATIONFOLDER]rterm.exe"
+                    WorkingDirectory="APPLICATIONFOLDER" />
+                <RemoveFolder Id="CleanUpShortCut" Directory="ApplicationProgramsFolder" On="uninstall" />
+                <RegistryValue
+                    Root="HKCU"
+                    Key="Software\rterm\Installed"
+                    Name="installed"
+                    Type="integer"
+                    Value="1"
+                    KeyPath="yes" />
+            </Component>
+        </DirectoryRef>
+
+        <Feature
+            Id="Binaries"
+            Title="rterm"
+            Description="rterm executable and Start-menu shortcut"
+            Level="1"
+            ConfigurableDirectory="APPLICATIONFOLDER"
+            AllowAdvertise="no"
+            Display="expand"
+            Absent="disallow">
+            <ComponentRef Id="Binary" />
+            <ComponentRef Id="ApplicationShortcut" />
+        </Feature>
+
+        <!-- Use the WiX-default install UI so the user sees a
+             Next / Install / Finish flow rather than a silent run. -->
+        <UIRef Id="WixUI_Minimal" />
+        <UIRef Id="WixUI_ErrorProgressText" />
+    </Product>
+</Wix>
