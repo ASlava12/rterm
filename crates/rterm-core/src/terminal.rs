@@ -1007,6 +1007,11 @@ impl Terminal {
             charset_g0: &mut self.charset_g0,
             charset_g1: &mut self.charset_g1,
             active_charset: &mut self.active_charset,
+            images: &mut self.images,
+            image_order: &mut self.image_order,
+            image_placements: &mut self.image_placements,
+            next_image_id: &mut self.next_image_id,
+            image_bytes_total: &mut self.image_bytes_total,
         };
         for &b in bytes {
             self.parser.advance(&mut perform, b);
@@ -1077,6 +1082,16 @@ struct TerminalPerform<'a> {
     charset_g0: &'a mut Charset,
     charset_g1: &'a mut Charset,
     active_charset: &'a mut u8,
+    // Inline-image store. Threaded into the Perform borrow so the
+    // iTerm2 OSC 1337;File= handler (and the upcoming Kitty APC G
+    // dispatcher) can register payloads and place them at the
+    // cursor without bouncing through a separate parse-then-apply
+    // step. RIS (`ESC c`) clears every field below.
+    images: &'a mut HashMap<u64, crate::image::Image>,
+    image_order: &'a mut VecDeque<u64>,
+    image_placements: &'a mut Vec<crate::image::ImagePlacement>,
+    next_image_id: &'a mut u64,
+    image_bytes_total: &'a mut usize,
 }
 
 impl<'a> TerminalPerform<'a> {
@@ -1135,6 +1150,198 @@ impl<'a> TerminalPerform<'a> {
                     .push_back(format!("\x1bP0+r{}\x1b\\", hex_name)),
             }
         }
+    }
+
+    /// Handle one `OSC 1337 ; File = <kv-list> : <base64-payload>`
+    /// payload. Best-effort: every failure mode (malformed kv,
+    /// undecodable base64, unknown format, oversized payload, store
+    /// full) silently drops the image — a misbehaving shell can't
+    /// kill the parser. `inline=0` (download, no display) is also
+    /// dropped since rterm has no file-save UX yet.
+    fn dispatch_iterm2_file(&mut self, body: &str) {
+        // `File=k=v;k=v:<base64>`. Base64 alphabet has no `:`, so
+        // splitting at the FIRST `:` cleanly separates params from
+        // payload.
+        let (params_str, payload_b64) = match body.split_once(':') {
+            Some(pair) => pair,
+            None => return,
+        };
+
+        let mut width_cells: Option<u16> = None;
+        let mut height_cells: Option<u16> = None;
+        let mut width_px: Option<u32> = None;
+        let mut height_px: Option<u32> = None;
+        let mut inline = true;
+        let mut declared_size: Option<usize> = None;
+        for kv in params_str.split(';') {
+            if kv.is_empty() {
+                continue;
+            }
+            let Some((k, v)) = kv.split_once('=') else { continue };
+            match k.trim() {
+                // `inline=0` is "save to disk" — no inline display.
+                // We have no save UX yet so drop silently.
+                "inline" => inline = v != "0",
+                // Sender-declared total payload size (after base64
+                // decode). Used as a pre-decode sanity gate.
+                "size" => declared_size = v.parse().ok(),
+                "width" => match parse_iterm2_dim(v) {
+                    Some(Iterm2Dim::Cells(n)) => width_cells = Some(n),
+                    Some(Iterm2Dim::Pixels(n)) => width_px = Some(n),
+                    _ => {}
+                },
+                "height" => match parse_iterm2_dim(v) {
+                    Some(Iterm2Dim::Cells(n)) => height_cells = Some(n),
+                    Some(Iterm2Dim::Pixels(n)) => height_px = Some(n),
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        if !inline {
+            return;
+        }
+        if let Some(declared) = declared_size {
+            if declared > IMAGE_MAX_PAYLOAD_BYTES {
+                return;
+            }
+        }
+
+        // Base64 decode. Whitespace strip first — some shells wrap
+        // long payloads with newlines that the terminal-side ANSI
+        // parser would otherwise have rejected anyway (OSC strings
+        // can't contain raw newlines), but defensive trim doesn't
+        // hurt.
+        use base64::Engine;
+        let trimmed: String = payload_b64
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let payload = match base64::engine::general_purpose::STANDARD
+            .decode(&trimmed)
+        {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        if payload.is_empty() || payload.len() > IMAGE_MAX_PAYLOAD_BYTES {
+            return;
+        }
+
+        // Format sniff. Only PNG / JPEG / GIF make it through —
+        // anything else is silently dropped.
+        let Some(format) = detect_image_format(&payload) else { return };
+
+        // Pixel-dim sniff for PNG when the sender didn't tell us.
+        // JPEG / GIF dim-sniff is out of scope for v1; those rely
+        // on the explicit `width=` / `height=` attribute and fall
+        // back to the conservative defaults below.
+        let (sniff_w, sniff_h) = if matches!(format, crate::image::ImageFormat::Png) {
+            sniff_png_dims(&payload).unwrap_or((0, 0))
+        } else {
+            (0, 0)
+        };
+        let final_width_px = width_px.unwrap_or(sniff_w);
+        let final_height_px = height_px.unwrap_or(sniff_h);
+
+        // Cell footprint. iTerm2's `width=Ncells` / `height=Ncells`
+        // take precedence — sender explicitly asked for that
+        // size. Otherwise estimate from pixels using 8px / col
+        // and 16px / row (typical 13pt monospace metrics). The
+        // renderer can refine at draw time when it has the real
+        // metrics; the parser-side estimate is what the cursor
+        // advances by.
+        let cols = width_cells
+            .unwrap_or_else(|| {
+                ((final_width_px as f32 / 8.0).ceil().max(1.0) as u32).min(200) as u16
+            })
+            .max(1);
+        let rows = height_cells
+            .unwrap_or_else(|| {
+                ((final_height_px as f32 / 16.0).ceil().max(1.0) as u32).min(80) as u16
+            })
+            .max(1);
+
+        // Absolute logical row = scrollback length + grid row
+        // (when on the primary screen). Alt screen has no
+        // scrollback, so abs_row collapses to grid_row.
+        let on_alt = *self.active == ALT;
+        let sb_len = if on_alt { 0 } else { self.scrollback.len() };
+        let abs_row = sb_len as i64 + self.cursor.row as i64;
+        let col = self.cursor.col;
+
+        // Register the payload. Eviction logic mirrors
+        // `Terminal::register_image` exactly — kept inline rather
+        // than calling through `Terminal` because the Perform
+        // borrow can't go via `&mut self.terminal`.
+        let Some(id) = self.register_image_inline(
+            format,
+            final_width_px,
+            final_height_px,
+            payload,
+        ) else {
+            return;
+        };
+        self.image_placements.push(crate::image::ImagePlacement {
+            image_id: id,
+            abs_row,
+            col,
+            rows,
+            cols,
+            width_px: final_width_px,
+            height_px: final_height_px,
+            placement_id: 0,
+        });
+
+        // Advance the cursor past the image so subsequent text
+        // doesn't paint over it. Matches iTerm2 / WezTerm
+        // behaviour. `linefeed` handles the scroll-region rules
+        // and OSC 133 plumbing the same way a shell-emitted '\n'
+        // would.
+        for _ in 0..rows {
+            self.linefeed();
+        }
+    }
+
+    /// FIFO-evicting variant of `Terminal::register_image` that
+    /// operates on the borrowed Perform fields. Kept in lock-step
+    /// with its sibling — any cap or eviction change has to land
+    /// in both spots.
+    fn register_image_inline(
+        &mut self,
+        format: crate::image::ImageFormat,
+        width_px: u32,
+        height_px: u32,
+        data: Vec<u8>,
+    ) -> Option<u64> {
+        if data.len() > IMAGE_MAX_PAYLOAD_BYTES {
+            return None;
+        }
+        if data.len() > IMAGE_BYTES_CAP {
+            return None;
+        }
+        while !self.image_order.is_empty()
+            && (self.image_order.len() >= IMAGE_STORE_CAP
+                || *self.image_bytes_total + data.len() > IMAGE_BYTES_CAP)
+        {
+            if let Some(victim) = self.image_order.pop_front() {
+                if let Some(img) = self.images.remove(&victim) {
+                    *self.image_bytes_total =
+                        self.image_bytes_total.saturating_sub(img.data.len());
+                }
+                self.image_placements.retain(|p| p.image_id != victim);
+            } else {
+                break;
+            }
+        }
+        let id = *self.next_image_id;
+        *self.next_image_id = self.next_image_id.wrapping_add(1).max(1);
+        *self.image_bytes_total += data.len();
+        self.image_order.push_back(id);
+        self.images.insert(
+            id,
+            crate::image::Image { id, format, width_px, height_px, data },
+        );
+        Some(id)
     }
 
     fn size(&self) -> Size {
@@ -1861,6 +2068,95 @@ fn parse_hex_hash(s: &str) -> Option<[u8; 3]> {
         ]),
         _ => None,
     }
+}
+
+/// Parsed `width=` / `height=` value from an iTerm2 `OSC 1337
+/// ;File=` payload. iTerm2's full unit set is
+/// `N | Npx | Ncells | Npercent | auto`; we materially support
+/// cells and pixels (percent / auto fall back to the caller's
+/// pixel-dim estimate).
+enum Iterm2Dim {
+    Cells(u16),
+    Pixels(u32),
+    /// Recognised but explicitly unspec (`auto` / `Npercent`) —
+    /// caller falls back to the PNG-header sniff.
+    Auto,
+}
+
+fn parse_iterm2_dim(v: &str) -> Option<Iterm2Dim> {
+    let v = v.trim();
+    if v.is_empty() {
+        return None;
+    }
+    if v.eq_ignore_ascii_case("auto") {
+        return Some(Iterm2Dim::Auto);
+    }
+    // Trailing-suffix detection. Walk back from the end while we
+    // see ASCII letters — that's the unit token. The numeric head
+    // is everything before it.
+    let bytes = v.as_bytes();
+    let mut split = bytes.len();
+    // The unit suffix can be alphabetic ("cells", "px", "percent")
+    // or the lone `%` glyph some encoders emit instead of
+    // `percent`. Walk back over both so the numeric head is
+    // cleanly separated.
+    while split > 0
+        && (bytes[split - 1].is_ascii_alphabetic() || bytes[split - 1] == b'%')
+    {
+        split -= 1;
+    }
+    let (num_str, unit) = v.split_at(split);
+    let num_str = num_str.trim();
+    let n: u32 = num_str.parse().ok()?;
+    let unit_lower = unit.to_ascii_lowercase();
+    match unit_lower.as_str() {
+        // Bare number → cells (iTerm2's documented default for
+        // `width=` / `height=`).
+        "" | "cells" | "ch" => Some(Iterm2Dim::Cells(n.min(u16::MAX as u32) as u16)),
+        "px" => Some(Iterm2Dim::Pixels(n)),
+        "percent" | "%" => Some(Iterm2Dim::Auto),
+        _ => None,
+    }
+}
+
+/// Identify a known image format by its magic-byte prefix. Returns
+/// `None` for any payload that doesn't match a supported encoding;
+/// the caller drops the image rather than guessing.
+fn detect_image_format(bytes: &[u8]) -> Option<crate::image::ImageFormat> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some(crate::image::ImageFormat::Png);
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some(crate::image::ImageFormat::Jpeg);
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some(crate::image::ImageFormat::Gif);
+    }
+    None
+}
+
+/// Peek the IHDR chunk of a PNG file and pull `(width, height)`.
+/// `None` when the buffer is too short, doesn't start with the PNG
+/// magic, or has a missing / displaced IHDR. Doesn't decode the
+/// pixel data — used at parse time to estimate cell footprint
+/// before the renderer ever touches the bytes.
+fn sniff_png_dims(bytes: &[u8]) -> Option<(u32, u32)> {
+    // PNG layout: 8 bytes magic, then chunks. First chunk MUST be
+    // IHDR (4 bytes length, 4 bytes "IHDR" tag, then payload). The
+    // IHDR payload starts with 4 bytes width + 4 bytes height in
+    // big-endian.
+    if bytes.len() < 24 {
+        return None;
+    }
+    if &bytes[0..8] != [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A].as_slice() {
+        return None;
+    }
+    if &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    let w = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+    let h = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+    Some((w, h))
 }
 
 /// Decode `%XX` byte escapes in a URI path. Invalid escapes are left as-is.
@@ -2615,6 +2911,18 @@ impl<'a> Perform for TerminalPerform<'a> {
                     // the `notification` plugin event picks it up
                     // uniformly.
                     self.push_notification(msg.to_string());
+                } else if let Some(body) = raw.strip_prefix("File=") {
+                    // iTerm2 inline-image protocol. Format:
+                    //   `ESC ] 1337 ; File = k1=v1 ; k2=v2 : <base64> ST`
+                    // The semicolons inside `File=` were re-joined
+                    // above, so `body` is exactly the substring
+                    // after `File=`.
+                    //
+                    // Defensive: a malformed payload should NOT
+                    // panic the parser — just drop the image and
+                    // let the shell move on. The whole branch is
+                    // best-effort.
+                    self.dispatch_iterm2_file(body);
                 }
             }
             // OSC 8: hyperlink. Format: ESC ] 8 ; params ; URI ST
@@ -3211,6 +3519,16 @@ impl<'a> Perform for TerminalPerform<'a> {
                 self.pending_lines.clear();
                 self.pending_command_finishes.clear();
                 *self.last_command_start = None;
+                // RIS wipes inline images too — their cell
+                // footprints just got obliterated by the
+                // grid clear, so any surviving placement
+                // would reference content that no longer
+                // exists.
+                self.images.clear();
+                self.image_order.clear();
+                self.image_placements.clear();
+                *self.next_image_id = 1;
+                *self.image_bytes_total = 0;
             }
             _ => {}
         }
@@ -5835,6 +6153,133 @@ mod tests {
         assert!(t
             .register_image(crate::image::ImageFormat::Rgba8, 1, 1, oversize)
             .is_none());
+    }
+
+    /// Build a tiny valid PNG (1×1 RGBA, opaque red) via a
+    /// minimal hand-crafted byte sequence — saves pulling in a
+    /// PNG encoder just to seed test payloads.
+    fn red_pixel_png() -> Vec<u8> {
+        // Magic + IHDR(1×1, 8-bit, RGBA, no interlace) + IDAT
+        // (one filtered scanline `\0 FF 00 00 FF`, deflate-encoded) + IEND.
+        // Pre-computed from a real encoder so CRCs match and a
+        // strict decoder would accept it. Used only as a header
+        // for the format-sniff path; we don't decode pixels here.
+        vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+            0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+            0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+            0x89, 0x00, 0x00, 0x00, 0x0F, 0x49, 0x44, 0x41,
+            0x54, 0x78, 0x9C, 0x62, 0xFC, 0xFF, 0xFF, 0x3F,
+            0x03, 0x03, 0x00, 0x00, 0x07, 0x02, 0x02, 0x9D,
+            0xFE, 0x66, 0xC3, 0x00, 0x00, 0x00, 0x00, 0x49,
+            0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ]
+    }
+
+    fn iterm2_inline_png_envelope(b64: &str) -> Vec<u8> {
+        let mut v = Vec::with_capacity(b64.len() + 32);
+        v.extend_from_slice(b"\x1b]1337;File=inline=1;width=4;height=2:");
+        v.extend_from_slice(b64.as_bytes());
+        v.extend_from_slice(b"\x07");
+        v
+    }
+
+    #[test]
+    fn iterm2_file_inline_registers_image_and_advances_cursor() {
+        use base64::Engine;
+        let mut t = term(80, 24);
+        let png = red_pixel_png();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        let stream = iterm2_inline_png_envelope(&b64);
+        t.advance(&stream);
+        let placements = t.image_placements();
+        assert_eq!(placements.len(), 1, "one placement was registered");
+        let p = placements[0];
+        assert_eq!(p.cols, 4, "width=4 cells honoured");
+        assert_eq!(p.rows, 2, "height=2 cells honoured");
+        // Cursor moved down `rows` lines past the image.
+        assert_eq!(t.cursor().row, 2, "cursor advanced past image rows");
+        // Image was registered with the sniffed PNG dimensions.
+        let img = t.image(p.image_id).expect("image stored");
+        assert_eq!((img.width_px, img.height_px), (1, 1), "PNG dims sniffed");
+        assert!(matches!(img.format, crate::image::ImageFormat::Png));
+    }
+
+    #[test]
+    fn iterm2_file_with_inline_zero_is_silently_dropped() {
+        use base64::Engine;
+        let mut t = term(80, 24);
+        let png = red_pixel_png();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        let mut stream = Vec::new();
+        stream.extend_from_slice(b"\x1b]1337;File=inline=0;width=4;height=2:");
+        stream.extend_from_slice(b64.as_bytes());
+        stream.extend_from_slice(b"\x07");
+        t.advance(&stream);
+        assert!(t.image_placements().is_empty(), "non-inline drops silently");
+    }
+
+    #[test]
+    fn iterm2_file_with_garbage_base64_does_not_crash() {
+        let mut t = term(80, 24);
+        // Mangle the payload — the parser must NOT panic.
+        let stream = b"\x1b]1337;File=inline=1;width=4;height=2:not-real-base64===\x07";
+        t.advance(stream);
+        assert!(t.image_placements().is_empty());
+    }
+
+    #[test]
+    fn iterm2_file_with_non_image_payload_is_dropped() {
+        use base64::Engine;
+        let mut t = term(80, 24);
+        // Valid base64 that decodes to something that isn't a
+        // PNG / JPEG / GIF.
+        let b64 = base64::engine::general_purpose::STANDARD
+            .encode(b"hello world, not an image");
+        let mut stream = Vec::new();
+        stream.extend_from_slice(b"\x1b]1337;File=inline=1;width=4;height=2:");
+        stream.extend_from_slice(b64.as_bytes());
+        stream.extend_from_slice(b"\x07");
+        t.advance(&stream);
+        assert!(
+            t.image_placements().is_empty(),
+            "unrecognised format dropped silently"
+        );
+    }
+
+    #[test]
+    fn ris_clears_all_images() {
+        use base64::Engine;
+        let mut t = term(80, 24);
+        let png = red_pixel_png();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        let stream = iterm2_inline_png_envelope(&b64);
+        t.advance(&stream);
+        assert_eq!(t.image_placements().len(), 1);
+        t.advance(b"\x1bc"); // RIS
+        assert!(t.image_placements().is_empty(), "RIS dropped placements");
+    }
+
+    #[test]
+    fn parse_iterm2_dim_understands_cells_pixels_and_auto() {
+        assert!(matches!(parse_iterm2_dim("10"), Some(Iterm2Dim::Cells(10))));
+        assert!(matches!(parse_iterm2_dim("10cells"), Some(Iterm2Dim::Cells(10))));
+        assert!(matches!(parse_iterm2_dim("10px"), Some(Iterm2Dim::Pixels(10))));
+        assert!(matches!(parse_iterm2_dim("auto"), Some(Iterm2Dim::Auto)));
+        assert!(matches!(parse_iterm2_dim("50%"), Some(Iterm2Dim::Auto)));
+        assert!(parse_iterm2_dim("").is_none());
+        assert!(parse_iterm2_dim("garbage").is_none());
+    }
+
+    #[test]
+    fn sniff_png_dims_extracts_width_height_from_header() {
+        let png = red_pixel_png();
+        assert_eq!(sniff_png_dims(&png), Some((1, 1)));
+        // Wrong magic → None.
+        assert_eq!(sniff_png_dims(b"not a png"), None);
+        // Too short → None.
+        assert_eq!(sniff_png_dims(&png[..16]), None);
     }
 
     #[test]

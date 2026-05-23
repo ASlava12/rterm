@@ -13,3 +13,9 @@ bitflags = { workspace = true }
 unicode-width = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# base64 for the iTerm2 `OSC 1337 ;File=` and Kitty `APC G f=100`
+# image payloads. Both protocols transport binary image bytes
+# (PNG / JPEG / GIF / raw RGBA) as base64 over the control-string
+# wire. Decoder lives here so the parser can sniff the image
+# header for pixel dimensions before handing off to the renderer.
+base64 = { workspace = true }
