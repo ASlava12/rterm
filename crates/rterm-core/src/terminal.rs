@@ -340,6 +340,20 @@ pub struct Terminal {
     charset_g1: Charset,
     /// Which of {G0, G1} is currently active. 0 = G0, 1 = G1.
     active_charset: u8,
+    /// APC ("Application Program Command", `ESC _ ... ESC \` /
+    /// `ESC _ ... BEL`) capture state. The `vte` crate silently
+    /// discards APC bytes in its `SosPmApcString` state — there's
+    /// no `apc_dispatch` callback to hook. We pre-scan the input
+    /// stream for APC and divert the body to `dispatch_apc` here,
+    /// while non-APC bytes still flow through to the vte parser
+    /// untouched. Required for the Kitty graphics protocol
+    /// (`APC G ...`); will be expanded with the actual handler in
+    /// the next commit.
+    apc_state: ApcState,
+    /// Accumulated payload bytes inside an active APC string.
+    /// Capped by [`APC_BUF_CAP`] so a malformed shell can't grow
+    /// the buffer without bound.
+    apc_buf: Vec<u8>,
     /// Inline images registered by the iTerm2 `OSC 1337 ;File=` and
     /// Kitty `APC G` protocols. Keyed by a monotonically-incremented
     /// id; the matching [`ImagePlacement`]s in `image_placements`
@@ -405,6 +419,34 @@ const IMAGE_BYTES_CAP: usize = 64 * 1024 * 1024;
 /// but smaller than `IMAGE_BYTES_CAP` itself so a single
 /// pathological frame can't blow past the budget on its own.
 pub const IMAGE_MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+
+/// Cap on the in-flight `apc_buf` while accumulating an APC
+/// payload. Sized to match [`IMAGE_MAX_PAYLOAD_BYTES`] so the
+/// Kitty graphics protocol (the only real-world APC consumer
+/// rterm targets) can deliver a single full-resolution frame in
+/// one APC sequence. A misbehaving shell that streams past this
+/// limit gets the remainder dropped — the dispatched payload is
+/// truncated, which the Kitty handler treats as a decode error.
+const APC_BUF_CAP: usize = IMAGE_MAX_PAYLOAD_BYTES;
+
+/// APC ("Application Program Command", `ESC _`) capture state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ApcState {
+    /// Normal pass-through: bytes flow to vte.
+    #[default]
+    Ground,
+    /// We just saw `ESC` and are deciding whether it's the start
+    /// of an APC string (next byte = `_`) or a regular escape
+    /// (forward both bytes to vte unchanged).
+    AfterEsc,
+    /// Inside an APC payload — accumulating into `apc_buf`.
+    InApc,
+    /// Saw `ESC` inside an APC payload. Either this is an ST
+    /// terminator (next byte = `\\`, the standard "String
+    /// Terminator" pairing) or the start of a NEW escape that
+    /// also terminates the APC per ECMA-48.
+    AfterEscInApc,
+}
 
 /// Pending palette change emitted by OSC 4 / 10 / 11 SET. Drained by the
 /// App and folded into the renderer's live `Palette`.
@@ -518,6 +560,8 @@ impl Terminal {
             image_placements: Vec::new(),
             next_image_id: 1,
             image_bytes_total: 0,
+            apc_state: ApcState::default(),
+            apc_buf: Vec::new(),
         }
     }
 
@@ -951,6 +995,120 @@ impl Terminal {
     }
 
     pub fn advance(&mut self, bytes: &[u8]) {
+        // Pre-parse APC sequences (`ESC _ ... ESC \` / `ESC _ ... BEL`)
+        // out of the byte stream before vte sees them — vte silently
+        // discards APC bodies in its `SosPmApcString` state with no
+        // dispatch callback. Non-APC bytes flow through to vte in the
+        // exact order they arrived (interleaved 1:1 with the APC
+        // dispatches so the cursor is at the right grid position when
+        // an image lands). Used by the Kitty graphics protocol; the
+        // actual `G ...` decoder lands in the next commit and lives
+        // behind `Terminal::dispatch_apc`.
+        let mut vte_buf: Vec<u8> = Vec::with_capacity(bytes.len());
+        for &b in bytes {
+            match self.apc_state {
+                ApcState::Ground => {
+                    if b == 0x1B {
+                        self.apc_state = ApcState::AfterEsc;
+                    } else {
+                        vte_buf.push(b);
+                    }
+                }
+                ApcState::AfterEsc => {
+                    if b == b'_' {
+                        // ESC `_` — APC start. The held ESC and `_`
+                        // are NOT forwarded to vte; the body that
+                        // follows is ours.
+                        self.apc_buf.clear();
+                        self.apc_state = ApcState::InApc;
+                    } else {
+                        // Held ESC was the start of some other
+                        // escape sequence. Replay both bytes into
+                        // the vte stream so its own state machine
+                        // sees them.
+                        vte_buf.push(0x1B);
+                        vte_buf.push(b);
+                        self.apc_state = ApcState::Ground;
+                    }
+                }
+                ApcState::InApc => {
+                    if b == 0x07 {
+                        // BEL terminator. Flush everything queued
+                        // for vte first so the APC dispatches at
+                        // the grid position the shell intended.
+                        self.feed_vte(&vte_buf);
+                        vte_buf.clear();
+                        let payload = std::mem::take(&mut self.apc_buf);
+                        self.dispatch_apc(&payload);
+                        self.apc_state = ApcState::Ground;
+                    } else if b == 0x1B {
+                        self.apc_state = ApcState::AfterEscInApc;
+                    } else if self.apc_buf.len() < APC_BUF_CAP {
+                        self.apc_buf.push(b);
+                    }
+                    // Over-cap bytes are silently dropped — the
+                    // downstream Kitty handler will see a
+                    // truncated payload and treat it as a decode
+                    // error.
+                }
+                ApcState::AfterEscInApc => {
+                    // APC ended — either via ST (ESC `\\`) or the
+                    // start of a new escape. Flush vte buffer +
+                    // dispatch the completed payload BEFORE
+                    // forwarding the new ESC sequence.
+                    self.feed_vte(&vte_buf);
+                    vte_buf.clear();
+                    let payload = std::mem::take(&mut self.apc_buf);
+                    self.dispatch_apc(&payload);
+                    if b == b'\\' {
+                        // Standard ST — both bytes are consumed by
+                        // the APC terminator.
+                        self.apc_state = ApcState::Ground;
+                    } else {
+                        // ECMA-48 says any ESC inside a string
+                        // implicitly ends the string and starts a
+                        // new escape. Forward ESC + this byte to
+                        // vte.
+                        vte_buf.push(0x1B);
+                        vte_buf.push(b);
+                        self.apc_state = ApcState::Ground;
+                    }
+                }
+            }
+        }
+        // Final flush of any trailing non-APC bytes.
+        self.feed_vte(&vte_buf);
+        // Bound `osc_responses` post-batch. A shell flooding queries
+        // between renderer drains would otherwise grow the VecDeque
+        // unbounded; oldest reply pops first (the app cares about the
+        // freshest response).
+        while self.osc_responses.len() > OSC_RESPONSES_CAP {
+            self.osc_responses.pop_front();
+        }
+    }
+
+    /// Best-effort handler for one complete APC payload (the bytes
+    /// between `ESC _` and the terminator). Empty body is silently
+    /// dropped. Currently a stub — the next commit dispatches
+    /// payloads that start with `G` to the Kitty graphics protocol.
+    fn dispatch_apc(&mut self, payload: &[u8]) {
+        if payload.is_empty() {
+            return;
+        }
+        tracing::debug!(
+            len = payload.len(),
+            head = ?std::str::from_utf8(&payload[..payload.len().min(32)]),
+            "APC payload (no handler yet)",
+        );
+    }
+
+    /// Feed a chunk of non-APC bytes through the vte parser. Splits
+    /// out from `advance` so the APC pre-parser can interleave
+    /// `feed_vte` / `dispatch_apc` calls in input order.
+    fn feed_vte(&mut self, buf: &[u8]) {
+        if buf.is_empty() {
+            return;
+        }
         let mut perform = TerminalPerform {
             grids: &mut self.grids,
             active: &mut self.active,
@@ -1013,15 +1171,8 @@ impl Terminal {
             next_image_id: &mut self.next_image_id,
             image_bytes_total: &mut self.image_bytes_total,
         };
-        for &b in bytes {
+        for &b in buf {
             self.parser.advance(&mut perform, b);
-        }
-        // Bound `osc_responses` post-batch. A shell flooding queries
-        // between renderer drains would otherwise grow the VecDeque
-        // unbounded; oldest reply pops first (the app cares about the
-        // freshest response).
-        while self.osc_responses.len() > OSC_RESPONSES_CAP {
-            self.osc_responses.pop_front();
         }
     }
 }
@@ -6280,6 +6431,63 @@ mod tests {
         assert_eq!(sniff_png_dims(b"not a png"), None);
         // Too short → None.
         assert_eq!(sniff_png_dims(&png[..16]), None);
+    }
+
+    #[test]
+    fn apc_st_terminator_routes_around_vte() {
+        // ESC _ <body> ESC \ — body should NOT reach the grid.
+        // The terminator both ends APC and consumes the ESC + \\.
+        let mut t = term(80, 24);
+        t.advance(b"\x1b_Gpayload-bytes\x1b\\hello");
+        // The `hello` after APC must land in the grid normally.
+        assert_eq!(row_text(&t, 0).trim_end_matches(' '), "hello");
+    }
+
+    #[test]
+    fn apc_bel_terminator_also_works() {
+        let mut t = term(80, 24);
+        t.advance(b"\x1b_GpayloadX\x07after");
+        assert_eq!(row_text(&t, 0).trim_end_matches(' '), "after");
+    }
+
+    #[test]
+    fn apc_state_persists_across_advance_calls() {
+        // A single APC payload split across two writes shouldn't
+        // corrupt either the grid or vte state.
+        let mut t = term(80, 24);
+        t.advance(b"\x1b_Gpart1");
+        t.advance(b"-part2\x1b\\done");
+        assert_eq!(row_text(&t, 0).trim_end_matches(' '), "done");
+    }
+
+    #[test]
+    fn esc_not_followed_by_underscore_passes_through_to_vte() {
+        // ESC c is RIS (full reset). The pre-parser must NOT swallow
+        // it — it has to forward the ESC + c so vte runs RIS.
+        let mut t = term(80, 24);
+        t.advance(b"some text");
+        t.advance(b"\x1bc");
+        // RIS homes the cursor and clears the grid.
+        assert_eq!(t.cursor().row, 0);
+        assert_eq!(t.cursor().col, 0);
+        assert_eq!(row_text(&t, 0).trim_end_matches(' '), "");
+    }
+
+    #[test]
+    fn apc_payload_larger_than_cap_is_truncated_safely() {
+        // Stream past the buf cap — must not panic; subsequent
+        // bytes still land in the grid.
+        let mut t = term(80, 24);
+        let mut stream = Vec::new();
+        stream.extend_from_slice(b"\x1b_G");
+        // 17 MiB of `x` — well past APC_BUF_CAP (16 MiB).
+        // Trim to a smaller value for test speed while still
+        // exercising the cap path; 2 MiB is plenty to hit a
+        // future cap regression even if the constant shrinks.
+        stream.extend(std::iter::repeat(b'x').take(2 * 1024 * 1024));
+        stream.extend_from_slice(b"\x1b\\trailing");
+        t.advance(&stream);
+        assert_eq!(row_text(&t, 0).trim_end_matches(' '), "trailing");
     }
 
     #[test]
