@@ -50,13 +50,10 @@ When `target/` exceeds ~5 GB run `cargo clean` at an iteration boundary. The cac
 If a session opens with just "продолжай" (continue), read this file plus `MEMORY.md` plus the most recent `git log`-equivalent (the project isn't a git repo by default — check timestamps), then pick the next pending item from the in-flight TODO. Common next steps documented in commits or in `README.md` Roadmap.
 
 Typical next chunks at this stage:
-1. Selection anchored to absolute logical lines (currently viewport-relative — drifts when scrollback shifts)
-2. Sixel / ReGIS graphics decoding
-3. Ghost label TEXT following the cursor during tab drag-reorder (the
-   chip background already follows via `tab_bar_quads`'s ghost branch,
-   but the label glyphs stay at the original slot position — a separate
-   ghost text-buffer rendered at `cursor.x - press_offset` would close
-   the gap).
+1. Sixel / ReGIS graphics decoding — biggest remaining roadmap item.
+   Needs DCS-parser extension in rterm-core, an image decoder + GPU
+   image-pass in rterm-render, and cell-grid alignment so panes
+   reflow without stretching the bitmap.
 
 ## Conventions
 
