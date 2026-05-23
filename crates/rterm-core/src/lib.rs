@@ -5,11 +5,13 @@
 
 pub mod color;
 pub mod grid;
+pub mod image;
 pub mod parser;
 pub mod plugin;
 pub mod terminal;
 
 pub use color::{Color, NamedColor, DEFAULT_BG, DEFAULT_FG, DEFAULT_NAMED_PALETTE};
 pub use grid::{Cell, CellAttrs, Grid, Position, Size};
+pub use image::{Image, ImageFormat, ImagePlacement};
 pub use plugin::PluginCmd;
 pub use terminal::{is_safe_url, CommandFinish, CursorShape, MouseTracking, PaletteUpdate, Terminal};

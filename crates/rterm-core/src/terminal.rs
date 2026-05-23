@@ -340,6 +340,29 @@ pub struct Terminal {
     charset_g1: Charset,
     /// Which of {G0, G1} is currently active. 0 = G0, 1 = G1.
     active_charset: u8,
+    /// Inline images registered by the iTerm2 `OSC 1337 ;File=` and
+    /// Kitty `APC G` protocols. Keyed by a monotonically-incremented
+    /// id; the matching [`ImagePlacement`]s in `image_placements`
+    /// reference back via `image_id`. Capped at `IMAGE_STORE_CAP`
+    /// entries so a malicious or buggy shell can't pin unbounded
+    /// memory with a flood of inline blobs.
+    images: HashMap<u64, crate::image::Image>,
+    /// Insertion order of `images` — used to evict the oldest entry
+    /// (FIFO) when the store hits its cap, mirroring how
+    /// `hyperlink_order` keeps the hyperlink table bounded.
+    image_order: VecDeque<u64>,
+    /// Active placements — image-rect anchors in absolute
+    /// (scrollback ++ grid) coordinates. Multiple placements can
+    /// reference the same `image_id` (Kitty's virtual placements).
+    /// Pruned by `evict_placements_at_cell` whenever a print /
+    /// erase touches an image's footprint.
+    image_placements: Vec<crate::image::ImagePlacement>,
+    /// Monotonic id source for new images.
+    next_image_id: u64,
+    /// Running byte total across `images.data` for the
+    /// `IMAGE_BYTES_CAP` quota — recomputing each call would be
+    /// O(n) per insert.
+    image_bytes_total: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -365,6 +388,23 @@ const HYPERLINK_CAP: usize = 4096;
 /// — a slow but real DoS. 1 MiB matches "real URI loads are well
 /// under this" while still blunting the worst case.
 const HYPERLINK_TOTAL_BYTES_CAP: usize = 1024 * 1024;
+/// Hard ceiling on the number of distinct images held in the
+/// inline-image store. iTerm2 / Kitty don't enforce any limit on
+/// the wire; a shell that streams thousands of tiny PNGs would
+/// otherwise pin unbounded RAM. 256 frames is plenty for typical
+/// `chafa` / matplotlib / yazi-preview workloads (those reuse
+/// placements or evict via the protocols' own delete actions).
+const IMAGE_STORE_CAP: usize = 256;
+/// Running-byte ceiling across all stored images' `data` fields.
+/// 64 MiB matches "a couple of hi-res screenshots in scrollback"
+/// without letting a malicious payload trigger an OOM.
+const IMAGE_BYTES_CAP: usize = 64 * 1024 * 1024;
+/// Hard ceiling on the size of a single image payload, in bytes.
+/// Larger than `IMAGE_BYTES_CAP / IMAGE_STORE_CAP` so the global
+/// cap can still hold a few normal images alongside one big one,
+/// but smaller than `IMAGE_BYTES_CAP` itself so a single
+/// pathological frame can't blow past the budget on its own.
+pub const IMAGE_MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
 /// Pending palette change emitted by OSC 4 / 10 / 11 SET. Drained by the
 /// App and folded into the renderer's live `Palette`.
@@ -473,7 +513,111 @@ impl Terminal {
             charset_g0: Charset::Ascii,
             charset_g1: Charset::Ascii,
             active_charset: 0,
+            images: HashMap::new(),
+            image_order: VecDeque::new(),
+            image_placements: Vec::new(),
+            next_image_id: 1,
+            image_bytes_total: 0,
         }
+    }
+
+    /// Register a new image payload. Returns its assigned id, or
+    /// `None` when the payload would push the store past
+    /// [`IMAGE_MAX_PAYLOAD_BYTES`] / [`IMAGE_BYTES_CAP`] /
+    /// [`IMAGE_STORE_CAP`] even after evicting the oldest entries
+    /// (e.g. one image bigger than the global byte budget).
+    /// Caller (the iTerm2 / Kitty parsers) provides the
+    /// pre-decoded payload, format hint, and pixel dimensions.
+    pub fn register_image(
+        &mut self,
+        format: crate::image::ImageFormat,
+        width_px: u32,
+        height_px: u32,
+        data: Vec<u8>,
+    ) -> Option<u64> {
+        if data.len() > IMAGE_MAX_PAYLOAD_BYTES {
+            return None;
+        }
+        if data.len() > IMAGE_BYTES_CAP {
+            return None;
+        }
+        // Evict FIFO until the new payload fits, both by count and
+        // by bytes. Drops placements that reference the evicted
+        // image so the renderer doesn't deref a stale id next frame.
+        while !self.image_order.is_empty()
+            && (self.image_order.len() >= IMAGE_STORE_CAP
+                || self.image_bytes_total + data.len() > IMAGE_BYTES_CAP)
+        {
+            if let Some(victim) = self.image_order.pop_front() {
+                if let Some(img) = self.images.remove(&victim) {
+                    self.image_bytes_total =
+                        self.image_bytes_total.saturating_sub(img.data.len());
+                }
+                self.image_placements.retain(|p| p.image_id != victim);
+            } else {
+                break;
+            }
+        }
+        let id = self.next_image_id;
+        self.next_image_id = self.next_image_id.wrapping_add(1).max(1);
+        self.image_bytes_total += data.len();
+        self.image_order.push_back(id);
+        self.images.insert(
+            id,
+            crate::image::Image { id, format, width_px, height_px, data },
+        );
+        Some(id)
+    }
+
+    /// Attach an image placement to the current frame. The renderer
+    /// will draw the image at `abs_row × col` covering `rows × cols`
+    /// cells. Silently no-ops when `image_id` doesn't match a
+    /// registered image (e.g. one that was just FIFO-evicted).
+    pub fn place_image(&mut self, placement: crate::image::ImagePlacement) {
+        if !self.images.contains_key(&placement.image_id) {
+            return;
+        }
+        if placement.rows == 0 || placement.cols == 0 {
+            return;
+        }
+        self.image_placements.push(placement);
+    }
+
+    /// Snapshot of every active placement. The renderer iterates
+    /// this each frame; the borrow is read-only so no copy unless
+    /// the caller needs to extend its own lifetime past the frame.
+    pub fn image_placements(&self) -> &[crate::image::ImagePlacement] {
+        &self.image_placements
+    }
+
+    /// Look up an image's raw bytes + format by id. Returns `None`
+    /// for ids that were FIFO-evicted or never registered. Used by
+    /// the renderer to upload to the GPU on first draw.
+    pub fn image(&self, id: u64) -> Option<&crate::image::Image> {
+        self.images.get(&id)
+    }
+
+    /// Drop every placement whose cell footprint contains
+    /// `(abs_row, col)`. Called from the print / erase / scroll
+    /// paths so text overwriting an image surface visibly removes
+    /// the image (xterm / iTerm2 semantics — Kitty's "image as
+    /// layer" mode is out of scope for v1). Returns the number of
+    /// placements removed.
+    pub fn evict_placements_at_cell(&mut self, abs_row: i64, col: u16) -> usize {
+        let before = self.image_placements.len();
+        self.image_placements.retain(|p| !p.covers(abs_row, col));
+        before - self.image_placements.len()
+    }
+
+    /// Drop every placement and every stored image. Called by
+    /// `RIS` (`ESC c`, full reset) and by Kitty's `a=d, d=A` delete-
+    /// all action. Frees the byte budget so subsequent images can
+    /// land.
+    pub fn clear_images(&mut self) {
+        self.images.clear();
+        self.image_order.clear();
+        self.image_placements.clear();
+        self.image_bytes_total = 0;
     }
 
     pub fn app_keypad(&self) -> bool {
@@ -5590,5 +5734,127 @@ mod tests {
         assert!(decode_hex_ascii("ABC").is_none(), "odd length must fail");
         assert!(decode_hex_ascii("ZZ").is_none(), "non-hex digits must fail");
         assert!(decode_hex_ascii("").is_none(), "empty input rejected");
+    }
+
+    #[test]
+    fn register_image_assigns_monotonic_ids() {
+        let mut t = term(80, 24);
+        let id1 = t
+            .register_image(crate::image::ImageFormat::Rgba8, 1, 1, vec![0, 0, 0, 255])
+            .expect("first");
+        let id2 = t
+            .register_image(crate::image::ImageFormat::Rgba8, 1, 1, vec![1, 2, 3, 4])
+            .expect("second");
+        assert_ne!(id1, id2);
+        assert!(t.image(id1).is_some());
+        assert!(t.image(id2).is_some());
+    }
+
+    #[test]
+    fn place_image_filters_unknown_ids_and_zero_extent() {
+        let mut t = term(80, 24);
+        let id = t
+            .register_image(crate::image::ImageFormat::Rgba8, 4, 4, vec![0; 4 * 4 * 4])
+            .unwrap();
+        t.place_image(crate::image::ImagePlacement {
+            image_id: id,
+            abs_row: 0,
+            col: 0,
+            rows: 2,
+            cols: 4,
+            width_px: 4,
+            height_px: 4,
+            placement_id: 0,
+        });
+        assert_eq!(t.image_placements().len(), 1);
+        // Unknown id silently dropped.
+        t.place_image(crate::image::ImagePlacement {
+            image_id: 9999,
+            abs_row: 0,
+            col: 0,
+            rows: 1,
+            cols: 1,
+            width_px: 1,
+            height_px: 1,
+            placement_id: 0,
+        });
+        assert_eq!(t.image_placements().len(), 1);
+        // Zero-extent placement silently dropped.
+        t.place_image(crate::image::ImagePlacement {
+            image_id: id,
+            abs_row: 0,
+            col: 0,
+            rows: 0,
+            cols: 4,
+            width_px: 4,
+            height_px: 4,
+            placement_id: 0,
+        });
+        assert_eq!(t.image_placements().len(), 1);
+    }
+
+    #[test]
+    fn evict_placements_at_cell_only_removes_covered() {
+        let mut t = term(80, 24);
+        let id = t
+            .register_image(crate::image::ImageFormat::Rgba8, 10, 10, vec![0; 10 * 10 * 4])
+            .unwrap();
+        // Two non-overlapping placements.
+        t.place_image(crate::image::ImagePlacement {
+            image_id: id,
+            abs_row: 0,
+            col: 0,
+            rows: 2,
+            cols: 4,
+            width_px: 10,
+            height_px: 10,
+            placement_id: 0,
+        });
+        t.place_image(crate::image::ImagePlacement {
+            image_id: id,
+            abs_row: 5,
+            col: 10,
+            rows: 2,
+            cols: 4,
+            width_px: 10,
+            height_px: 10,
+            placement_id: 0,
+        });
+        assert_eq!(t.image_placements().len(), 2);
+        let removed = t.evict_placements_at_cell(1, 2); // inside first
+        assert_eq!(removed, 1);
+        assert_eq!(t.image_placements().len(), 1);
+        // Second one's still there.
+        assert_eq!(t.image_placements()[0].abs_row, 5);
+    }
+
+    #[test]
+    fn payload_above_max_is_rejected() {
+        let mut t = term(80, 24);
+        let oversize = vec![0u8; IMAGE_MAX_PAYLOAD_BYTES + 1];
+        assert!(t
+            .register_image(crate::image::ImageFormat::Rgba8, 1, 1, oversize)
+            .is_none());
+    }
+
+    #[test]
+    fn clear_images_resets_store_and_placements() {
+        let mut t = term(80, 24);
+        let id = t
+            .register_image(crate::image::ImageFormat::Rgba8, 2, 2, vec![0; 16])
+            .unwrap();
+        t.place_image(crate::image::ImagePlacement {
+            image_id: id,
+            abs_row: 0,
+            col: 0,
+            rows: 1,
+            cols: 1,
+            width_px: 2,
+            height_px: 2,
+            placement_id: 0,
+        });
+        t.clear_images();
+        assert!(t.image_placements().is_empty());
+        assert!(t.image(id).is_none());
     }
 }
