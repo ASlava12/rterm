@@ -1596,9 +1596,20 @@ impl GpuState {
             }
         };
         let info = adapter.get_info();
+        // Log the full adapter identity, not just the friendly name.
+        // When a user reports a render glitch the maintainers need
+        // (vendor, device, driver, driver_info, device_type) to
+        // correlate with known driver bugs (e.g. Qualcomm Adreno on
+        // Windows-on-ARM has a different set of DX12 quirks than
+        // Intel Arc on x86_64).
         tracing::info!(
             backend = ?info.backend,
             adapter = %info.name,
+            vendor = format_args!("0x{:04x}", info.vendor),
+            device = format_args!("0x{:04x}", info.device),
+            device_type = ?info.device_type,
+            driver = %info.driver,
+            driver_info = %info.driver_info,
             "GPU adapter selected; requesting device",
         );
         // Take the adapter's full limits rather than `downlevel_defaults`.
@@ -1627,6 +1638,18 @@ impl GpuState {
         tracing::info!("GPU device ready");
 
         let caps = surface.get_capabilities(&adapter);
+        // Echo the surface's full capability matrix so a render-
+        // glitch log (Adreno on Windows-ARM, llvmpipe on WSL2,
+        // ancient Intel iGPU, ...) shows what we actually had to
+        // pick from. Without this the reader has to guess whether
+        // the chosen format/present-mode/alpha-mode was first-
+        // choice or a fallback after we filtered.
+        tracing::info!(
+            formats = ?caps.formats,
+            present_modes = ?caps.present_modes,
+            alpha_modes = ?caps.alpha_modes,
+            "surface capabilities",
+        );
         let format = caps
             .formats
             .iter()
