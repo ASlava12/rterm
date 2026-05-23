@@ -1988,6 +1988,40 @@ impl<'a> TerminalPerform<'a> {
                 }
             }
         }
+        // Drop any image placement whose footprint intersects the
+        // erased rect — text-on-image semantics from xterm /
+        // iTerm2. Cheap early-bail when there are no placements
+        // (the common case).
+        if !self.image_placements.is_empty() {
+            let on_alt = *self.active == ALT;
+            let sb_len = if on_alt { 0 } else { self.scrollback.len() };
+            for row in start.row..=end.row {
+                let abs_row = sb_len as i64 + row as i64;
+                let col_lo = if row == start.row { start.col } else { 0 };
+                let col_hi = if row == end.row {
+                    end.col
+                } else {
+                    size.cols.saturating_sub(1)
+                };
+                self.image_placements.retain(|p| {
+                    // Keep the placement unless its rect overlaps
+                    // ANY column in [col_lo, col_hi] on this row.
+                    let row_in_range = p.abs_row <= abs_row
+                        && abs_row < p.abs_row + p.rows as i64;
+                    if !row_in_range {
+                        return true;
+                    }
+                    let p_lo = p.col;
+                    let p_hi = p.col.saturating_add(p.cols);
+                    // Keep iff the placement's column range is
+                    // entirely outside the erased `[col_lo, col_hi]`
+                    // span. (`p_hi` is exclusive; `col_hi` is
+                    // inclusive — hence the strict `<=` / `>`
+                    // pairing.)
+                    p_hi <= col_lo || p_lo > col_hi
+                });
+            }
+        }
     }
 
     fn erase_in_display(&mut self, mode: u16) {
@@ -2778,6 +2812,22 @@ impl<'a> Perform for TerminalPerform<'a> {
                 .cell_mut(Position { row: pos.row, col: pos.col + 1 })
             {
                 *c = spacer;
+            }
+        }
+        // Text printed onto a cell occupied by an inline image
+        // drops the image (xterm / iTerm2 semantics — Kitty's
+        // image-as-layer mode is out of scope for v1). The
+        // is_empty() check makes this a one-load fast path when
+        // no images are active.
+        if !self.image_placements.is_empty() {
+            let on_alt = *self.active == ALT;
+            let sb_len = if on_alt { 0 } else { self.scrollback.len() };
+            let abs_row = sb_len as i64 + pos.row as i64;
+            self.image_placements
+                .retain(|p| !p.covers(abs_row, pos.col));
+            if width == 2 {
+                self.image_placements
+                    .retain(|p| !p.covers(abs_row, pos.col + 1));
             }
         }
         self.cursor.col = self.cursor.col.saturating_add(width);
@@ -6862,6 +6912,55 @@ mod tests {
         // `a=d, d=A` — delete all.
         t.advance(b"\x1b_Ga=d,d=A\x1b\\");
         assert!(t.image_placements().is_empty());
+    }
+
+    #[test]
+    fn printing_over_image_cell_drops_placement() {
+        // Register an image covering rows 0..2, cols 0..4. Then
+        // print a character at (row=1, col=2) — that cell is
+        // inside the image rect, so the placement must vanish.
+        let mut t = term(80, 24);
+        let id = t
+            .register_image(crate::image::ImageFormat::Rgba8, 4, 4, vec![0; 4 * 4 * 4])
+            .unwrap();
+        t.place_image(crate::image::ImagePlacement {
+            image_id: id,
+            abs_row: 0,
+            col: 0,
+            rows: 2,
+            cols: 4,
+            width_px: 4,
+            height_px: 4,
+            placement_id: 0,
+        });
+        assert_eq!(t.image_placements().len(), 1);
+        // Move cursor to (1, 2) and print one char.
+        t.advance(b"\n  x");
+        assert!(
+            t.image_placements().is_empty(),
+            "image dropped after text overlapped its rect",
+        );
+    }
+
+    #[test]
+    fn erase_in_display_drops_image_in_erased_region() {
+        let mut t = term(80, 24);
+        let id = t
+            .register_image(crate::image::ImageFormat::Rgba8, 4, 4, vec![0; 4 * 4 * 4])
+            .unwrap();
+        t.place_image(crate::image::ImagePlacement {
+            image_id: id,
+            abs_row: 0,
+            col: 0,
+            rows: 2,
+            cols: 4,
+            width_px: 4,
+            height_px: 4,
+            placement_id: 0,
+        });
+        // CSI 2J — erase entire display.
+        t.advance(b"\x1b[2J");
+        assert!(t.image_placements().is_empty(), "ED 2 dropped the image");
     }
 
     #[test]
