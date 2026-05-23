@@ -25,6 +25,15 @@ tracing = { workspace = true }
 rterm-core = { workspace = true }
 rterm-history = { workspace = true }
 
+# Image-format decoder for the inline-image protocols. iTerm2 OSC
+# 1337 ;File= and Kitty APC G both ship PNG / JPEG / GIF bytes
+# over the wire; the parser side (in rterm-core) keeps them in
+# their on-the-wire form, and the renderer decodes once on first
+# GPU upload. PNG / JPEG / GIF are the formats real-world tools
+# emit (chafa, matplotlib, yazi preview); pulling in WebP / TIFF
+# / AVIF would balloon the dep tree for ~zero practical win.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
+
 # Win32 globals for the optional Guake global-hotkey worker thread.
 # `RegisterHotKey` is the supported way to receive a system-wide key
 # combo without focus stealing tricks; the bindings come pre-generated

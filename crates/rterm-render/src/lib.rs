@@ -1,6 +1,7 @@
 //! GPU renderer + winit application for rterm.
 
 mod bg;
+mod image_decode;
 pub mod palette;
 pub(crate) mod tree;
 pub mod action;
