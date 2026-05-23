@@ -354,6 +354,13 @@ pub struct Terminal {
     /// Capped by [`APC_BUF_CAP`] so a malformed shell can't grow
     /// the buffer without bound.
     apc_buf: Vec<u8>,
+    /// In-flight Kitty graphics chunks keyed by sender-supplied
+    /// image id (`i=` parameter). Multi-chunk transfers (`m=1` on
+    /// every chunk except the last) accumulate here until the
+    /// closing `m=0` arrives; capped by [`KITTY_CHUNK_TOTAL_CAP`]
+    /// per id to avoid an unbounded buffer if a sender drops the
+    /// terminator. Cleared on RIS.
+    kitty_chunks: HashMap<u32, KittyChunkBuffer>,
     /// Inline images registered by the iTerm2 `OSC 1337 ;File=` and
     /// Kitty `APC G` protocols. Keyed by a monotonically-incremented
     /// id; the matching [`ImagePlacement`]s in `image_placements`
@@ -428,6 +435,44 @@ pub const IMAGE_MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 /// limit gets the remainder dropped — the dispatched payload is
 /// truncated, which the Kitty handler treats as a decode error.
 const APC_BUF_CAP: usize = IMAGE_MAX_PAYLOAD_BYTES;
+
+/// Hard cap on the total accumulated chunk bytes for one in-flight
+/// Kitty transfer. Sized at twice `IMAGE_MAX_PAYLOAD_BYTES` because
+/// base64-encoded transfers are ~33% larger on the wire (4 chars
+/// per 3 bytes), plus a margin for kv-list overhead between
+/// chunks.
+const KITTY_CHUNK_TOTAL_CAP: usize = IMAGE_MAX_PAYLOAD_BYTES * 2;
+
+/// Accumulator for one in-flight Kitty graphics multi-chunk
+/// transfer. The first chunk carries the action + format + pixel
+/// dims; subsequent chunks just include `m=` (more) and additional
+/// base64 payload. Once `m=0` arrives we decode the concatenated
+/// payload and apply.
+#[derive(Debug, Clone, Default)]
+struct KittyChunkBuffer {
+    /// Format from the FIRST chunk's `f=` (24, 32, or 100).
+    /// Defaults to 100 (PNG) when the sender omits it.
+    format: u32,
+    /// `s=` pixel width (required for raw RGB/RGBA; unused for PNG).
+    width_px: u32,
+    /// `v=` pixel height.
+    height_px: u32,
+    /// `c=` cell columns (renderer footprint). 0 = auto.
+    cols: u16,
+    /// `r=` cell rows. 0 = auto.
+    rows: u16,
+    /// Cell column to place at (`X=`). Not commonly used; defaults to cursor.
+    x_offset: i32,
+    /// Cell row to place at (`Y=`). Defaults to cursor.
+    y_offset: i32,
+    /// Whether the action was `T` (transmit+display) vs `t`
+    /// (transmit only). For v1 we treat both as display since the
+    /// renderer has no "store but don't display" surface.
+    display: bool,
+    /// Concatenated base64-decoded payload across every chunk seen
+    /// so far. Capped by [`KITTY_CHUNK_TOTAL_CAP`].
+    data: Vec<u8>,
+}
 
 /// APC ("Application Program Command", `ESC _`) capture state.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -562,6 +607,7 @@ impl Terminal {
             image_bytes_total: 0,
             apc_state: ApcState::default(),
             apc_buf: Vec::new(),
+            kitty_chunks: HashMap::new(),
         }
     }
 
@@ -1088,18 +1134,277 @@ impl Terminal {
     }
 
     /// Best-effort handler for one complete APC payload (the bytes
-    /// between `ESC _` and the terminator). Empty body is silently
-    /// dropped. Currently a stub — the next commit dispatches
-    /// payloads that start with `G` to the Kitty graphics protocol.
+    /// between `ESC _` and the terminator). Currently routes
+    /// `G ...` payloads to the Kitty graphics protocol; everything
+    /// else is silently ignored.
     fn dispatch_apc(&mut self, payload: &[u8]) {
         if payload.is_empty() {
             return;
         }
-        tracing::debug!(
-            len = payload.len(),
-            head = ?std::str::from_utf8(&payload[..payload.len().min(32)]),
-            "APC payload (no handler yet)",
-        );
+        // Format: `G <comma-separated kv list> ; <base64 chunk>`.
+        // The `G` byte alone is the discriminator vs SOS / PM /
+        // future APC consumers we don't handle.
+        if payload[0] != b'G' {
+            return;
+        }
+        let body = &payload[1..];
+        let (kv_str, payload_b64) = match body.iter().position(|&b| b == b';') {
+            Some(idx) => (&body[..idx], &body[idx + 1..]),
+            None => (body, &[][..]),
+        };
+        // Parse the comma-separated key=value list. Unknown keys
+        // are tolerated — Kitty's protocol grows over time and we
+        // pin to a v1-ish subset.
+        let mut action: u8 = b'T'; // default: transmit + display
+        let mut format: u32 = 100; // default: PNG
+        let mut img_id: u32 = 0;
+        let mut more: u32 = 0;
+        let mut s_px: u32 = 0;
+        let mut v_px: u32 = 0;
+        let mut c_cells: u16 = 0;
+        let mut r_cells: u16 = 0;
+        let mut x_off: i32 = 0;
+        let mut y_off: i32 = 0;
+        let mut delete_what: u8 = b'a';
+        for kv in kv_str.split(|&b| b == b',') {
+            let Some(eq) = kv.iter().position(|&b| b == b'=') else { continue };
+            let k = &kv[..eq];
+            let v = &kv[eq + 1..];
+            let v_str = std::str::from_utf8(v).unwrap_or("");
+            match k {
+                b"a" => {
+                    if let Some(&first) = v.first() {
+                        action = first;
+                        if action == b'd' {
+                            delete_what = v.get(1).copied().unwrap_or(b'a');
+                        }
+                    }
+                }
+                b"f" => format = v_str.parse().unwrap_or(100),
+                b"i" => img_id = v_str.parse().unwrap_or(0),
+                b"m" => more = v_str.parse().unwrap_or(0),
+                b"s" => s_px = v_str.parse().unwrap_or(0),
+                b"v" => v_px = v_str.parse().unwrap_or(0),
+                b"c" => c_cells = v_str.parse().unwrap_or(0),
+                b"r" => r_cells = v_str.parse().unwrap_or(0),
+                b"X" => x_off = v_str.parse().unwrap_or(0),
+                b"Y" => y_off = v_str.parse().unwrap_or(0),
+                // Ignored: q (quiet), I (image number), p (placement
+                // id), z (z-index), C (cursor policy), animation
+                // params. Out of scope for v1.
+                _ => {}
+            }
+        }
+        // Delete actions: `a=d, d=A` wipes everything. Other delete
+        // subcodes (id-specific, area-specific) are out of scope —
+        // we treat them as no-op.
+        if action == b'd' {
+            if delete_what == b'A' || delete_what == b'a' {
+                self.clear_images();
+            }
+            return;
+        }
+        // Transmit-only (`a=t`) and put (`a=p`) without prior store
+        // are out of scope. Both fall through to the display path
+        // below — `t` would technically skip placement, but since
+        // we don't expose a "store-only" reservation that the user
+        // can't see, treating it as `T` (transmit + display) is the
+        // most useful behaviour.
+        if action != b'T' && action != b't' && action != b'p' {
+            return;
+        }
+        // Decode the chunk's base64 fragment. Empty body is allowed
+        // for control-only chunks (e.g. a final `m=0` with no data
+        // closing a multi-chunk transfer where the previous chunk
+        // already carried everything).
+        let trimmed: Vec<u8> = payload_b64
+            .iter()
+            .copied()
+            .filter(|b| !b.is_ascii_whitespace())
+            .collect();
+        let chunk_bytes = if trimmed.is_empty() {
+            Vec::new()
+        } else {
+            use base64::Engine;
+            match base64::engine::general_purpose::STANDARD.decode(&trimmed) {
+                Ok(b) => b,
+                Err(_) => return,
+            }
+        };
+        // Append to the per-sender-id accumulator, creating one on
+        // first sight. Subsequent chunks of the same id use the
+        // SAME entry; the format / dims fields are read from the
+        // first chunk only.
+        let buf = self.kitty_chunks.entry(img_id).or_insert_with(|| {
+            KittyChunkBuffer {
+                format,
+                width_px: s_px,
+                height_px: v_px,
+                cols: c_cells,
+                rows: r_cells,
+                x_offset: x_off,
+                y_offset: y_off,
+                display: action == b'T' || action == b'p',
+                data: Vec::new(),
+            }
+        });
+        if buf.data.len() + chunk_bytes.len() > KITTY_CHUNK_TOTAL_CAP {
+            // Sender blew past our cap — discard the in-flight
+            // transfer entirely. Better than a half-finished
+            // buffer that downstream code would decode as garbage.
+            self.kitty_chunks.remove(&img_id);
+            return;
+        }
+        buf.data.extend_from_slice(&chunk_bytes);
+        // `m=1` → more chunks coming. Hold and wait.
+        if more == 1 {
+            return;
+        }
+        // `m=0` (or absent → 0) → this is the final chunk. Take
+        // the accumulated buffer out of the map, finalize.
+        let Some(finalized) = self.kitty_chunks.remove(&img_id) else {
+            return;
+        };
+        self.commit_kitty_image(finalized);
+    }
+
+    /// Finalize a Kitty transfer: convert the format hint into our
+    /// [`ImageFormat`], register the bytes, place at the current
+    /// cursor (with any `X=` / `Y=` cell offsets applied), and
+    /// advance the cursor past the image. Best-effort — every
+    /// failure path silently drops the image rather than raising.
+    fn commit_kitty_image(&mut self, buf: KittyChunkBuffer) {
+        let format = match buf.format {
+            100 => crate::image::ImageFormat::Png,
+            24 => crate::image::ImageFormat::Rgb8,
+            32 => crate::image::ImageFormat::Rgba8,
+            _ => return, // unsupported f= value
+        };
+        // For PNG payloads we can sniff width/height from the
+        // header so the cell-footprint estimate works even when
+        // the sender omitted `s=` / `v=`.
+        let (width_px, height_px) = if format == crate::image::ImageFormat::Png {
+            sniff_png_dims(&buf.data).unwrap_or((buf.width_px, buf.height_px))
+        } else {
+            (buf.width_px, buf.height_px)
+        };
+        if width_px == 0 || height_px == 0 {
+            return;
+        }
+        // Cell footprint — same fallback math iTerm2 uses: 8 px / col,
+        // 16 px / row.
+        let cols = if buf.cols > 0 {
+            buf.cols
+        } else {
+            ((width_px as f32 / 8.0).ceil().max(1.0) as u32).min(200) as u16
+        };
+        let rows = if buf.rows > 0 {
+            buf.rows
+        } else {
+            ((height_px as f32 / 16.0).ceil().max(1.0) as u32).min(80) as u16
+        };
+        // Position: cursor + Y=/X= offsets (applied as cell
+        // coordinates; negative values clamp at the grid edge).
+        let cursor = self.cursor;
+        let col = cursor.col.saturating_add_signed(buf.x_offset as i16);
+        let row = cursor.row.saturating_add_signed(buf.y_offset as i16);
+        let on_alt = self.active == ALT;
+        let sb_len = if on_alt { 0 } else { self.scrollback.len() };
+        let abs_row = sb_len as i64 + row as i64;
+        // Move data out of buf BEFORE register_image so we don't
+        // double-borrow.
+        let data = buf.data;
+        let id = match self.register_image(format, width_px, height_px, data) {
+            Some(id) => id,
+            None => return,
+        };
+        self.image_placements.push(crate::image::ImagePlacement {
+            image_id: id,
+            abs_row,
+            col,
+            rows,
+            cols,
+            width_px,
+            height_px,
+            placement_id: 0,
+        });
+        if !buf.display {
+            // `a=t` — transmit only. Don't advance cursor; the image
+            // is registered + placed at cursor but in practice this
+            // path also stays out of the renderer's pipeline. Kept
+            // for symmetry with `T`.
+            return;
+        }
+        // Advance the cursor past the image. Mirror the iTerm2
+        // path: each row -> one `\n` via the parser to honour
+        // scroll regions + OSC 133.
+        let mut perform = TerminalPerform {
+            grids: &mut self.grids,
+            active: &mut self.active,
+            scrollback: &mut self.scrollback,
+            scrollback_limit: self.scrollback_limit,
+            cursor: &mut self.cursor,
+            saved: &mut self.saved,
+            sgr: &mut self.sgr,
+            sgr_stack: &mut self.sgr_stack,
+            cursor_visible: &mut self.cursor_visible,
+            region: &mut self.region,
+            pending_title: &mut self.pending_title,
+            pending_bell: &mut self.pending_bell,
+            mouse_tracking: &mut self.mouse_tracking,
+            sgr_mouse: &mut self.sgr_mouse,
+            bracketed_paste: &mut self.bracketed_paste,
+            reverse_screen: &mut self.reverse_screen,
+            focus_tracking: &mut self.focus_tracking,
+            sync_output: &mut self.sync_output,
+            insert_mode: &mut self.insert_mode,
+            app_cursor_keys: &mut self.app_cursor_keys,
+            autowrap: &mut self.autowrap,
+            origin_mode: &mut self.origin_mode,
+            hyperlinks: &mut self.hyperlinks,
+            hyperlink_uri_to_id: &mut self.hyperlink_uri_to_id,
+            hyperlink_order: &mut self.hyperlink_order,
+            next_link_id: &mut self.next_link_id,
+            current_hyperlink: &mut self.current_hyperlink,
+            pending_clipboard: &mut self.pending_clipboard,
+            cursor_shape: &mut self.cursor_shape,
+            cursor_should_blink: &mut self.cursor_should_blink,
+            cwd: &mut self.cwd,
+            pending_lines: &mut self.pending_lines,
+            prompt_marks: &mut self.prompt_marks,
+            command_marks: &mut self.command_marks,
+            pending_command_finishes: &mut self.pending_command_finishes,
+            last_command_start: &mut self.last_command_start,
+            osc_responses: &mut self.osc_responses,
+            default_fg_rgb: &mut self.default_fg_rgb,
+            default_bg_rgb: &mut self.default_bg_rgb,
+            named_palette: &mut self.named_palette,
+            cursor_rgb: &mut self.cursor_rgb,
+            pending_palette_changes: &mut self.pending_palette_changes,
+            tab_stops: &mut self.tab_stops,
+            app_keypad: &mut self.app_keypad,
+            pending_notifications: &mut self.pending_notifications,
+            pending_progress: &mut self.pending_progress,
+            dcs_buf: &mut self.dcs_buf,
+            dcs_is_rqss: &mut self.dcs_is_rqss,
+            dcs_is_xtgettcap: &mut self.dcs_is_xtgettcap,
+            last_printed: &mut self.last_printed,
+            current_title: &mut self.current_title,
+            title_stack: &mut self.title_stack,
+            charset_g0: &mut self.charset_g0,
+            charset_g1: &mut self.charset_g1,
+            active_charset: &mut self.active_charset,
+            images: &mut self.images,
+            image_order: &mut self.image_order,
+            image_placements: &mut self.image_placements,
+            next_image_id: &mut self.next_image_id,
+            image_bytes_total: &mut self.image_bytes_total,
+            kitty_chunks: &mut self.kitty_chunks,
+        };
+        for _ in 0..rows {
+            perform.linefeed();
+        }
+        let _ = col;
     }
 
     /// Feed a chunk of non-APC bytes through the vte parser. Splits
@@ -1170,6 +1475,7 @@ impl Terminal {
             image_placements: &mut self.image_placements,
             next_image_id: &mut self.next_image_id,
             image_bytes_total: &mut self.image_bytes_total,
+            kitty_chunks: &mut self.kitty_chunks,
         };
         for &b in buf {
             self.parser.advance(&mut perform, b);
@@ -1243,6 +1549,7 @@ struct TerminalPerform<'a> {
     image_placements: &'a mut Vec<crate::image::ImagePlacement>,
     next_image_id: &'a mut u64,
     image_bytes_total: &'a mut usize,
+    kitty_chunks: &'a mut HashMap<u32, KittyChunkBuffer>,
 }
 
 impl<'a> TerminalPerform<'a> {
@@ -3680,6 +3987,11 @@ impl<'a> Perform for TerminalPerform<'a> {
                 self.image_placements.clear();
                 *self.next_image_id = 1;
                 *self.image_bytes_total = 0;
+                // In-flight Kitty multi-chunk transfers are
+                // half-finished images by definition — they'd
+                // splash onto the freshly-cleared grid if we
+                // let them continue. Drop them too.
+                self.kitty_chunks.clear();
             }
             _ => {}
         }
@@ -6488,6 +6800,83 @@ mod tests {
         stream.extend_from_slice(b"\x1b\\trailing");
         t.advance(&stream);
         assert_eq!(row_text(&t, 0).trim_end_matches(' '), "trailing");
+    }
+
+    fn kitty_apc(kv: &str, b64: &str) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"\x1b_G");
+        v.extend_from_slice(kv.as_bytes());
+        if !b64.is_empty() {
+            v.push(b';');
+            v.extend_from_slice(b64.as_bytes());
+        }
+        v.extend_from_slice(b"\x1b\\");
+        v
+    }
+
+    #[test]
+    fn kitty_transmit_and_display_png_registers_image() {
+        use base64::Engine;
+        let mut t = term(80, 24);
+        let png = red_pixel_png();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        // Single-chunk transfer: `a=T, f=100, c=4, r=2`.
+        t.advance(&kitty_apc("a=T,f=100,c=4,r=2", &b64));
+        let placements = t.image_placements();
+        assert_eq!(placements.len(), 1, "kitty placement registered");
+        let p = placements[0];
+        assert_eq!(p.cols, 4);
+        assert_eq!(p.rows, 2);
+        let img = t.image(p.image_id).expect("image stored");
+        assert!(matches!(img.format, crate::image::ImageFormat::Png));
+        // Cursor advanced past the 2-row image.
+        assert_eq!(t.cursor().row, 2);
+    }
+
+    #[test]
+    fn kitty_multi_chunk_assembles_full_payload() {
+        use base64::Engine;
+        let mut t = term(80, 24);
+        let png = red_pixel_png();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        // Split base64 in half — first chunk has m=1, second m=0.
+        let mid = b64.len() / 2;
+        let part1 = &b64[..mid];
+        let part2 = &b64[mid..];
+        t.advance(&kitty_apc("a=T,f=100,i=42,c=4,r=2,m=1", part1));
+        // Mid-transfer — nothing placed yet.
+        assert!(t.image_placements().is_empty());
+        t.advance(&kitty_apc("i=42,m=0", part2));
+        // After the final chunk the assembled image lands.
+        assert_eq!(t.image_placements().len(), 1);
+    }
+
+    #[test]
+    fn kitty_delete_all_clears_store() {
+        use base64::Engine;
+        let mut t = term(80, 24);
+        let png = red_pixel_png();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        t.advance(&kitty_apc("a=T,f=100,c=4,r=2", &b64));
+        assert_eq!(t.image_placements().len(), 1);
+        // `a=d, d=A` — delete all.
+        t.advance(b"\x1b_Ga=d,d=A\x1b\\");
+        assert!(t.image_placements().is_empty());
+    }
+
+    #[test]
+    fn kitty_chunk_over_cap_drops_in_flight_transfer() {
+        // Sender starts a multi-chunk transfer, blows past the
+        // KITTY_CHUNK_TOTAL_CAP — accumulator must be dropped so
+        // no half-finished bytes survive into the next image.
+        let mut t = term(80, 24);
+        // First chunk: small base64, m=1.
+        t.advance(&kitty_apc("a=T,f=100,i=7,m=1", "aGVsbG8="));
+        // Now an oversize chunk for the same i=7.
+        let big = "A".repeat(KITTY_CHUNK_TOTAL_CAP);
+        t.advance(&kitty_apc("i=7,m=0", &big));
+        // No image landed.
+        assert!(t.image_placements().is_empty());
     }
 
     #[test]
