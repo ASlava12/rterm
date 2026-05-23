@@ -2636,49 +2636,131 @@ enum SelectionMode {
     Block,
 }
 
+/// Selection endpoint anchored in ABSOLUTE logical-row coordinates.
+///
+/// `abs_row` is the row index in the `scrollback ++ grid` stream:
+/// `[0, sb_len)` indexes the scrollback ring (oldest first),
+/// `[sb_len, sb_len + grid_rows)` indexes the live grid. Stored as
+/// `i64` so the conversion to a viewport row (which subtracts the
+/// current `sb_len`) can go negative without underflow — that's
+/// the signal the renderer uses to clip a selection that's been
+/// scrolled off the top of the visible area.
+///
+/// Previously selections lived in viewport-relative `SelectionPoint`,
+/// so a wheel-scroll of N lines while a selection was active
+/// drifted the highlight by N rows: the renderer kept painting
+/// "viewport row 5", but viewport row 5 now showed a different
+/// logical line. Anchoring in absolute coords makes the selection
+/// stick to its content regardless of subsequent scrolling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AbsPoint {
+    abs_row: i64,
+    col: u16,
+}
+
+impl AbsPoint {
+    /// Build from a viewport-relative `SelectionPoint`, capturing
+    /// the absolute coordinate via the same `sb_len - offset +
+    /// viewport_row` mapping used everywhere else for the visible
+    /// <-> logical translation.
+    fn from_viewport(sp: SelectionPoint, sb_len: usize, offset: u16) -> Self {
+        let abs_row = sb_len as i64 - offset as i64 + sp.row as i64;
+        Self { abs_row, col: sp.col }
+    }
+
+    /// Project back to a viewport row given the CURRENT scroll
+    /// state. May fall outside `[0, rows)` when the selection has
+    /// been scrolled off-screen — callers clip.
+    fn to_viewport_row(self, sb_len: usize, offset: u16) -> i64 {
+        self.abs_row - sb_len as i64 + offset as i64
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ActiveSelection {
     pane_idx: usize,
-    anchor: SelectionPoint,
-    focus: SelectionPoint,
+    anchor: AbsPoint,
+    focus: AbsPoint,
     mode: SelectionMode,
     /// For Word/Line modes: the inclusive cell range of the original
     /// pivot word/line captured on the initial multi-click. Subsequent
     /// drag-extends snap to word/line bounds at the drag point and
     /// anchor against this pivot range, so the selection always covers
     /// whole words or whole lines.
-    pivot: Option<(SelectionPoint, SelectionPoint)>,
+    pivot: Option<(AbsPoint, AbsPoint)>,
 }
 
 impl ActiveSelection {
-    fn normalized(&self) -> NormSelection {
+    /// Translate the absolute-coord anchor / focus into a
+    /// viewport-relative `NormSelection` using the CURRENT scroll
+    /// state. Rows that fall outside `[0, rows)` are clipped — when
+    /// the entire selection is off-screen, returns `None`. Block
+    /// mode normalises rows + cols independently (rectangle);
+    /// linear mode preserves the historical
+    /// "open-ended on intermediate rows" stream semantics.
+    fn to_visible_norm(
+        self,
+        sb_len: usize,
+        offset: u16,
+        rows: u16,
+    ) -> Option<NormSelection> {
+        let anchor_r = self.anchor.to_viewport_row(sb_len, offset);
+        let focus_r = self.focus.to_viewport_row(sb_len, offset);
+        let max_r = rows.saturating_sub(1) as i64;
         if matches!(self.mode, SelectionMode::Block) {
-            // Block mode normalises rows and cols INDEPENDENTLY so
-            // the resulting rect is `[min_row, max_row] × [min_col,
-            // max_col]` regardless of which corner the user
-            // anchored / focused on. `end.col` stays *exclusive*
-            // (one past the last selected column) to match
-            // `contains`'s comparison.
-            let (r_start, r_end) = if self.anchor.row <= self.focus.row {
-                (self.anchor.row, self.focus.row)
+            let (r_start, r_end) = if anchor_r <= focus_r {
+                (anchor_r, focus_r)
             } else {
-                (self.focus.row, self.anchor.row)
+                (focus_r, anchor_r)
             };
+            // Clip the row range to the visible window.
+            let r_start = r_start.max(0);
+            let r_end = r_end.min(max_r);
+            if r_start > r_end {
+                return None;
+            }
             let (c_min, c_max) = if self.anchor.col <= self.focus.col {
                 (self.anchor.col, self.focus.col)
             } else {
                 (self.focus.col, self.anchor.col)
             };
-            return NormSelection {
-                start: SelectionPoint { row: r_start, col: c_min },
-                end: SelectionPoint { row: r_end, col: c_max + 1 },
+            return Some(NormSelection {
+                start: SelectionPoint { row: r_start as u16, col: c_min },
+                end: SelectionPoint { row: r_end as u16, col: c_max + 1 },
                 block: true,
-            };
+            });
         }
-        let a = (self.anchor.row, self.anchor.col);
-        let f = (self.focus.row, self.focus.col);
-        let (s, e) = if a <= f { (self.anchor, self.focus) } else { (self.focus, self.anchor) };
-        NormSelection { start: s, end: e, block: false }
+        // Linear: sort lexicographically by (row, col) in absolute
+        // space, THEN clip rows to the visible window.
+        let ((s_r, s_col), (e_r, e_col)) = if (anchor_r, self.anchor.col) <= (focus_r, self.focus.col) {
+            ((anchor_r, self.anchor.col), (focus_r, self.focus.col))
+        } else {
+            ((focus_r, self.focus.col), (anchor_r, self.anchor.col))
+        };
+        let s_clipped = s_r.max(0);
+        let e_clipped = e_r.min(max_r);
+        if s_clipped > e_clipped {
+            return None;
+        }
+        // When the selection start is above the viewport, treat the
+        // first visible row's col as 0 (selection bled in from
+        // above). Same logic mirrored for the end row when the
+        // selection extends below.
+        let start_col = if s_r >= 0 { s_col } else { 0 };
+        let end_col = if e_r <= max_r {
+            e_col
+        } else {
+            // Below the viewport — let it absorb the full row width
+            // by setting the end col to u16::MAX; `selection_text`
+            // and `NormSelection::contains` both clip against the
+            // actual row length.
+            u16::MAX
+        };
+        Some(NormSelection {
+            start: SelectionPoint { row: s_clipped as u16, col: start_col },
+            end: SelectionPoint { row: e_clipped as u16, col: end_col },
+            block: false,
+        })
     }
 
     fn is_empty(&self) -> bool {
@@ -6462,11 +6544,13 @@ impl App {
                 .unwrap_or(false);
             if same_pane {
                 if let Some(p) = self.pixel_to_cell(i, x, y) {
-                    if let Some(sel) = self.selection.as_mut() {
-                        sel.focus = p;
+                    if let Some(ap) = self.abs_point(i, p) {
+                        if let Some(sel) = self.selection.as_mut() {
+                            sel.focus = ap;
+                        }
+                        self.mouse_dragging = true;
+                        return false;
                     }
-                    self.mouse_dragging = true;
-                    return false;
                 }
             }
         }
@@ -6572,10 +6656,11 @@ impl App {
                 } else {
                     SelectionMode::Char
                 };
+                let Some(ap) = self.abs_point(i, p) else { return false };
                 self.selection = Some(ActiveSelection {
                     pane_idx: i,
-                    anchor: p,
-                    focus: p,
+                    anchor: ap,
+                    focus: ap,
                     mode,
                     pivot: None,
                 });
@@ -6587,12 +6672,14 @@ impl App {
                         row: sel.end.row,
                         col: sel.end.col.saturating_sub(1),
                     };
+                    let Some(start_abs) = self.abs_point(i, sel.start) else { return false };
+                    let Some(end_abs) = self.abs_point(i, end_inclusive) else { return false };
                     self.selection = Some(ActiveSelection {
                         pane_idx: i,
-                        anchor: sel.start,
-                        focus: end_inclusive,
+                        anchor: start_abs,
+                        focus: end_abs,
                         mode: SelectionMode::Word,
-                        pivot: Some((sel.start, end_inclusive)),
+                        pivot: Some((start_abs, end_abs)),
                     });
                     // Keep dragging armed so the user can extend the
                     // initial word selection by sweeping the mouse — the
@@ -6607,18 +6694,42 @@ impl App {
                         row: sel.end.row,
                         col: sel.end.col.saturating_sub(1),
                     };
+                    let Some(start_abs) = self.abs_point(i, sel.start) else { return false };
+                    let Some(end_abs) = self.abs_point(i, end_inclusive) else { return false };
                     self.selection = Some(ActiveSelection {
                         pane_idx: i,
-                        anchor: sel.start,
-                        focus: end_inclusive,
+                        anchor: start_abs,
+                        focus: end_abs,
                         mode: SelectionMode::Line,
-                        pivot: Some((sel.start, end_inclusive)),
+                        pivot: Some((start_abs, end_abs)),
                     });
                     self.mouse_dragging = true;
                 }
             }
         }
         false
+    }
+
+    /// Build an `AbsPoint` from a viewport-relative `SelectionPoint`
+    /// by sampling the pane's current `scrollback_len` + `scroll_offset`.
+    /// Returns `None` only on truly degenerate state (no active tab,
+    /// no pane at `pane_idx`, poisoned terminal mutex). The alt-
+    /// screen path forces `sb_len = 0` since the alt grid has no
+    /// scrollback — that way selections made in vim / less stay
+    /// anchored to the alt grid rather than drifting into negative
+    /// abs-row space when alt exits.
+    fn abs_point(&self, pane_idx: usize, sp: SelectionPoint) -> Option<AbsPoint> {
+        let tab = self.active_tab()?;
+        let pane = tab.pane_at(pane_idx)?;
+        let term = pane.terminal.lock().ok()?;
+        let sb_len = if term.is_on_alt_screen() {
+            0
+        } else {
+            term.scrollback_len()
+        };
+        drop(term);
+        let offset = pane.scroll_offset.load(Ordering::Relaxed);
+        Some(AbsPoint::from_viewport(sp, sb_len, offset))
     }
 
     fn word_selection_at(&self, pane_idx: usize, p: SelectionPoint) -> Option<NormSelection> {
@@ -6791,26 +6902,42 @@ impl App {
             Some(sel) => (sel.mode, sel.pivot),
             None => return,
         };
+        // Helper: lift a viewport `SelectionPoint` into the
+        // absolute-row frame of the active pane. Fails-soft to
+        // `(0, p.col)` if the terminal mutex is poisoned mid-drag.
+        let lift = |sp: SelectionPoint| -> AbsPoint {
+            self.abs_point(pane_idx, sp).unwrap_or(AbsPoint {
+                abs_row: sp.row as i64,
+                col: sp.col,
+            })
+        };
+        let p_abs = lift(p);
         let snapped = match mode {
             // Char and Block both move the focus directly to the
             // cursor position — Block doesn't snap to anything (the
-            // rect math happens later in `normalized()`), so it
+            // rect math happens later in `to_visible_norm`), so it
             // shares the no-snap branch with Char.
             SelectionMode::Char | SelectionMode::Block => None,
             SelectionMode::Word => pivot.map(|piv| {
                 let (drag_start, drag_end_incl) = self
                     .word_selection_at(pane_idx, p)
-                    .map(|w| (w.start, SelectionPoint { row: w.end.row, col: w.end.col.saturating_sub(1) }))
-                    .unwrap_or((p, p));
+                    .map(|w| (lift(w.start), lift(SelectionPoint {
+                        row: w.end.row,
+                        col: w.end.col.saturating_sub(1),
+                    })))
+                    .unwrap_or((p_abs, p_abs));
                 snap_drag_to_range(piv, drag_start, drag_end_incl, false)
             }),
             SelectionMode::Line => pivot.map(|piv| {
                 let (drag_start, drag_end_incl) = self
                     .line_selection_at(pane_idx, p)
-                    .map(|l| (l.start, SelectionPoint { row: l.end.row, col: l.end.col.saturating_sub(1) }))
+                    .map(|l| (lift(l.start), lift(SelectionPoint {
+                        row: l.end.row,
+                        col: l.end.col.saturating_sub(1),
+                    })))
                     .unwrap_or((
-                        SelectionPoint { row: p.row, col: 0 },
-                        SelectionPoint { row: p.row, col: 0 },
+                        lift(SelectionPoint { row: p.row, col: 0 }),
+                        lift(SelectionPoint { row: p.row, col: 0 }),
                     ));
                 snap_drag_to_range(piv, drag_start, drag_end_incl, true)
             }),
@@ -6821,7 +6948,7 @@ impl App {
                     sel.anchor = anchor;
                     sel.focus = focus;
                 }
-                None => sel.focus = p,
+                None => sel.focus = p_abs,
             }
         }
     }
@@ -6885,29 +7012,74 @@ impl App {
     /// Build the plain text representation of the current selection. Returns
     /// `None` when there is no selection or the text is empty after trimming
     /// trailing-space padding on each line.
+    ///
+    /// Iterates by ABSOLUTE row index so copy continues to capture
+    /// the right content even when the selection has been scrolled
+    /// off-screen (or only partially visible). Each abs-row maps
+    /// back to a (scrollback or grid) physical row via the same
+    /// math `Terminal::visible_row` uses internally.
     fn selection_text(&self) -> Option<String> {
         let sel = self.selection?;
         let tab = self.active_tab()?;
         let pane = tab.pane_at(sel.pane_idx)?;
-        let offset = pane.scroll_offset.load(Ordering::Relaxed);
-        let norm = sel.normalized();
         let mut text = String::new();
         if let Ok(term) = pane.terminal.lock() {
-            for r in norm.start.row..=norm.end.row {
-                let Some(row) = term.visible_row(offset, r) else { continue };
-                // Block mode: every row uses the same rect-derived
-                // `[start.col, end.col)` range. Linear mode uses the
-                // historical "open-ended on intermediate rows" rule
-                // so the copied text reads like a stream.
-                let (lo, hi) = if norm.block {
+            let sb_len = if term.is_on_alt_screen() {
+                0
+            } else {
+                term.scrollback_len()
+            };
+            let grid_rows = term.size().rows;
+            // Normalise the absolute-coord anchor / focus into a
+            // [start, end] pair using the same lexicographic /
+            // block-rectangle rules as `to_visible_norm`.
+            let (abs_s_row, s_col, abs_e_row, e_col, block) =
+                if matches!(sel.mode, SelectionMode::Block) {
+                    let (rs, re) = if sel.anchor.abs_row <= sel.focus.abs_row {
+                        (sel.anchor.abs_row, sel.focus.abs_row)
+                    } else {
+                        (sel.focus.abs_row, sel.anchor.abs_row)
+                    };
+                    let (cs, ce) = if sel.anchor.col <= sel.focus.col {
+                        (sel.anchor.col, sel.focus.col + 1)
+                    } else {
+                        (sel.focus.col, sel.anchor.col + 1)
+                    };
+                    (rs, cs, re, ce, true)
+                } else {
+                    let a = (sel.anchor.abs_row, sel.anchor.col);
+                    let f = (sel.focus.abs_row, sel.focus.col);
+                    let (s, e) = if a <= f { (a, f) } else { (f, a) };
+                    (s.0, s.1, e.0, e.1, false)
+                };
+            let total = sb_len as i64 + grid_rows as i64;
+            for abs_r in abs_s_row..=abs_e_row {
+                if abs_r < 0 || abs_r >= total {
+                    continue;
+                }
+                // Re-use `visible_row` by deriving an offset that
+                // places `abs_r` at viewport row 0 (when it's in
+                // scrollback) or use offset=0 + the right grid row
+                // (when it's in the live grid). Same projection as
+                // `Terminal::visible_row` does internally — fewer
+                // surprises than reaching into private state.
+                let row_opt = if (abs_r as usize) < sb_len {
+                    let off = (sb_len - abs_r as usize).min(u16::MAX as usize) as u16;
+                    term.visible_row(off, 0)
+                } else {
+                    let g_row = (abs_r as usize - sb_len) as u16;
+                    term.visible_row(0, g_row)
+                };
+                let Some(row) = row_opt else { continue };
+                let (lo, hi) = if block {
                     (
-                        (norm.start.col as usize).min(row.len()),
-                        (norm.end.col as usize).min(row.len()),
+                        (s_col as usize).min(row.len()),
+                        (e_col as usize).min(row.len()),
                     )
                 } else {
-                    let lo = if r == norm.start.row { norm.start.col as usize } else { 0 };
-                    let hi = if r == norm.end.row {
-                        (norm.end.col as usize).min(row.len())
+                    let lo = if abs_r == abs_s_row { s_col as usize } else { 0 };
+                    let hi = if abs_r == abs_e_row {
+                        (e_col as usize).min(row.len())
                     } else {
                         row.len()
                     };
@@ -6925,7 +7097,7 @@ impl App {
                         text.push(cell.ch);
                     }
                 }
-                if r < norm.end.row {
+                if abs_r < abs_e_row {
                     text.push('\n');
                 }
             }
@@ -9237,16 +9409,16 @@ impl App {
 /// the selection. Otherwise (Word mode) the full (row, col) tuple
 /// decides direction.
 fn snap_drag_to_range(
-    pivot: (SelectionPoint, SelectionPoint),
-    drag_start: SelectionPoint,
-    drag_end_incl: SelectionPoint,
+    pivot: (AbsPoint, AbsPoint),
+    drag_start: AbsPoint,
+    drag_end_incl: AbsPoint,
     row_only: bool,
-) -> (SelectionPoint, SelectionPoint) {
+) -> (AbsPoint, AbsPoint) {
     let (piv_start, piv_end_incl) = pivot;
     let backward = if row_only {
-        drag_start.row < piv_start.row
+        drag_start.abs_row < piv_start.abs_row
     } else {
-        (drag_start.row, drag_start.col) < (piv_start.row, piv_start.col)
+        (drag_start.abs_row, drag_start.col) < (piv_start.abs_row, piv_start.col)
     };
     if backward {
         (piv_end_incl, drag_start)
@@ -10554,12 +10726,15 @@ impl ApplicationHandler<UserEvent> for App {
                             // dir=+1 means cursor below bottom → scroll toward live (offset--).
                             let next = (cur - dir).clamp(0, max_off);
                             pane.scroll_offset.store(next as u16, Ordering::Relaxed);
-                            if let Some(sel) = self.selection.as_mut() {
-                                sel.focus = if dir < 0 {
-                                    SelectionPoint { row: 0, col: 0 }
-                                } else {
-                                    SelectionPoint { row: last_row, col: last_col }
-                                };
+                            let edge_sp = if dir < 0 {
+                                SelectionPoint { row: 0, col: 0 }
+                            } else {
+                                SelectionPoint { row: last_row, col: last_col }
+                            };
+                            if let Some(edge_abs) = self.abs_point(sel_pane_idx, edge_sp) {
+                                if let Some(sel) = self.selection.as_mut() {
+                                    sel.focus = edge_abs;
+                                }
                             }
                         }
                     }
@@ -12315,7 +12490,24 @@ impl ApplicationHandler<UserEvent> for App {
                             return;
                         }
                     };
-                    let sel_normalized = self.selection.map(|s| (s.pane_idx, s.normalized()));
+                    // Translate the absolute-coord selection to
+                    // current viewport rows once per frame, using
+                    // each guard's live `(sb_len, offset)` snapshot
+                    // so the highlight follows wheel scrolls and
+                    // scrollback evictions.
+                    let sel_normalized = self.selection.and_then(|s| {
+                        let g = guards.get(s.pane_idx)?;
+                        let sb_len = if g.is_on_alt_screen() {
+                            0
+                        } else {
+                            g.scrollback_len()
+                        };
+                        let rows = g.size().rows;
+                        let pane = tab.pane_at(s.pane_idx)?;
+                        let offset = pane.scroll_offset.load(Ordering::Relaxed);
+                        s.to_visible_norm(sb_len, offset, rows)
+                            .map(|n| (s.pane_idx, n))
+                    });
                     // While searching, the active match takes priority over
                     // any user-drawn selection.
                     let draws: Vec<PaneDraw> = guards
@@ -12691,6 +12883,13 @@ mod tests {
 
     fn pt(row: u16, col: u16) -> SelectionPoint {
         SelectionPoint { row, col }
+    }
+
+    /// Test helper: build an `AbsPoint` directly from row/col. The
+    /// selection tests assert against ActiveSelection's normalised
+    /// output, which lives in absolute coords now.
+    fn ap(row: i64, col: u16) -> AbsPoint {
+        AbsPoint { abs_row: row, col }
     }
 
     #[test]
@@ -13526,6 +13725,14 @@ mod tests {
         assert!(!s.contains(5, 5));
     }
 
+    /// Render-state helper for ActiveSelection tests: rows=100,
+    /// sb_len=0, offset=0 — that pins `abs_row == viewport_row`,
+    /// so the existing assertions against `SelectionPoint { row, col }`
+    /// stay meaningful without touching every literal.
+    fn norm(s: &ActiveSelection) -> NormSelection {
+        s.to_visible_norm(0, 0, 100).expect("selection in viewport")
+    }
+
     #[test]
     fn active_selection_block_normalizes_rect_corners() {
         // Anchor + focus pinned diagonally; the resulting rect must
@@ -13536,12 +13743,12 @@ mod tests {
         // diagonal-shaped selection.
         let s = ActiveSelection {
             pane_idx: 0,
-            anchor: pt(5, 10),
-            focus: pt(2, 3),
+            anchor: ap(5, 10),
+            focus: ap(2, 3),
             mode: SelectionMode::Block,
             pivot: None,
         };
-        let n = s.normalized();
+        let n = norm(&s);
         assert!(n.block);
         assert_eq!(n.start, pt(2, 3));
         // end.col is exclusive (= max_col + 1).
@@ -13560,25 +13767,59 @@ mod tests {
     fn active_selection_normalizes_swapped_endpoints() {
         let s = ActiveSelection {
             pane_idx: 0,
-            anchor: pt(5, 3),
-            focus: pt(2, 10),
+            anchor: ap(5, 3),
+            focus: ap(2, 10),
             mode: SelectionMode::Char,
             pivot: None,
         };
-        let n = s.normalized();
+        let n = norm(&s);
         assert_eq!(n.start, pt(2, 10));
         assert_eq!(n.end, pt(5, 3));
+    }
+
+    /// Selection scrolled fully above the viewport returns None
+    /// (renderer skips the highlight pass for this pane).
+    #[test]
+    fn selection_scrolled_above_viewport_yields_none() {
+        let s = ActiveSelection {
+            pane_idx: 0,
+            anchor: ap(2, 0),
+            focus: ap(4, 5),
+            mode: SelectionMode::Char,
+            pivot: None,
+        };
+        // sb_len = 10, offset = 0 → abs_row 2..4 maps to viewport
+        // row -8..=-6, fully above the visible window.
+        assert!(s.to_visible_norm(10, 0, 24).is_none());
+    }
+
+    /// Same selection becomes visible once the user scrolls into
+    /// scrollback — proving the wheel-scroll anchoring works.
+    #[test]
+    fn selection_visible_after_scroll_into_scrollback() {
+        let s = ActiveSelection {
+            pane_idx: 0,
+            anchor: ap(2, 0),
+            focus: ap(4, 5),
+            mode: SelectionMode::Char,
+            pivot: None,
+        };
+        // sb_len = 10, offset = 8 → abs_row 2 == viewport row 0,
+        // abs_row 4 == viewport row 2.
+        let n = s.to_visible_norm(10, 8, 24).expect("visible");
+        assert_eq!(n.start, pt(0, 0));
+        assert_eq!(n.end, pt(2, 5));
     }
 
     #[test]
     fn snap_word_drag_forward_uses_pivot_start_and_drag_end() {
         // Pivot word "hello" at row 5, cols 0..=4.
         // User drags right onto word "world" at cols 6..=10.
-        let pivot = (pt(5, 0), pt(5, 4));
+        let pivot = (ap(5, 0), ap(5, 4));
         let (anchor, focus) =
-            snap_drag_to_range(pivot, pt(5, 6), pt(5, 10), false);
-        assert_eq!(anchor, pt(5, 0));
-        assert_eq!(focus, pt(5, 10));
+            snap_drag_to_range(pivot, ap(5, 6), ap(5, 10), false);
+        assert_eq!(anchor, ap(5, 0));
+        assert_eq!(focus, ap(5, 10));
         // Normalized: cells 0..10 inclusive (covers both words).
         let active = ActiveSelection {
             pane_idx: 0,
@@ -13587,7 +13828,7 @@ mod tests {
             mode: SelectionMode::Word,
             pivot: Some(pivot),
         };
-        let n = active.normalized();
+        let n = norm(&active);
         assert_eq!(n.start, pt(5, 0));
         assert_eq!(n.end, pt(5, 10));
     }
@@ -13595,11 +13836,11 @@ mod tests {
     #[test]
     fn snap_word_drag_backward_swaps_anchor_to_pivot_end() {
         // Pivot word at cols 6..=10. Drag left onto word at cols 0..=4.
-        let pivot = (pt(5, 6), pt(5, 10));
+        let pivot = (ap(5, 6), ap(5, 10));
         let (anchor, focus) =
-            snap_drag_to_range(pivot, pt(5, 0), pt(5, 4), false);
-        assert_eq!(anchor, pt(5, 10));
-        assert_eq!(focus, pt(5, 0));
+            snap_drag_to_range(pivot, ap(5, 0), ap(5, 4), false);
+        assert_eq!(anchor, ap(5, 10));
+        assert_eq!(focus, ap(5, 0));
         // Normalized covers the union of both words.
         let active = ActiveSelection {
             pane_idx: 0,
@@ -13608,7 +13849,7 @@ mod tests {
             mode: SelectionMode::Word,
             pivot: Some(pivot),
         };
-        let n = active.normalized();
+        let n = norm(&active);
         assert_eq!(n.start, pt(5, 0));
         assert_eq!(n.end, pt(5, 10));
     }
@@ -13616,22 +13857,22 @@ mod tests {
     #[test]
     fn snap_line_drag_forward_extends_to_drag_row() {
         // Pivot is line 3 cols 0..=20. Drag down to line 7 cols 0..=15.
-        let pivot = (pt(3, 0), pt(3, 20));
+        let pivot = (ap(3, 0), ap(3, 20));
         let (anchor, focus) =
-            snap_drag_to_range(pivot, pt(7, 0), pt(7, 15), true);
-        assert_eq!(anchor, pt(3, 0));
-        assert_eq!(focus, pt(7, 15));
+            snap_drag_to_range(pivot, ap(7, 0), ap(7, 15), true);
+        assert_eq!(anchor, ap(3, 0));
+        assert_eq!(focus, ap(7, 15));
     }
 
     #[test]
     fn snap_line_drag_within_same_row_does_not_flip() {
         // Drag column changes within pivot's row must NOT flip direction.
-        let pivot = (pt(3, 0), pt(3, 20));
+        let pivot = (ap(3, 0), ap(3, 20));
         let (anchor, focus) =
-            snap_drag_to_range(pivot, pt(3, 0), pt(3, 5), true);
+            snap_drag_to_range(pivot, ap(3, 0), ap(3, 5), true);
         // row_only forward path is taken because drag.row == pivot.row.
-        assert_eq!(anchor, pt(3, 0));
-        assert_eq!(focus, pt(3, 5));
+        assert_eq!(anchor, ap(3, 0));
+        assert_eq!(focus, ap(3, 5));
     }
 
     #[test]
