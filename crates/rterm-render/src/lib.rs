@@ -2,6 +2,7 @@
 
 mod bg;
 mod image_decode;
+mod image_pass;
 pub mod palette;
 pub(crate) mod tree;
 pub mod action;

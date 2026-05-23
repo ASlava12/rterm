@@ -14,14 +14,6 @@
 //! one bad frame must not be allowed to take the whole renderer
 //! down.
 //!
-//! Currently unused — the wgpu image pass that calls `decode()`
-//! lands in the next commit. The module stays in main behind
-//! `#[allow(dead_code)]` so the tests still exercise the format
-//! handling and the image-crate compile cost is paid once for the
-//! upcoming pipeline.
-
-#![allow(dead_code)]
-
 use rterm_core::{Image, ImageFormat};
 
 /// Pre-decoded RGBA8 buffer ready for `Queue::write_texture`. Always
