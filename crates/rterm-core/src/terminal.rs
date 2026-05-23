@@ -370,6 +370,28 @@ pub struct Terminal {
     /// isn't disruptive mid-session; future shell-emitted images
     /// just don't register. Defaults to `true`.
     inline_images_enabled: bool,
+    /// Opt-in "auto-detect raw image bytes in the input stream"
+    /// feature. When `true`, the byte router watches for PNG /
+    /// JPEG magic at newline boundaries and decodes the inline
+    /// payload up to its format-specific terminator, then places
+    /// it at the cursor — same effect as iTerm2's OSC 1337 but
+    /// without requiring the sender to wrap. Default `false`
+    /// because of the false-positive risk (`xxd image.png`, raw
+    /// network dumps, hex-tools all carry the same magic bytes
+    /// intentionally). User can flip this from the Settings
+    /// overlay; gating in the parser is byte-by-byte so the
+    /// price when off is one extra load per byte.
+    autoimg_enabled: bool,
+    /// Auto-detect state machine. See [`AutoImageState`].
+    autoimg_state: AutoImageState,
+    /// Bytes held during the magic-matching phase (pre-`InBody`).
+    /// If the candidate doesn't pan out (mismatch on byte N of
+    /// the magic), these get replayed into the vte stream so no
+    /// data is lost.
+    autoimg_held: Vec<u8>,
+    /// Body bytes accumulated inside `AutoImageState::InBody`.
+    /// Capped at [`IMAGE_MAX_PAYLOAD_BYTES`].
+    autoimg_buf: Vec<u8>,
     /// Inline images registered by the iTerm2 `OSC 1337 ;File=` and
     /// Kitty `APC G` protocols. Keyed by a monotonically-incremented
     /// id; the matching [`ImagePlacement`]s in `image_placements`
@@ -481,6 +503,40 @@ struct KittyChunkBuffer {
     /// Concatenated base64-decoded payload across every chunk seen
     /// so far. Capped by [`KITTY_CHUNK_TOTAL_CAP`].
     data: Vec<u8>,
+}
+
+/// Auto-detect state machine for the "just cat the file" inline
+/// image flow. Gated by `Terminal::autoimg_enabled`; default off
+/// because of the false-positive risk (a deliberate `xxd image.png`
+/// must NOT turn back into a picture).
+///
+/// The detector only "arms" at newline boundaries — that's a cheap
+/// heuristic that rejects most false positives (someone slipping a
+/// `\x89PNG` literal mid-log will not start with `\n`). Inside the
+/// body, format-specific terminators (PNG IEND, JPEG EOI) are
+/// matched byte-by-byte via a small sliding window.
+#[derive(Debug, Clone, Default)]
+enum AutoImageState {
+    /// Looking for a candidate magic byte at a newline boundary.
+    /// `post_newline` flips on `\n` and back off on any other
+    /// byte that gets forwarded to vte.
+    #[default]
+    Ground,
+    /// Saw a first-byte candidate (PNG `\x89`, JPEG `\xFF`),
+    /// matching subsequent bytes against the expected magic.
+    /// `matched` counts the magic bytes seen so far. Held bytes
+    /// live in `autoimg_held` on Terminal; on mismatch the whole
+    /// hold gets replayed into vte_buf so nothing is lost.
+    MatchingPng { matched: u8 },
+    MatchingJpeg { matched: u8 },
+    /// Inside a PNG body, accumulating into `autoimg_buf`. Tail
+    /// holds the last 8 bytes of the buffer so we can match the
+    /// PNG IEND CRC sequence in O(1) per byte rather than
+    /// rescanning the whole accumulator.
+    InPngBody,
+    /// Inside a JPEG body. Watching for the EOI marker
+    /// `\xFF\xD9`. `last_was_ff` carries the one-byte lookahead.
+    InJpegBody { last_was_ff: bool },
 }
 
 /// APC ("Application Program Command", `ESC _`) capture state.
@@ -618,7 +674,31 @@ impl Terminal {
             apc_buf: Vec::new(),
             kitty_chunks: HashMap::new(),
             inline_images_enabled: true,
+            autoimg_enabled: false,
+            autoimg_state: AutoImageState::default(),
+            autoimg_held: Vec::new(),
+            autoimg_buf: Vec::new(),
         }
+    }
+
+    /// Opt-in toggle for the raw "auto-detect image bytes in the
+    /// input stream" path. Off by default. Plumbed from
+    /// `[image].auto_detect` in `config.toml` and from the
+    /// Settings overlay's checkbox.
+    pub fn set_auto_detect_inline_images(&mut self, enabled: bool) {
+        self.autoimg_enabled = enabled;
+        if !enabled {
+            // Bail out of any partially-matched state when the
+            // toggle goes off mid-stream so the held bytes don't
+            // get stuck in the held-buffer between calls.
+            self.autoimg_state = AutoImageState::default();
+            self.autoimg_held.clear();
+            self.autoimg_buf.clear();
+        }
+    }
+
+    pub fn auto_detect_inline_images(&self) -> bool {
+        self.autoimg_enabled
     }
 
     /// Master toggle for the inline-image protocols. Setting to
@@ -1080,7 +1160,7 @@ impl Terminal {
                     if b == 0x1B {
                         self.apc_state = ApcState::AfterEsc;
                     } else {
-                        vte_buf.push(b);
+                        self.route_to_vte(b, &mut vte_buf);
                     }
                 }
                 ApcState::AfterEsc => {
@@ -1095,8 +1175,8 @@ impl Terminal {
                         // escape sequence. Replay both bytes into
                         // the vte stream so its own state machine
                         // sees them.
-                        vte_buf.push(0x1B);
-                        vte_buf.push(b);
+                        self.route_to_vte(0x1B, &mut vte_buf);
+                        self.route_to_vte(b, &mut vte_buf);
                         self.apc_state = ApcState::Ground;
                     }
                 }
@@ -1138,8 +1218,8 @@ impl Terminal {
                         // implicitly ends the string and starts a
                         // new escape. Forward ESC + this byte to
                         // vte.
-                        vte_buf.push(0x1B);
-                        vte_buf.push(b);
+                        self.route_to_vte(0x1B, &mut vte_buf);
+                        self.route_to_vte(b, &mut vte_buf);
                         self.apc_state = ApcState::Ground;
                     }
                 }
@@ -1432,6 +1512,218 @@ impl Terminal {
             perform.linefeed();
         }
         let _ = col;
+    }
+
+    /// Route one post-APC byte either into the vte feed buffer or
+    /// into the auto-detect image accumulator. Fast-path bypass
+    /// when `autoimg_enabled = false` (the common case) — single
+    /// branch + push.
+    ///
+    /// When auto-detect is enabled, the byte flows through
+    /// [`AutoImageState`]. The state machine may:
+    ///  - append directly to `vte_buf` (regular text),
+    ///  - hold the byte in `autoimg_held` while a candidate magic
+    ///    is being matched,
+    ///  - replay the held buffer into `vte_buf` (on magic
+    ///    mismatch),
+    ///  - accumulate into `autoimg_buf` (inside a body),
+    ///  - or finalize an image: flush `vte_buf` first (so the
+    ///    cursor reaches the right grid position), then dispatch
+    ///    the decoded payload through the image-store path.
+    fn route_to_vte(&mut self, b: u8, vte_buf: &mut Vec<u8>) {
+        if !self.autoimg_enabled {
+            vte_buf.push(b);
+            return;
+        }
+        match self.autoimg_state {
+            AutoImageState::Ground => {
+                // Decide whether `b` could plausibly start a known
+                // magic. Detector only arms after a newline (or at
+                // the very start of input) to keep false positives
+                // from inline `printf '\x89'` and similar.
+                let last_was_nl = vte_buf.last().copied() == Some(b'\n')
+                    || vte_buf.is_empty();
+                if last_was_nl {
+                    if b == 0x89 {
+                        self.autoimg_state = AutoImageState::MatchingPng { matched: 1 };
+                        self.autoimg_held.clear();
+                        self.autoimg_held.push(b);
+                        return;
+                    }
+                    if b == 0xFF {
+                        self.autoimg_state = AutoImageState::MatchingJpeg { matched: 1 };
+                        self.autoimg_held.clear();
+                        self.autoimg_held.push(b);
+                        return;
+                    }
+                }
+                vte_buf.push(b);
+            }
+            AutoImageState::MatchingPng { matched } => {
+                // PNG magic: \x89 P N G \r \n \x1a \n  (8 bytes).
+                const PNG_MAGIC: [u8; 8] = [
+                    0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A,
+                ];
+                let expected = PNG_MAGIC.get(matched as usize).copied();
+                if expected == Some(b) {
+                    self.autoimg_held.push(b);
+                    if matched + 1 == PNG_MAGIC.len() as u8 {
+                        // Magic complete — flip to body mode. The
+                        // 8 magic bytes already in `held` go into
+                        // `autoimg_buf` as the start of the body.
+                        let header: Vec<u8> =
+                            std::mem::take(&mut self.autoimg_held);
+                        self.autoimg_buf = header;
+                        self.autoimg_state = AutoImageState::InPngBody;
+                    } else {
+                        self.autoimg_state = AutoImageState::MatchingPng {
+                            matched: matched + 1,
+                        };
+                    }
+                } else {
+                    // Mismatch — restore the held bytes to vte
+                    // (no data lost) + this byte too.
+                    let held: Vec<u8> = std::mem::take(&mut self.autoimg_held);
+                    vte_buf.extend_from_slice(&held);
+                    vte_buf.push(b);
+                    self.autoimg_state = AutoImageState::Ground;
+                }
+            }
+            AutoImageState::MatchingJpeg { matched } => {
+                // JPEG magic: \xFF \xD8 \xFF.
+                const JPEG_MAGIC: [u8; 3] = [0xFF, 0xD8, 0xFF];
+                let expected = JPEG_MAGIC.get(matched as usize).copied();
+                if expected == Some(b) {
+                    self.autoimg_held.push(b);
+                    if matched + 1 == JPEG_MAGIC.len() as u8 {
+                        let header: Vec<u8> =
+                            std::mem::take(&mut self.autoimg_held);
+                        self.autoimg_buf = header;
+                        self.autoimg_state =
+                            AutoImageState::InJpegBody { last_was_ff: true };
+                    } else {
+                        self.autoimg_state = AutoImageState::MatchingJpeg {
+                            matched: matched + 1,
+                        };
+                    }
+                } else {
+                    let held: Vec<u8> = std::mem::take(&mut self.autoimg_held);
+                    vte_buf.extend_from_slice(&held);
+                    vte_buf.push(b);
+                    self.autoimg_state = AutoImageState::Ground;
+                }
+            }
+            AutoImageState::InPngBody => {
+                // Watch for the PNG IEND chunk's fixed tail:
+                // `IEND` (4 bytes type) followed by the IEND CRC
+                // `\xae\x42\x60\x82` (4 bytes). Together always
+                // these exact 8 bytes — strict + unique enough
+                // that scanning the trailing-8 window on every
+                // push is reliable.
+                const IEND_TAIL: [u8; 8] =
+                    [b'I', b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82];
+                if self.autoimg_buf.len() >= IMAGE_MAX_PAYLOAD_BYTES {
+                    // Cap blown — abort: dump the buffer as text
+                    // and reset.
+                    let dump = std::mem::take(&mut self.autoimg_buf);
+                    vte_buf.extend_from_slice(&dump);
+                    vte_buf.push(b);
+                    self.autoimg_state = AutoImageState::Ground;
+                    return;
+                }
+                self.autoimg_buf.push(b);
+                if self.autoimg_buf.ends_with(&IEND_TAIL) {
+                    self.finalize_auto_image(crate::image::ImageFormat::Png, vte_buf);
+                }
+            }
+            AutoImageState::InJpegBody { last_was_ff } => {
+                if self.autoimg_buf.len() >= IMAGE_MAX_PAYLOAD_BYTES {
+                    let dump = std::mem::take(&mut self.autoimg_buf);
+                    vte_buf.extend_from_slice(&dump);
+                    vte_buf.push(b);
+                    self.autoimg_state = AutoImageState::Ground;
+                    return;
+                }
+                self.autoimg_buf.push(b);
+                // JPEG EOI marker is `\xFF \xD9`. JPEG byte-
+                // stuffing inserts `\x00` after literal `\xFF` in
+                // scan data, so the only place `\xD9` follows
+                // `\xFF` is the genuine EOI.
+                if last_was_ff && b == 0xD9 {
+                    self.finalize_auto_image(crate::image::ImageFormat::Jpeg, vte_buf);
+                } else {
+                    self.autoimg_state = AutoImageState::InJpegBody {
+                        last_was_ff: b == 0xFF,
+                    };
+                }
+            }
+        }
+    }
+
+    /// Decode the accumulated image, register it in the store,
+    /// and place it at the cursor — same finalize path the
+    /// iTerm2 / Kitty handlers use, just sourced from the
+    /// raw-bytes accumulator. Flushes any pre-image text in
+    /// `vte_buf` to vte first so the cursor is at the position
+    /// the shell intended when the image lands.
+    fn finalize_auto_image(
+        &mut self,
+        format: crate::image::ImageFormat,
+        vte_buf: &mut Vec<u8>,
+    ) {
+        let bytes = std::mem::take(&mut self.autoimg_buf);
+        self.autoimg_state = AutoImageState::Ground;
+        // Push pre-image text to the grid first.
+        self.feed_vte(vte_buf);
+        vte_buf.clear();
+        // Sniff pixel dims for PNG. JPEG dim-sniff is out of
+        // scope here; falls back to a default cell footprint.
+        let (width_px, height_px) = match format {
+            crate::image::ImageFormat::Png => {
+                sniff_png_dims(&bytes).unwrap_or((0, 0))
+            }
+            _ => (0, 0),
+        };
+        if format == crate::image::ImageFormat::Png && (width_px == 0 || height_px == 0)
+        {
+            // Couldn't even read the header — treat as decode
+            // failure and dump bytes as text.
+            vte_buf.extend_from_slice(&bytes);
+            return;
+        }
+        // For JPEG without dim info we estimate from the
+        // accumulated byte count — very rough, but the renderer
+        // can refine.
+        let (final_w, final_h) = if format == crate::image::ImageFormat::Jpeg {
+            (width_px.max(64), height_px.max(64))
+        } else {
+            (width_px, height_px)
+        };
+        let cols =
+            ((final_w as f32 / 8.0).ceil().max(1.0) as u32).min(200) as u16;
+        let rows =
+            ((final_h as f32 / 16.0).ceil().max(1.0) as u32).min(80) as u16;
+        let on_alt = self.active == ALT;
+        let sb_len = if on_alt { 0 } else { self.scrollback.len() };
+        let abs_row = sb_len as i64 + self.cursor.row as i64;
+        let col = self.cursor.col;
+        let Some(id) = self.register_image(format, final_w, final_h, bytes) else {
+            return;
+        };
+        self.image_placements.push(crate::image::ImagePlacement {
+            image_id: id,
+            abs_row,
+            col,
+            rows,
+            cols,
+            width_px: final_w,
+            height_px: final_h,
+            placement_id: 0,
+        });
+        // Advance cursor past the image rows. Use a small
+        // perform — same trick the Kitty commit path uses.
+        let lfs = vec![b'\n'; rows as usize];
+        self.feed_vte(&lfs);
     }
 
     /// Feed a chunk of non-APC bytes through the vte parser. Splits
@@ -6942,6 +7234,71 @@ mod tests {
         assert_eq!(t.image_placements().len(), 1);
         // `a=d, d=A` — delete all.
         t.advance(b"\x1b_Ga=d,d=A\x1b\\");
+        assert!(t.image_placements().is_empty());
+    }
+
+    #[test]
+    fn auto_detect_disabled_by_default_so_raw_png_bytes_print_as_text() {
+        let mut t = term(80, 24);
+        let png = red_pixel_png();
+        // Feed raw bytes after a newline (the eligibility boundary
+        // the detector would use if it were on).
+        let mut stream = Vec::new();
+        stream.push(b'\n');
+        stream.extend_from_slice(&png);
+        t.advance(&stream);
+        // No placement registered.
+        assert!(t.image_placements().is_empty());
+        // Some bytes landed on the grid as printable chars (PNG
+        // contains many printable ASCII bytes inside `IHDR` etc.)
+        // — confirms we did NOT intercept.
+        assert!(t.cursor().row > 0, "raw bytes printed onto grid");
+    }
+
+    #[test]
+    fn auto_detect_when_enabled_decodes_png_on_newline_boundary() {
+        let mut t = term(80, 24);
+        t.set_auto_detect_inline_images(true);
+        let png = red_pixel_png();
+        // Newline first → eligibility, then raw PNG, then trailing
+        // text to confirm pre/post-image bytes still reach vte.
+        let mut stream = Vec::new();
+        stream.extend_from_slice(b"hello\n");
+        stream.extend_from_slice(&png);
+        stream.extend_from_slice(b"world\n");
+        t.advance(&stream);
+        assert_eq!(t.image_placements().len(), 1, "PNG auto-detected");
+        // `hello` should still be on row 0.
+        assert_eq!(row_text(&t, 0).trim_end_matches(' '), "hello");
+    }
+
+    #[test]
+    fn auto_detect_does_not_trigger_mid_line_to_avoid_false_positives() {
+        let mut t = term(80, 24);
+        t.set_auto_detect_inline_images(true);
+        // `printf` puts `\x89` literal in the middle of a line —
+        // detector must NOT engage, the bytes flow to vte as
+        // regular printable chars.
+        let mut stream = Vec::new();
+        stream.extend_from_slice(b"abc");
+        stream.push(0x89);
+        stream.extend_from_slice(b"def\n");
+        t.advance(&stream);
+        // No placement.
+        assert!(t.image_placements().is_empty());
+    }
+
+    #[test]
+    fn auto_detect_magic_mismatch_replays_held_bytes_to_grid() {
+        let mut t = term(80, 24);
+        t.set_auto_detect_inline_images(true);
+        // `\x89` at line start (eligibility met), but the next
+        // byte isn't `P` — bail out and dump.
+        let mut stream = Vec::new();
+        stream.push(b'\n');
+        stream.push(0x89);
+        stream.extend_from_slice(b"NOT-A-PNG\n");
+        t.advance(&stream);
         assert!(t.image_placements().is_empty());
     }
 

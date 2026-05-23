@@ -250,6 +250,15 @@ confirm_min_bytes = 80
 # backend, etc.
 #   Type:   bool. Default: true.
 enabled = true
+# auto_detect — sniff raw PNG / JPEG magic bytes in the input
+# stream (at newline boundaries) and decode them as inline images.
+# Lets `cat picture.png` "just work" without a helper utility.
+# Disabled by default — `xxd image.png` / `nc < image.png` /
+# hex-dump utilities all stream the same magic bytes intentionally
+# and would surprise-render as pictures. Toggle anytime via the
+# Settings overlay (Ctrl+Shift+, → "Auto-detect inline images").
+#   Type:   bool. Default: false.
+auto_detect = false
 
 # ── [colors] ──────────────────────────────────────────────────────────
 # Terminal palette overrides. Every entry is an optional `[r, g, b]`

@@ -2533,6 +2533,10 @@ enum SettingsHit {
     ToggleBlink,
     /// Toggle scrollbar visibility.
     ToggleScrollbar,
+    /// Toggle the opt-in "auto-detect raw image bytes in the
+    /// input stream" feature. Off by default; flipping here
+    /// propagates to every live pane's `Terminal`.
+    ToggleAutoDetectImages,
     /// Swap to the help overlay (`Ctrl+Shift+H` equivalent).
     OpenHelp,
     /// Close the settings overlay.
@@ -2981,6 +2985,11 @@ pub struct RunConfig {
     pub cursor_blink: bool,
     /// Whether to draw the slim right-edge scrollbar.
     pub show_scrollbar: bool,
+    /// Initial state of `[image].auto_detect` — opt-in raw image
+    /// detection in the input stream. The Settings overlay's
+    /// checkbox reads this value on render and can flip it
+    /// runtime; flips propagate to every live pane's terminal.
+    pub image_auto_detect: bool,
     /// On-screen flash on BEL. `false` keeps the `bell` plugin event but
     /// skips the visual flash for users who find it distracting.
     pub bell_visual: bool,
@@ -3207,6 +3216,12 @@ pub struct App {
     cursor_blink: bool,
     /// `terminal.show_scrollbar` — toggles the right-edge scrollbar.
     show_scrollbar: bool,
+    /// `[image].auto_detect` — opt-in detection of raw PNG / JPEG
+    /// magic bytes in the input stream. Mirrored here so the
+    /// Settings overlay can render the checkbox state without
+    /// reaching into any pane's `Terminal`; toggling the box
+    /// writes through to every live pane's terminal.
+    image_auto_detect: bool,
     /// `terminal.bell_visual` — turn the on-screen flash on/off.
     bell_visual: bool,
     /// `terminal.bell_urgent` — turn the taskbar attention ping on/off.
@@ -3351,6 +3366,7 @@ impl App {
             scroll_on_output,
             cursor_blink,
             show_scrollbar,
+            image_auto_detect,
             bell_visual,
             bell_urgent,
             tab_silence_ms,
@@ -3453,6 +3469,7 @@ impl App {
             scroll_on_output,
             cursor_blink,
             show_scrollbar,
+            image_auto_detect,
             bell_visual,
             bell_urgent,
             allow_osc52,
@@ -3581,6 +3598,22 @@ impl App {
 
     fn reset_cursor_blink(&mut self) {
         self.cursor_blink_anchor = Instant::now();
+    }
+
+    /// Push the current `image_auto_detect` value into every live
+    /// pane's `Terminal`. Called when the user toggles the
+    /// checkbox in the Settings overlay — without this, the App
+    /// would track the new value but the parsers would keep
+    /// using whatever state they had at pane-spawn time.
+    fn propagate_auto_detect_to_panes(&mut self) {
+        let enabled = self.image_auto_detect;
+        for tab in &self.tabs {
+            for pane in tab.panes() {
+                if let Ok(mut term) = pane.terminal.lock() {
+                    term.set_auto_detect_inline_images(enabled);
+                }
+            }
+        }
     }
 
     fn active_tab(&self) -> Option<&Tab> {
@@ -4112,6 +4145,10 @@ impl App {
             }
             Some(SettingsHit::ToggleScrollbar) => {
                 self.show_scrollbar = !self.show_scrollbar;
+            }
+            Some(SettingsHit::ToggleAutoDetectImages) => {
+                self.image_auto_detect = !self.image_auto_detect;
+                self.propagate_auto_detect_to_panes();
             }
             Some(SettingsHit::OpenHelp) => {
                 self.show_settings = false;

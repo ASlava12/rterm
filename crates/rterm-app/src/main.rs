@@ -82,6 +82,9 @@ impl PaneSpawner for GuiSpawner {
         // Honour `[image].enabled` — when false, both iTerm2 and
         // Kitty image protocols drop new payloads at parse time.
         term.set_inline_images_enabled(self.config.image.enabled);
+        // Honour `[image].auto_detect` — off by default; opt-in
+        // detection of raw PNG / JPEG magic bytes in the input.
+        term.set_auto_detect_inline_images(self.config.image.auto_detect);
         let terminal: SharedTerminal = Arc::new(Mutex::new(term));
 
         let (program, args) = resolve_shell(&self.config);
@@ -1819,6 +1822,7 @@ fn run_gui(
         scroll_on_output: config.terminal.scroll_on_output,
         cursor_blink: config.terminal.cursor_blink,
         show_scrollbar: config.terminal.show_scrollbar,
+        image_auto_detect: config.image.auto_detect,
         bell_visual: config.terminal.bell_visual,
         bell_urgent: config.terminal.bell_urgent,
         tab_silence_ms: config.terminal.tab_silence_ms,

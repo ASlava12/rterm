@@ -605,6 +605,19 @@ impl App {
         push_hit(&mut self.settings_hits, scroll_row, 2, 22, SettingsHit::ToggleScrollbar);
         row += 1;
 
+        let autoimg_row = row;
+        let autoimg_mark = if self.image_auto_detect { "[x]" } else { "[ ]" };
+        storage.push(format!("  {} Auto-detect inline images\n", autoimg_mark));
+        spans.push((storage.len() - 1, fg, false));
+        push_hit(
+            &mut self.settings_hits,
+            autoimg_row,
+            2,
+            32,
+            SettingsHit::ToggleAutoDetectImages,
+        );
+        row += 1;
+
         storage.push("\n".to_string());
         spans.push((storage.len() - 1, fg, false));
         row += 1;

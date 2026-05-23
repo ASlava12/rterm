@@ -37,11 +37,21 @@ pub struct Config {
 #[serde(default)]
 pub struct ImageConfig {
     pub enabled: bool,
+    /// Opt-in: detect raw PNG / JPEG magic bytes in the input
+    /// stream (at newline boundaries) and display them as
+    /// images — lets `cat picture.png` "just work" without a
+    /// helper utility. Disabled by default because of the
+    /// false-positive risk (intentional hex / network dumps).
+    /// User can flip from the Settings overlay too.
+    pub auto_detect: bool,
 }
 
 impl Default for ImageConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            auto_detect: false,
+        }
     }
 }
 
