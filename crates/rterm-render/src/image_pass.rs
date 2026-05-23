@@ -38,14 +38,6 @@
 //! garbage-collected by [`ImageLayer::sweep`], called per-frame
 //! against the set of currently-referenced ids.
 //!
-//! Currently the wiring into `GpuState::render` is the very next
-//! commit — until then, the module compiles + the pipeline is
-//! validated by `cargo build`, but no quads are emitted yet. The
-//! `#![allow(dead_code)]` falls off once `App::redraw` calls into
-//! [`ImageLayer::prepare`] / [`ImageLayer::render`].
-
-#![allow(dead_code)]
-
 use std::collections::{HashMap, HashSet};
 
 use bytemuck::{Pod, Zeroable};
@@ -70,13 +62,22 @@ struct Instance {
     size: [f32; 2],
 }
 
+/// Globally-unique cache key for a single image instance. Composed
+/// of `(pane_uid, image_id)` because every pane's Terminal owns its
+/// own monotonic `image_id` counter — IDs collide across panes
+/// otherwise (pane A's image 1 != pane B's image 1).
+pub type CacheKey = (u64, u64);
+
 /// One textured rectangle the renderer wants to draw. Built by the
 /// App layer from a `(pane_rect, image_placement, cell_metrics)`
 /// triple — the placement itself stays in `rterm-core` and doesn't
 /// know about pixel space.
 #[derive(Debug, Clone, Copy)]
 pub struct ImageQuad {
-    pub image_id: u64,
+    /// `(pane_uid, image_id)` — the cache key the texture lives
+    /// under. The renderer doesn't see `image_id` in isolation;
+    /// see [`CacheKey`].
+    pub key: CacheKey,
     pub pos: [f32; 2],
     pub size: [f32; 2],
 }
@@ -126,7 +127,12 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
 "#;
 
 struct ImageCacheEntry {
-    texture: wgpu::Texture,
+    /// Owned GPU texture. Not read directly — the bind group below
+    /// holds the texture view that the fragment shader samples. The
+    /// field exists to extend the texture's lifetime to match its
+    /// view; dropping it would invalidate the bind group between
+    /// the prepare and render passes.
+    _texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
 }
 
@@ -136,17 +142,17 @@ pub struct ImageLayer {
     viewport_buffer: wgpu::Buffer,
     sampler: wgpu::Sampler,
     image_bgl: wgpu::BindGroupLayout,
-    cache: HashMap<u64, ImageCacheEntry>,
-    /// IDs we already tried to decode and failed on. Avoids burning
-    /// CPU on the same bad payload every frame.
-    failed: HashSet<u64>,
+    cache: HashMap<CacheKey, ImageCacheEntry>,
+    /// Keys we already tried to decode and failed on. Avoids
+    /// burning CPU on the same bad payload every frame.
+    failed: HashSet<CacheKey>,
     instance_buffer: wgpu::Buffer,
     capacity: u64,
-    /// Per-frame draw groups: `(image_id, [first..last])` index
-    /// ranges into `instance_buffer`. One draw call per group;
-    /// each call binds the matching `ImageCacheEntry`'s bind
-    /// group and instances the shared quad.
-    groups: Vec<(u64, std::ops::Range<u32>)>,
+    /// Per-frame draw groups: `(key, [first..last])` index ranges
+    /// into `instance_buffer`. One draw call per group; each call
+    /// binds the matching `ImageCacheEntry`'s bind group and
+    /// instances the shared quad.
+    groups: Vec<(CacheKey, std::ops::Range<u32>)>,
     viewport: [f32; 2],
     /// Scratch buffer reused per-frame for the staging fill of
     /// `instance_buffer` — same trick `BgLayer` uses to avoid
@@ -308,9 +314,9 @@ impl ImageLayer {
     /// Kitty `a=d` delete actions). Re-uploading on next reference
     /// is a millisecond-scale cost, well below the per-frame
     /// budget, so we don't try to soft-evict here.
-    pub fn sweep(&mut self, live_ids: &HashSet<u64>) {
-        self.cache.retain(|id, _| live_ids.contains(id));
-        self.failed.retain(|id| live_ids.contains(id));
+    pub fn sweep(&mut self, live: &HashSet<CacheKey>) {
+        self.cache.retain(|k, _| live.contains(k));
+        self.failed.retain(|k| live.contains(k));
     }
 
     /// Look up — or lazily upload — the GPU resources for an
@@ -322,24 +328,25 @@ impl ImageLayer {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        key: CacheKey,
         image: &Image,
     ) -> bool {
-        if self.cache.contains_key(&image.id) {
+        if self.cache.contains_key(&key) {
             return true;
         }
-        if self.failed.contains(&image.id) {
+        if self.failed.contains(&key) {
             return false;
         }
         let decoded = match image_decode::decode(image) {
             Some(d) => d,
             None => {
-                self.failed.insert(image.id);
+                self.failed.insert(key);
                 return false;
             }
         };
         // Refuse degenerate dimensions — wgpu requires at least 1×1.
         if decoded.width == 0 || decoded.height == 0 {
-            self.failed.insert(image.id);
+            self.failed.insert(key);
             return false;
         }
         let extent = wgpu::Extent3d {
@@ -392,7 +399,7 @@ impl ImageLayer {
                 },
             ],
         });
-        self.cache.insert(image.id, ImageCacheEntry { texture, bind_group });
+        self.cache.insert(key, ImageCacheEntry { _texture: texture, bind_group });
         true
     }
 
@@ -407,9 +414,9 @@ impl ImageLayer {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         quads: &[ImageQuad],
-        mut images_for: F,
+        mut image_for: F,
     ) where
-        F: FnMut(u64) -> Option<Image>,
+        F: FnMut(CacheKey) -> Option<Image>,
     {
         // Reset per-frame state. Pull the scratch Vec out so the
         // ensure_uploaded path can keep &mut self for the cache.
@@ -422,37 +429,37 @@ impl ImageLayer {
             return;
         }
 
-        // Group quads by image_id, preserving order so multiple
-        // panes don't accidentally interleave (which would force
-        // separate draw calls and lose batching).
-        let mut by_id: HashMap<u64, Vec<&ImageQuad>> = HashMap::new();
-        let mut order: Vec<u64> = Vec::new();
+        // Group quads by cache key, preserving first-occurrence
+        // order so multi-pane streams don't accidentally interleave
+        // (which would force separate draw calls and lose batching).
+        let mut by_key: HashMap<CacheKey, Vec<&ImageQuad>> = HashMap::new();
+        let mut order: Vec<CacheKey> = Vec::new();
         for q in quads {
-            let entry = by_id.entry(q.image_id).or_default();
+            let entry = by_key.entry(q.key).or_default();
             if entry.is_empty() {
-                order.push(q.image_id);
+                order.push(q.key);
             }
             entry.push(q);
         }
 
-        for id in &order {
+        for key in &order {
             // Upload (or reuse cache) for this image. If decode
-            // fails, the id stays in `failed` and is silently
+            // fails, the key stays in `failed` and is silently
             // skipped from now on.
-            let img = match images_for(*id) {
+            let img = match image_for(*key) {
                 Some(i) => i,
                 None => continue,
             };
-            if !self.ensure_uploaded(device, queue, &img) {
+            if !self.ensure_uploaded(device, queue, *key, &img) {
                 continue;
             }
             let start = instances.len() as u32;
-            for q in by_id.get(id).into_iter().flatten() {
+            for q in by_key.get(key).into_iter().flatten() {
                 instances.push(Instance { pos: q.pos, size: q.size });
             }
             let end = instances.len() as u32;
             if end > start {
-                self.groups.push((*id, start..end));
+                self.groups.push((*key, start..end));
             }
         }
 
@@ -502,18 +509,11 @@ impl ImageLayer {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.viewport_bind_group, &[]);
         pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-        for (id, range) in &self.groups {
-            let Some(entry) = self.cache.get(id) else { continue };
+        for (key, range) in &self.groups {
+            let Some(entry) = self.cache.get(key) else { continue };
             pass.set_bind_group(1, &entry.bind_group, &[]);
             pass.draw(0..6, range.clone());
         }
     }
 
-    /// Count of currently-cached GPU entries. Mostly here so the
-    /// test harness can assert sweep behaviour without poking at
-    /// private state.
-    #[cfg(test)]
-    pub(crate) fn cache_len(&self) -> usize {
-        self.cache.len()
-    }
 }

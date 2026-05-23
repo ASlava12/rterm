@@ -542,6 +542,12 @@ pub struct PaneDraw<'a> {
     /// Cursor blink phase. When false, the cursor block is suppressed even if
     /// the terminal's DECTCEM says it should be visible.
     pub blink_on: bool,
+    /// Pane's unique identifier — used by the image pass to
+    /// namespace its texture cache. Image IDs are monotonic
+    /// per-pane (every `Terminal` owns its own counter), so we
+    /// need `(pane_uid, image_id)` to avoid one pane's image
+    /// accidentally aliasing another's in the GPU cache.
+    pub pane_uid: u64,
 }
 
 pub struct TextLayer {
@@ -1572,6 +1578,10 @@ impl TextLayer {
 pub struct GpuState {
     pub text: TextLayer,
     bg: BgLayer,
+    /// Inline-image pipeline. Owned alongside `bg` / `text`, drawn
+    /// between the bg-quad pass and the overlay pass so images sit
+    /// on top of cell backgrounds and under modal panels.
+    images: image_pass::ImageLayer,
     clear_color: wgpu::Color,
     config: wgpu::SurfaceConfiguration,
     surface: wgpu::Surface<'static>,
@@ -1813,6 +1823,8 @@ impl GpuState {
         tracing::info!("building bg layer");
         let mut bg = BgLayer::new(&device, format);
         bg.resize(config.width, config.height);
+        let mut images = image_pass::ImageLayer::new(&device, format);
+        images.resize(config.width, config.height);
         tracing::info!("gpu state ready");
 
         // Default surface clear matches DEFAULT_BG; pre-multiply RGB if the
@@ -1838,6 +1850,7 @@ impl GpuState {
             clear_color,
             text,
             bg,
+            images,
         })
     }
 
@@ -1866,6 +1879,7 @@ impl GpuState {
         self.surface.configure(&self.device, &self.config);
         self.text.resize(&self.queue, cw, ch);
         self.bg.resize(cw, ch);
+        self.images.resize(cw, ch);
     }
 
     pub fn window(&self) -> &Arc<Window> {
@@ -1968,6 +1982,74 @@ impl GpuState {
             before_panes,
             after_panes,
         );
+
+        // Build the inline-image quad list. Walks every pane's
+        // `image_placements()` and projects each placement's
+        // absolute (scrollback ++ grid) row coords into the
+        // visible viewport using the same `abs_row + offset -
+        // sb_len` mapping the selection / search paths use. Quads
+        // that fall outside the pane rect are silently skipped —
+        // the renderer doesn't try to clip mid-quad on the GPU
+        // side, so an image partially scrolled off-screen
+        // disappears at the edge rather than getting cut on the
+        // pane boundary. Acceptable for v1; a future pass could
+        // emit per-row sub-quads to support smooth edge clipping.
+        let mut image_quads: Vec<image_pass::ImageQuad> = Vec::new();
+        let mut live_keys: std::collections::HashSet<image_pass::CacheKey> =
+            std::collections::HashSet::new();
+        for p in panes {
+            let placements = p.terminal.image_placements();
+            if placements.is_empty() {
+                continue;
+            }
+            let on_alt = p.terminal.is_on_alt_screen();
+            let sb_len = if on_alt {
+                0
+            } else {
+                p.terminal.scrollback_len()
+            };
+            let grid_rows = p.terminal.size().rows as i64;
+            for pl in placements {
+                // Project absolute row into the viewport.
+                let viewport_row =
+                    pl.abs_row + p.scroll_offset as i64 - sb_len as i64;
+                if viewport_row + pl.rows as i64 <= 0 {
+                    continue; // fully above the visible window
+                }
+                if viewport_row >= grid_rows {
+                    continue; // fully below
+                }
+                let pos = [
+                    p.rect.left + pl.col as f32 * cell_w,
+                    p.rect.top + viewport_row as f32 * line_h,
+                ];
+                let size = [pl.cols as f32 * cell_w, pl.rows as f32 * line_h];
+                let key = (p.pane_uid, pl.image_id);
+                live_keys.insert(key);
+                image_quads.push(image_pass::ImageQuad { key, pos, size });
+            }
+        }
+        // GC textures for image ids that no longer have placements
+        // (FIFO-evicted, RIS, or just panes that closed).
+        self.images.sweep(&live_keys);
+        // Closure that the image pass uses to fetch the source
+        // bytes for a (pane_uid, image_id) pair. Walks the panes
+        // to find the matching `Terminal`, then asks for its
+        // image — we can't precompute a HashMap of images because
+        // the renderer doesn't own the `Terminal` (the pane
+        // mutex guards do, scoped to the closure).
+        self.images.prepare(
+            &self.device,
+            &self.queue,
+            &image_quads,
+            |(pane_uid, image_id)| {
+                panes
+                    .iter()
+                    .find(|p| p.pane_uid == pane_uid)
+                    .and_then(|p| p.terminal.image(image_id))
+                    .cloned()
+            },
+        );
         static R2: std::sync::Once = std::sync::Once::new();
         R2.call_once(|| tracing::debug!("render: entering text.prepare"));
         if let Err(e) = self.text.prepare(
@@ -2023,14 +2105,26 @@ impl GpuState {
                 occlusion_query_set: None,
             });
             // Layered render so overlay panels sit ABOVE pane glyphs:
-            //   1. bg.draw_main  — pane backgrounds, cursor, dim
-            //   2. text.render_main — pane + header glyphs
-            //   3. bg.draw_overlay — modal backdrop panels
-            //   4. text.render_overlay — modal text
-            // Without (3) sandwiched between (2) and (4) the overlay
+            //   1. bg.draw_main    — pane backgrounds, cursor, dim
+            //   2. images.render   — inline image quads (iTerm2 /
+            //                        Kitty), drawn over cell bg so
+            //                        the underlying default-bg
+            //                        colour doesn't show through
+            //                        partially-transparent images
+            //                        but BEFORE text so glyphs that
+            //                        coincidentally overlap (which
+            //                        shouldn't happen — parser
+            //                        advances past image rows — but
+            //                        is harmless if it does) sit
+            //                        on top of the bitmap.
+            //   3. text.render_main — pane + header glyphs
+            //   4. bg.draw_overlay  — modal backdrop panels
+            //   5. text.render_overlay — modal text
+            // Without (4) sandwiched between (3) and (5) the overlay
             // panel ends up under both text passes and pane glyphs
             // bleed through the menu — the original visual bug.
             self.bg.draw_main(&mut pass);
+            self.images.render(&mut pass);
             if let Err(e) = self.text.render_main(&mut pass) {
                 tracing::warn!("text render main failed: {e:#}");
             }
@@ -12540,6 +12634,10 @@ impl ApplicationHandler<UserEvent> for App {
                                 rect: *rect,
                                 selection: sel,
                                 blink_on,
+                                pane_uid: tab
+                                    .pane_at(i)
+                                    .map(|p| p.uid)
+                                    .unwrap_or(0),
                             }
                         })
                         .collect();
