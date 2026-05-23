@@ -51,11 +51,12 @@ If a session opens with just "продолжай" (continue), read this file plu
 
 Typical next chunks at this stage:
 1. Selection anchored to absolute logical lines (currently viewport-relative — drifts when scrollback shifts)
-2. Right-click context menu (currently right-click pastes)
-3. Sixel / ReGIS graphics decoding
-4. Visual feedback during tab drag-reorder (ghost label following cursor)
-5. `rterm.scrollback_text(tab, pane, max_lines)` — bottom-N scrollback for any pane
-6. `rterm.set_pane_title_by_uid` — pane-title override that survives pane reorders / closes
+2. Sixel / ReGIS graphics decoding
+3. Ghost label TEXT following the cursor during tab drag-reorder (the
+   chip background already follows via `tab_bar_quads`'s ghost branch,
+   but the label glyphs stay at the original slot position — a separate
+   ghost text-buffer rendered at `cursor.x - press_offset` would close
+   the gap).
 
 ## Conventions
 
