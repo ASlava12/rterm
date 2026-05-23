@@ -576,6 +576,15 @@ pub struct TextLayer {
     /// left the glyph text anchored to the header left — labels and
     /// chips drifted apart visibly.
     header_tabs_buffer: Buffer,
+    /// Cursor-following ghost label rendered ONLY while a tab drag
+    /// is in flight. The ghost CHIP background is drawn via
+    /// `tab_bar_quads` at `cursor.x - press_offset`, but the label
+    /// text used to stay parked at the source slot (just dimmed) —
+    /// reads as a disconnected drop-shadow. This buffer carries
+    /// just the dragged tab's label and its TextArea is positioned
+    /// to land exactly on top of the ghost chip, closing the visual
+    /// gap. Empty buffer when no drag is active.
+    header_tabs_ghost_buffer: Buffer,
     /// Window-title text in the centre of the top-row title bar
     /// (VSCode pattern). Separate from `header_buffer` so its position
     /// can be derived independently of the tab strip's width.
@@ -647,6 +656,23 @@ pub struct HeaderTabsDraw<'a> {
     /// tab that's scrolled off-screen-left doesn't paint over the
     /// hamburger glyph.
     pub left_clip: f32,
+}
+
+/// Cursor-following ghost label rendered ONLY while a tab drag is in
+/// flight. Paired with the ghost chip background that `tab_bar_quads`
+/// emits at the same position. Both layers move together so the
+/// dragged tab reads as a single object lifted off the strip.
+pub struct HeaderTabsGhostDraw<'a> {
+    pub spans: SpanList<'a>,
+    /// Pixel x of the ghost chip's left edge — `cursor.x -
+    /// press_offset` clamped so the ghost can't slide past the
+    /// hamburger / window-controls strip.
+    pub left: f32,
+    pub top: f32,
+    /// Render width for the ghost label; matches the source chip
+    /// so the label clips at the same right edge as its background.
+    pub width: f32,
+    pub height: f32,
 }
 
 /// Right-anchored mini-header that paints the window-control glyphs
@@ -878,6 +904,9 @@ impl TextLayer {
         let mut header_tabs_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_height));
         header_tabs_buffer.set_monospace_width(&mut font_system, Some(cell_width));
         header_tabs_buffer.set_wrap(&mut font_system, Wrap::None);
+        let mut header_tabs_ghost_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_height));
+        header_tabs_ghost_buffer.set_monospace_width(&mut font_system, Some(cell_width));
+        header_tabs_ghost_buffer.set_wrap(&mut font_system, Wrap::None);
         let mut title_bar_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_height));
         title_bar_buffer.set_monospace_width(&mut font_system, Some(cell_width));
         let mut status_bar_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_height));
@@ -897,6 +926,7 @@ impl TextLayer {
             header_buffer,
             header_right_buffer,
             header_tabs_buffer,
+            header_tabs_ghost_buffer,
             title_bar_buffer,
             status_bar_buffer,
             overlay_buffer,
@@ -1116,6 +1146,7 @@ impl TextLayer {
         header: Option<&HeaderDraw<'_>>,
         header_right: Option<&HeaderRightDraw<'_>>,
         header_tabs: Option<&HeaderTabsDraw<'_>>,
+        header_tabs_ghost: Option<&HeaderTabsGhostDraw<'_>>,
         title_bar: Option<&TitleBarDraw<'_>>,
         status_bar: Option<&StatusBarDraw<'_>>,
         overlay: Option<&OverlayDraw<'_>>,
@@ -1273,6 +1304,46 @@ impl TextLayer {
                     top: h.top as i32,
                     right: h.right_clip as i32,
                     bottom: (h.top + h.height) as i32,
+                },
+                default_color: GlyphColor::rgb(220, 220, 220),
+                custom_glyphs: &[],
+            });
+        }
+        // Ghost-label glyphs for a tab being dragged. Shaped into a
+        // separate buffer + emitted as the last header TextArea so
+        // it draws ON TOP of the regular tab labels — closing the
+        // visual gap where the chip background follows the cursor
+        // but the label text used to stay parked at the source slot.
+        if let Some(g) = header_tabs_ghost {
+            self.header_tabs_ghost_buffer.set_size(
+                &mut self.font_system,
+                Some(g.width.max(1.0)),
+                Some(g.height),
+            );
+            self.header_tabs_ghost_buffer.set_rich_text(
+                &mut self.font_system,
+                g.spans.iter().map(|(s, fg, bold)| {
+                    let mut a = default_attrs.color(GlyphColor::rgb(fg[0], fg[1], fg[2]));
+                    if *bold {
+                        a = a.weight(Weight::BOLD);
+                    }
+                    (*s, a)
+                }),
+                default_attrs,
+                Shaping::Advanced,
+            );
+            self.header_tabs_ghost_buffer.shape_until_scroll(&mut self.font_system, false);
+            let text_offset = ((g.height - self.line_height) * 0.5).max(0.0);
+            main_areas.push(TextArea {
+                buffer: &self.header_tabs_ghost_buffer,
+                left: g.left,
+                top: g.top + text_offset,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: g.left as i32,
+                    top: g.top as i32,
+                    right: (g.left + g.width) as i32,
+                    bottom: (g.top + g.height) as i32,
                 },
                 default_color: GlyphColor::rgb(220, 220, 220),
                 custom_glyphs: &[],
@@ -1862,12 +1933,14 @@ impl GpuState {
 
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         panes: &[PaneDraw<'_>],
         header: Option<&HeaderDraw<'_>>,
         header_right: Option<&HeaderRightDraw<'_>>,
         header_tabs: Option<&HeaderTabsDraw<'_>>,
+        header_tabs_ghost: Option<&HeaderTabsGhostDraw<'_>>,
         title_bar: Option<&TitleBarDraw<'_>>,
         status_bar: Option<&StatusBarDraw<'_>>,
         overlay: Option<&OverlayDraw<'_>>,
@@ -1902,6 +1975,7 @@ impl GpuState {
             header,
             header_right,
             header_tabs,
+            header_tabs_ghost,
             title_bar,
             status_bar,
             overlay,
@@ -4736,6 +4810,36 @@ impl App {
             .into_iter()
             .map(|(idx, color, bold)| (storage[idx].as_str(), color, bold))
             .collect()
+    }
+
+    /// Build the single-tab spans for the cursor-following ghost
+    /// label rendered during a tab drag. Returns `None` when no
+    /// drag is in flight (or the source index is stale). Reuses
+    /// `tab_label` so the ghost text matches whatever
+    /// `header_tabs_spans` would have drawn for that tab — same
+    /// prefix / pane count / zoom marker — just at full intensity
+    /// instead of the dimmed-source colour.
+    fn header_tabs_ghost_spans<'a>(
+        &self,
+        storage: &'a mut Vec<String>,
+    ) -> Option<Vec<(&'a str, [u8; 3], bool)>> {
+        let idx = self.tab_dragging?;
+        let tab = self.tabs.get(idx)?;
+        let info = self.tab_label(idx, tab);
+        storage.clear();
+        storage.push(info.label);
+        // Active tab gets full default-fg; non-active uses the same
+        // muted colour the regular strip uses for inactive tabs.
+        // Activity-yellow and progress badges are intentionally
+        // dropped from the ghost — those signal "background news",
+        // which is incongruous on a chip the user is actively
+        // moving.
+        let color = if info.active {
+            palette::default_fg()
+        } else {
+            palette::default_fg().map(|c| c.saturating_sub(80))
+        };
+        Some(vec![(storage[0].as_str(), color, info.active)])
     }
 
     fn sync_terminal_size(&self) {
@@ -12032,6 +12136,9 @@ impl ApplicationHandler<UserEvent> for App {
                 let mut tabs_storage: Vec<String> = Vec::new();
                 let header_tabs_spans = self.header_tabs_spans(&mut tabs_storage);
                 let header_tabs_layout = self.tab_layout();
+                let mut tabs_ghost_storage: Vec<String> = Vec::new();
+                let header_tabs_ghost_spans =
+                    self.header_tabs_ghost_spans(&mut tabs_ghost_storage);
                 let mut header_right_storage: Vec<String> = Vec::new();
                 let header_right = self.header_right_spans(&mut header_right_storage);
                 // Title bar text is folded back into the single-row
@@ -12303,6 +12410,44 @@ impl ApplicationHandler<UserEvent> for App {
                             left_clip,
                         })
                     });
+                    // Cursor-following ghost label. Built only when
+                    // a drag is in flight (the spans builder returns
+                    // None otherwise). Position math mirrors the
+                    // ghost-chip branch in `tab_bar_quads`: the
+                    // chip's left edge is `cursor.x - press_offset +
+                    // gap/2`, and the label has to land exactly on
+                    // top of that chip, so we reuse the same
+                    // arithmetic plus the source tab's chip width.
+                    let header_tabs_ghost_draw = match (
+                        header_tabs_ghost_spans,
+                        self.tab_dragging,
+                        header_tabs_layout.as_ref(),
+                        tab_strip_rect_for_draw,
+                    ) {
+                        (Some(spans), Some(src_idx), Some(layout), Some(rect)) => {
+                            const TAB_GAP: f32 = 2.0; // matches `tab_bar_quads`
+                            layout
+                                .entries
+                                .iter()
+                                .find(|e| e.idx == src_idx)
+                                .map(|e| {
+                                    let chip_width =
+                                        ((e.close_end - e.left) as f32 - TAB_GAP).max(2.0);
+                                    let ghost_left = (self.cursor_pos.x
+                                        - self.tab_drag_press_offset)
+                                        as f32
+                                        + TAB_GAP * 0.5;
+                                    HeaderTabsGhostDraw {
+                                        spans,
+                                        left: ghost_left,
+                                        top: rect.top,
+                                        width: chip_width,
+                                        height: rect.height,
+                                    }
+                                })
+                        }
+                        _ => None,
+                    };
                     let header_right_draw =
                         header_right.map(|(spans, rect)| HeaderRightDraw { spans, rect });
                     let title_bar_draw =
@@ -12456,6 +12601,7 @@ impl ApplicationHandler<UserEvent> for App {
                         header_draw.as_ref(),
                         header_right_draw.as_ref(),
                         header_tabs_draw.as_ref(),
+                        header_tabs_ghost_draw.as_ref(),
                         title_bar_draw.as_ref(),
                         status_bar_draw.as_ref(),
                         overlay_draw.as_ref(),
