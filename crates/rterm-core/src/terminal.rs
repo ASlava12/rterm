@@ -361,6 +361,15 @@ pub struct Terminal {
     /// per id to avoid an unbounded buffer if a sender drops the
     /// terminator. Cleared on RIS.
     kitty_chunks: HashMap<u32, KittyChunkBuffer>,
+    /// Master switch for the inline-image protocols
+    /// (iTerm2 `OSC 1337 ; File =`, Kitty `APC G ...`). When
+    /// `false`, both parser entry points drop their payload
+    /// silently — useful for paranoid setups, low-bandwidth SSH
+    /// sessions, or when a buggy app is flooding malformed
+    /// payloads. Already-stored images stay put so the toggle
+    /// isn't disruptive mid-session; future shell-emitted images
+    /// just don't register. Defaults to `true`.
+    inline_images_enabled: bool,
     /// Inline images registered by the iTerm2 `OSC 1337 ;File=` and
     /// Kitty `APC G` protocols. Keyed by a monotonically-incremented
     /// id; the matching [`ImagePlacement`]s in `image_placements`
@@ -608,7 +617,21 @@ impl Terminal {
             apc_state: ApcState::default(),
             apc_buf: Vec::new(),
             kitty_chunks: HashMap::new(),
+            inline_images_enabled: true,
         }
+    }
+
+    /// Master toggle for the inline-image protocols. Setting to
+    /// `false` makes both the iTerm2 `OSC 1337 ;File=` handler
+    /// and the Kitty `APC G` dispatch drop new payloads silently;
+    /// already-displayed images remain in place. Default `true`.
+    pub fn set_inline_images_enabled(&mut self, enabled: bool) {
+        self.inline_images_enabled = enabled;
+    }
+
+    /// Whether the inline-image protocols are currently accepted.
+    pub fn inline_images_enabled(&self) -> bool {
+        self.inline_images_enabled
     }
 
     /// Register a new image payload. Returns its assigned id, or
@@ -1147,6 +1170,9 @@ impl Terminal {
         if payload[0] != b'G' {
             return;
         }
+        if !self.inline_images_enabled {
+            return;
+        }
         let body = &payload[1..];
         let (kv_str, payload_b64) = match body.iter().position(|&b| b == b';') {
             Some(idx) => (&body[..idx], &body[idx + 1..]),
@@ -1400,6 +1426,7 @@ impl Terminal {
             next_image_id: &mut self.next_image_id,
             image_bytes_total: &mut self.image_bytes_total,
             kitty_chunks: &mut self.kitty_chunks,
+            inline_images_enabled: self.inline_images_enabled,
         };
         for _ in 0..rows {
             perform.linefeed();
@@ -1476,6 +1503,7 @@ impl Terminal {
             next_image_id: &mut self.next_image_id,
             image_bytes_total: &mut self.image_bytes_total,
             kitty_chunks: &mut self.kitty_chunks,
+            inline_images_enabled: self.inline_images_enabled,
         };
         for &b in buf {
             self.parser.advance(&mut perform, b);
@@ -1550,6 +1578,7 @@ struct TerminalPerform<'a> {
     next_image_id: &'a mut u64,
     image_bytes_total: &'a mut usize,
     kitty_chunks: &'a mut HashMap<u32, KittyChunkBuffer>,
+    inline_images_enabled: bool,
 }
 
 impl<'a> TerminalPerform<'a> {
@@ -3419,7 +3448,9 @@ impl<'a> Perform for TerminalPerform<'a> {
                     // the `notification` plugin event picks it up
                     // uniformly.
                     self.push_notification(msg.to_string());
-                } else if let Some(body) = raw.strip_prefix("File=") {
+                } else if let Some(body) = raw.strip_prefix("File=")
+                    .filter(|_| self.inline_images_enabled)
+                {
                     // iTerm2 inline-image protocol. Format:
                     //   `ESC ] 1337 ; File = k1=v1 ; k2=v2 : <base64> ST`
                     // The semicolons inside `File=` were re-joined
@@ -6912,6 +6943,29 @@ mod tests {
         // `a=d, d=A` — delete all.
         t.advance(b"\x1b_Ga=d,d=A\x1b\\");
         assert!(t.image_placements().is_empty());
+    }
+
+    #[test]
+    fn disabling_inline_images_drops_iterm2_and_kitty_payloads() {
+        use base64::Engine;
+        let mut t = term(80, 24);
+        t.set_inline_images_enabled(false);
+        let png = red_pixel_png();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        // iTerm2: `OSC 1337 ;File=` should now drop.
+        let mut iterm2 = Vec::new();
+        iterm2.extend_from_slice(b"\x1b]1337;File=inline=1;width=4;height=2:");
+        iterm2.extend_from_slice(b64.as_bytes());
+        iterm2.extend_from_slice(b"\x07");
+        t.advance(&iterm2);
+        assert!(t.image_placements().is_empty(), "iTerm2 dropped when disabled");
+        // Kitty: `APC G ...` should also drop.
+        t.advance(&kitty_apc("a=T,f=100,c=4,r=2", &b64));
+        assert!(t.image_placements().is_empty(), "Kitty dropped when disabled");
+        // Re-enable and confirm the path is restored.
+        t.set_inline_images_enabled(true);
+        t.advance(&kitty_apc("a=T,f=100,c=4,r=2", &b64));
+        assert_eq!(t.image_placements().len(), 1);
     }
 
     #[test]

@@ -238,6 +238,19 @@ confirm_multiline = true
 #   Default: 80.
 confirm_min_bytes = 80
 
+# ── [image] ───────────────────────────────────────────────────────────
+# Inline-image protocols (iTerm2 OSC 1337 ;File= and Kitty APC G).
+# When `enabled = false`, both parsers drop new payloads silently —
+# already-displayed images stay in place so the toggle gates input,
+# not live state. Set to `false` on low-bandwidth SSH sessions or
+# when a misbehaving app floods malformed payloads.
+[image]
+# enabled — accept inline-image payloads from shell apps like
+# `chafa`, `kitty +kitten icat`, `yazi` preview, matplotlib's iTerm2
+# backend, etc.
+#   Type:   bool. Default: true.
+enabled = true
+
 # ── [colors] ──────────────────────────────────────────────────────────
 # Terminal palette overrides. Every entry is an optional `[r, g, b]`
 # byte triple (each channel 0..=255); missing fields keep the built-in

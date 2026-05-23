@@ -79,6 +79,9 @@ impl PaneSpawner for GuiSpawner {
         // Seed OSC 12 replies with the configured cursor colour, if any.
         term.set_cursor_color(pal.cursor);
         term.set_scrollback_limit(self.config.terminal.scrollback);
+        // Honour `[image].enabled` — when false, both iTerm2 and
+        // Kitty image protocols drop new payloads at parse time.
+        term.set_inline_images_enabled(self.config.image.enabled);
         let terminal: SharedTerminal = Arc::new(Mutex::new(term));
 
         let (program, args) = resolve_shell(&self.config);

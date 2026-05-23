@@ -25,6 +25,24 @@ pub struct Config {
     pub guake: GuakeConfig,
     pub history: HistoryConfig,
     pub paste: PasteConfig,
+    pub image: ImageConfig,
+}
+
+/// Inline-image protocol toggles. When `enabled = false`, both
+/// the iTerm2 `OSC 1337 ;File=` and Kitty `APC G` parsers drop
+/// new payloads silently. Already-displayed images stay in place
+/// — the toggle gates incoming payloads, not the live state, so
+/// flipping mid-session doesn't surprise the user.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ImageConfig {
+    pub enabled: bool,
+}
+
+impl Default for ImageConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 /// Bulk-paste safety prompt. When enabled, pasting text that
