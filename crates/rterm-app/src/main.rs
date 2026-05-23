@@ -4,6 +4,19 @@
 //! configured shell inside it. `--smoke` runs a headless PTY+parser pipeline
 //! used for CI/dev-loop validation.
 
+// Release builds on Windows declare the GUI subsystem so double-
+// clicking the .exe doesn't spawn an extra console window
+// alongside the terminal. Debug builds stay in the console
+// subsystem so `cargo run` keeps the tracing output visible
+// without having to plumb stderr through Win32. The
+// `AttachConsole(ATTACH_PARENT_PROCESS)` call at the top of `main`
+// re-attaches stdout/stderr when the user runs `rterm --version`
+// (etc.) from a shell, so CLI flags still print.
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -680,6 +693,27 @@ impl EventSink for PluginBridge {
 }
 
 fn main() -> Result<()> {
+    // Reattach to the parent console on Windows so the
+    // `windows_subsystem = "windows"` release binary can still
+    // print CLI output (`--version`, `--help`, `--check-update`,
+    // `--list-actions`, etc.) to the shell that launched it.
+    // No-op when the .exe was launched by double-click / Start
+    // menu / from a non-console parent (Explorer's
+    // `STARTUPINFO.hStdOutput` is invalid, AttachConsole fails
+    // silently, and the GUI path proceeds as normal). Has no
+    // effect at all in debug builds, which stay in the console
+    // subsystem.
+    #[cfg(all(target_os = "windows", not(debug_assertions)))]
+    unsafe {
+        use windows_sys::Win32::System::Console::{
+            AttachConsole, ATTACH_PARENT_PROCESS,
+        };
+        // Return value is ignored deliberately — failure just
+        // means we'll discard CLI output, which is the same
+        // outcome as the existing GUI launch flow.
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+
     // `--version` / `-V` / `--help` / `-h` exit before doing any setup so
     // they work without a display, without a writable config dir, and
     // without spawning a PTY. Cheap CLI parsing — no clap dep.

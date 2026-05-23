@@ -44,6 +44,12 @@ tokio = { workspace = true }
 # the crypto-from-scratch stack.
 ureq = { version = "2", default-features = false, features = ["native-tls", "json"] }
 
+# Windows-only: AttachConsole(ATTACH_PARENT_PROCESS) so the GUI
+# release binary (declared as `windows_subsystem = "windows"`)
+# can still print CLI flag output to the launching shell.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
 # Build-time PNG decode + downscale to 256×256 RGBA for the window
 # icon. The pre-decoded bytes are include_bytes!'d at runtime so
 # there's no PNG-decoder dep in the resulting binary. The full

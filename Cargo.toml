@@ -89,6 +89,11 @@ windows-sys = { version = "0.59", features = [
     # thread can post `WM_QUIT` to it on shutdown via
     # `PostThreadMessageW`.
     "Win32_System_Threading",
+    # `AttachConsole(ATTACH_PARENT_PROCESS)` so the GUI release
+    # build (which is a `windows_subsystem = "windows"` binary —
+    # no auto-opened console) can still print CLI output to the
+    # terminal that launched it.
+    "Win32_System_Console",
 ] }
 
 [profile.dev]
