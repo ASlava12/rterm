@@ -1,5 +1,12 @@
 //! Inline-image data model.
 //!
+//! Also exposes [`ImageValidator`], a callback the auto-detect
+//! parser uses at finalize time to ask the rendering side
+//! "is this actually a displayable image?". When the answer is
+//! `false`, the accumulated body bytes get streamed back to vte
+//! as plain text so a misfired auto-detect doesn't silently
+//! eat output that `cat` would normally have printed.
+//!
 //! Storage layer for the bitmap content embedded by terminal apps via
 //! the **iTerm2 `OSC 1337 ;File=`** and **Kitty graphics (`APC G`)**
 //! protocols. The parser layer (in `terminal.rs`) decodes the
@@ -13,6 +20,17 @@
 //! decoder lives behind a feature gate in `rterm-render` where the
 //! result lands directly in a `wgpu::Texture` without an
 //! intermediate Vec<u8> round-trip.
+
+use std::sync::Arc;
+
+/// Boxed predicate the auto-detect path calls before registering
+/// a freshly-accumulated body. Returns `true` when the bytes are
+/// a displayable image (decodable to RGBA by whatever decoder set
+/// the rendering side enables) and `false` otherwise. A `false`
+/// answer makes `finalize_auto_image` dump the bytes back to vte
+/// as ordinary text, mirroring what `cat` would have done if
+/// auto-detect hadn't intercepted the stream.
+pub type ImageValidator = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
 
 /// On-the-wire encoding of [`Image::data`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

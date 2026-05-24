@@ -85,6 +85,15 @@ impl PaneSpawner for GuiSpawner {
         // Honour `[image].auto_detect` — off by default; opt-in
         // detection of raw PNG / JPEG magic bytes in the input.
         term.set_auto_detect_inline_images(self.config.image.auto_detect);
+        // Decode-validator: when the auto-detect path collects
+        // a body, ask the renderer's image crate whether the
+        // bytes actually decode before registering. Failed
+        // decodes fall back to text output — preserving `cat`'s
+        // original behaviour for non-image payloads that happen
+        // to start with PNG / JPEG magic.
+        term.set_autoimg_validator(Some(Arc::new(
+            |bytes: &[u8]| rterm_render::validates_as_image(bytes),
+        )));
         let terminal: SharedTerminal = Arc::new(Mutex::new(term));
 
         let (program, args) = resolve_shell(&self.config);

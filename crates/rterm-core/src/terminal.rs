@@ -392,6 +392,19 @@ pub struct Terminal {
     /// Body bytes accumulated inside `AutoImageState::InBody`.
     /// Capped at [`IMAGE_MAX_PAYLOAD_BYTES`].
     autoimg_buf: Vec<u8>,
+    /// Optional decode-validator used by `finalize_auto_image`
+    /// to test whether the accumulated body is actually a
+    /// displayable image before registering it. When the
+    /// validator returns `false`, the bytes get flushed back
+    /// into the vte stream as ordinary text — preserves the
+    /// `cat`-like behaviour for non-image payloads that happen
+    /// to start with PNG / JPEG magic bytes.
+    ///
+    /// rterm-app sets this at pane spawn using
+    /// `rterm-render`'s `image_decode::decode` (which has the
+    /// full `image` crate's format set). `None` skips the
+    /// check entirely; the body bytes are trusted and registered.
+    autoimg_validator: Option<crate::image::ImageValidator>,
     /// Inline images registered by the iTerm2 `OSC 1337 ;File=` and
     /// Kitty `APC G` protocols. Keyed by a monotonically-incremented
     /// id; the matching [`ImagePlacement`]s in `image_placements`
@@ -699,7 +712,24 @@ impl Terminal {
             autoimg_state: AutoImageState::default(),
             autoimg_held: Vec::new(),
             autoimg_buf: Vec::new(),
+            autoimg_validator: None,
         }
+    }
+
+    /// Install a decode-validator that the auto-detect finalize
+    /// path consults before registering a body as an image. The
+    /// validator receives the raw payload bytes and returns
+    /// `true` when they decode as a displayable image, `false`
+    /// otherwise. On `false`, `finalize_auto_image` dumps the
+    /// payload to the vte buffer as text — so a misfired
+    /// auto-detect (e.g. some other binary that happened to
+    /// start with `\x89PNG`) prints what `cat` would have
+    /// printed, rather than disappearing into the image store.
+    ///
+    /// `None` (the default) skips the check entirely; bytes are
+    /// trusted and registered after header sniff only.
+    pub fn set_autoimg_validator(&mut self, validator: Option<crate::image::ImageValidator>) {
+        self.autoimg_validator = validator;
     }
 
     /// Opt-in toggle for the raw "auto-detect image bytes in the
@@ -1847,6 +1877,24 @@ impl Terminal {
             vte_buf.extend_from_slice(&bytes);
             return;
         }
+        // Decoder validation: ask the rendering side whether
+        // these bytes actually decode. Catches cases the
+        // header sniff misses — corrupt IDAT chunks, partial
+        // downloads, unsupported variants — by deferring to
+        // the same `image` crate decoder the GPU upload path
+        // would use anyway. Failure → dump as text so the
+        // user sees the bytes `cat` would have printed.
+        if let Some(validator) = self.autoimg_validator.clone() {
+            if !validator(&bytes) {
+                tracing::warn!(
+                    ?format,
+                    buf_len,
+                    "auto-detect: validator rejected payload — dumping bytes as text",
+                );
+                vte_buf.extend_from_slice(&bytes);
+                return;
+            }
+        }
         // For JPEG without dim info we estimate from the
         // accumulated byte count — very rough, but the renderer
         // can refine.
@@ -1868,10 +1916,18 @@ impl Terminal {
             cols, rows, abs_row, col,
             "auto-detect: registering image",
         );
+        // `register_image` consumes the bytes via move; clone
+        // here so the failure path can still dump them as text.
+        // The clone cost is only paid on registration failure
+        // (cap blown / oversize) — the common path moves into
+        // the store and never copies.
+        let bytes_for_fallback = bytes.clone();
         let Some(id) = self.register_image(format, final_w, final_h, bytes) else {
-            tracing::warn!("auto-detect: register_image rejected (size/cap)");
+            tracing::warn!("auto-detect: register_image rejected (size/cap), dumping as text");
+            vte_buf.extend_from_slice(&bytes_for_fallback);
             return;
         };
+        drop(bytes_for_fallback);
         self.image_placements.push(crate::image::ImagePlacement {
             image_id: id,
             abs_row,
@@ -7568,6 +7624,53 @@ mod tests {
         stream.extend_from_slice(b"NOT-A-PNG\n");
         t.advance(&stream);
         assert!(t.image_placements().is_empty());
+    }
+
+    #[test]
+    fn auto_detect_validator_reject_dumps_payload_as_text() {
+        // Validator simulates the rendering side's `image` crate
+        // refusing to decode — even though the magic + IHDR sniff
+        // succeed, the bytes must NOT register a placement and
+        // must instead be flushed to vte as ordinary text so the
+        // user sees what `cat` would have printed.
+        let mut t = term(80, 24);
+        t.set_auto_detect_inline_images(true);
+        t.set_autoimg_validator(Some(std::sync::Arc::new(|_bytes: &[u8]| false)));
+        let png = red_pixel_png();
+        let mut stream = Vec::new();
+        stream.push(b'\n');
+        stream.extend_from_slice(&png);
+        t.advance(&stream);
+        assert!(
+            t.image_placements().is_empty(),
+            "validator-rejected PNG produced no placement",
+        );
+        // PNG body contains printable `IHDR`, `IDAT`, `IEND`
+        // tags — at least one should land on the grid as text.
+        let visible: String =
+            (0..t.size().rows).map(|r| row_text(&t, r)).collect();
+        assert!(
+            visible.contains("IHDR")
+                || visible.contains("IDAT")
+                || visible.contains("IEND"),
+            "expected raw PNG ASCII to print on grid; got {visible:?}",
+        );
+    }
+
+    #[test]
+    fn auto_detect_validator_accept_preserves_happy_path() {
+        // Sanity: a validator that returns `true` doesn't break
+        // registration — placement lands exactly as it does
+        // without a validator set.
+        let mut t = term(80, 24);
+        t.set_auto_detect_inline_images(true);
+        t.set_autoimg_validator(Some(std::sync::Arc::new(|_bytes: &[u8]| true)));
+        let png = red_pixel_png();
+        let mut stream = Vec::new();
+        stream.push(b'\n');
+        stream.extend_from_slice(&png);
+        t.advance(&stream);
+        assert_eq!(t.image_placements().len(), 1);
     }
 
     #[test]

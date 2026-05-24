@@ -3,6 +3,21 @@
 mod bg;
 mod image_decode;
 mod image_pass;
+
+/// Quick "does this byte payload decode as an image?" check —
+/// used by the auto-detect parser to fall back to text output
+/// when its accumulated body turns out to not actually be a
+/// displayable image (corrupt header, unsupported variant,
+/// half-stream from a partial download). Calls into the same
+/// decoder the GPU upload path uses, so any format the
+/// renderer can paint is one the validator accepts.
+///
+/// Returns `false` on any decode error including a too-large
+/// payload that would have OOM'd. Logs are emitted by the
+/// decoder itself at WARN level.
+pub fn validates_as_image(bytes: &[u8]) -> bool {
+    image::load_from_memory(bytes).is_ok()
+}
 pub mod palette;
 pub(crate) mod tree;
 pub mod action;

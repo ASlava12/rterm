@@ -26,13 +26,35 @@ rterm-core = { workspace = true }
 rterm-history = { workspace = true }
 
 # Image-format decoder for the inline-image protocols. iTerm2 OSC
-# 1337 ;File= and Kitty APC G both ship PNG / JPEG / GIF bytes
+# 1337 ;File= and Kitty APC G both ship arbitrary image bytes
 # over the wire; the parser side (in rterm-core) keeps them in
 # their on-the-wire form, and the renderer decodes once on first
-# GPU upload. PNG / JPEG / GIF are the formats real-world tools
-# emit (chafa, matplotlib, yazi preview); pulling in WebP / TIFF
-# / AVIF would balloon the dep tree for ~zero practical win.
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
+# GPU upload via `image::load_from_memory` (auto-detects format
+# from magic bytes).
+#
+# Full set enabled below — gives `cat image.bmp`, `cat foo.webp`,
+# etc. a chance to land in the auto-detect path (or arrive via
+# iTerm2 / Kitty wrappers) without any code change beyond
+# enabling the feature flag. The compile-time cost of these
+# extra decoders is modest (every format the `image` crate ships
+# pure-Rust except AVIF, which we deliberately skip — it pulls
+# in a heavy AVIF/HEIC C bindings tree and is rarely cat'd).
+image = { version = "0.25", default-features = false, features = [
+    "png",     # iPhone / matplotlib / web / nearly every screenshot tool
+    "jpeg",    # cameras / web
+    "gif",     # logos / memes (static — animation is out of scope)
+    "webp",    # chrome screenshot tool default
+    "bmp",     # old Windows screenshots, paint output
+    "tiff",    # scanners / fax
+    "ico",     # favicons + win .ico
+    "tga",     # game-engine asset exports
+    "hdr",     # Radiance HDR
+    "exr",     # OpenEXR
+    "pnm",     # netpbm — ppm / pgm / pbm
+    "qoi",     # Quite OK Image format
+    "ff",      # farbfeld
+    "dds",     # DirectDraw Surface
+] }
 
 # Win32 globals for the optional Guake global-hotkey worker thread.
 # `RegisterHotKey` is the supported way to receive a system-wide key
