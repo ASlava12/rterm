@@ -2087,12 +2087,22 @@ fn spawn_reader_thread(
     thread::spawn(move || {
         let mut buf = [0u8; 8192];
         // Optional raw-PTY dump. Set RTERM_DUMP_PTY=/path/to/file to
-        // append every chunk read from the master PTY, before any
+        // write every chunk read from the master PTY, before any
         // VT/auto-detect processing. Catches mid-stream byte loss /
         // mangling — most useful for diagnosing ConPTY on Windows.
+        // Truncates on open so each run starts fresh — appending
+        // would smear successive sessions together and make byte
+        // counts meaningless.
         let mut pty_dump: Option<std::fs::File> = std::env::var("RTERM_DUMP_PTY")
             .ok()
-            .and_then(|path| std::fs::OpenOptions::new().create(true).append(true).open(&path).ok());
+            .and_then(|path| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&path)
+                    .ok()
+            });
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,

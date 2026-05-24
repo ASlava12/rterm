@@ -95,7 +95,12 @@ impl PsuedoCon {
                 &mut con,
             )
         };
-        if result != S_OK {
+        if result == S_OK {
+            log::info!(
+                "CreatePseudoConsole: PSEUDOCONSOLE_PASSTHROUGH_MODE active \
+                 — binary stdout will be forwarded byte-for-byte"
+            );
+        } else {
             log::warn!(
                 "CreatePseudoConsole with PASSTHROUGH_MODE failed (HRESULT {}); \
                  falling back to non-passthrough — binary stdout (e.g. `cat \
