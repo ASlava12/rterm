@@ -1756,6 +1756,26 @@ impl Terminal {
             buf_len,
             "auto-detect: end-of-image marker — finalizing",
         );
+        // Diagnostic: optionally dump the accumulated body to a
+        // file before handing it to the decoder. Compare with the
+        // original on disk (`md5sum dump.png original.png`) to
+        // tell whether any byte-level corruption survived the
+        // ONLCR undo. Set `RTERM_DUMP_AUTOIMG=/tmp/dump.bin` to
+        // enable. Skipped silently when the env var isn't set or
+        // the write fails (this is debug-only, never load-bearing).
+        if let Ok(path) = std::env::var("RTERM_DUMP_AUTOIMG") {
+            match std::fs::write(&path, &bytes) {
+                Ok(()) => tracing::info!(
+                    path = %path,
+                    buf_len,
+                    "auto-detect: dumped accumulated bytes to disk",
+                ),
+                Err(e) => tracing::warn!(
+                    path = %path,
+                    "auto-detect: dump failed: {e}",
+                ),
+            }
+        }
         self.autoimg_state = AutoImageState::Ground;
         // Push pre-image text to the grid first.
         self.feed_vte(vte_buf);
