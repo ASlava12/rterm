@@ -257,6 +257,19 @@ enabled = true
 # hex-dump utilities all stream the same magic bytes intentionally
 # and would surprise-render as pictures. Toggle anytime via the
 # Settings overlay (Ctrl+Shift+, → "Auto-detect inline images").
+#
+# Caveat: PTY-level ONLCR (the default tty discipline) doubles
+# every `\n` in the output of programs writing to stdout. Plain
+# `cat picture.png` therefore arrives with mangled PNG magic +
+# IDAT chunks and won't decode. The fix is to wrap the call with
+# stty:
+#     stty -onlcr; cat picture.png; stty onlcr
+# or define a shell function once:
+#     catimg() { stty -onlcr; cat "$1"; stty onlcr; }
+# Programs that use the proper OSC 1337 / Kitty APC protocol
+# (`chafa --format=iterm`, `kitten icat`, etc.) are unaffected
+# because their base64 payloads contain no `\n` bytes.
+#
 #   Type:   bool. Default: false.
 auto_detect = false
 

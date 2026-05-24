@@ -1587,11 +1587,31 @@ impl Terminal {
                         };
                     }
                 } else {
-                    tracing::debug!(
-                        ?b,
-                        matched,
-                        "auto-detect: PNG magic mismatch — replaying held bytes",
-                    );
+                    // Heuristic: matched ≥ 5 bytes (`\x89 P N G \r`)
+                    // and the next byte is another `\r` instead of
+                    // the expected `\n` (0x0A) is the calling card
+                    // of PTY-side ONLCR conversion — the line
+                    // discipline doubled every `\n` in the binary
+                    // stream. We can't fix it from this side (raw
+                    // `\r\n` strip would corrupt natural CRLF in
+                    // IDAT data), so emit a one-shot tip that
+                    // points the user at `stty -onlcr` and bail
+                    // out.
+                    if matched >= 5 && b == b'\r' {
+                        tracing::warn!(
+                            "auto-detect: PNG magic mangled by PTY ONLCR \
+                             (got CR where LF expected). Run `stty -onlcr; \
+                             cat file.png; stty onlcr` — or wrap in a shell \
+                             function. See the `[image].auto_detect` config \
+                             doc for details."
+                        );
+                    } else {
+                        tracing::debug!(
+                            ?b,
+                            matched,
+                            "auto-detect: PNG magic mismatch — replaying held bytes",
+                        );
+                    }
                     // Mismatch — restore the held bytes to vte
                     // (no data lost) + this byte too.
                     let held: Vec<u8> = std::mem::take(&mut self.autoimg_held);

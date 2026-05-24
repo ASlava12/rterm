@@ -267,6 +267,18 @@ enabled = true
 # hex-дамп утилиты шлют те же magic-байты намеренно и неожиданно
 # превратились бы в картинку. Переключается через Settings оверлей
 # (Ctrl+Shift+, → "Auto-detect inline images").
+#
+# Caveat: PTY-уровневый ONLCR (стандартная tty-дисциплина) дублирует
+# каждый `\n` в выводе программ, пишущих в stdout. Голый
+# `cat picture.png` приедет с покорёженной PNG magic + IDAT и не
+# раскодируется. Решение — обернуть в stty:
+#     stty -onlcr; cat picture.png; stty onlcr
+# или один раз определить shell-функцию:
+#     catimg() { stty -onlcr; cat "$1"; stty onlcr; }
+# Программы, использующие OSC 1337 / Kitty APC обёртки
+# (`chafa --format=iterm`, `kitten icat`, и т.д.), этой проблемы
+# не имеют — в их base64 payload'е нет `\n` байт.
+#
 #   Тип:    bool. По умолчанию: false.
 auto_detect = false
 
