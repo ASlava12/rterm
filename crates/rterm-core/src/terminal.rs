@@ -2161,12 +2161,22 @@ impl<'a> TerminalPerform<'a> {
     /// kill the parser. `inline=0` (download, no display) is also
     /// dropped since rterm has no file-save UX yet.
     fn dispatch_iterm2_file(&mut self, body: &str) {
+        tracing::debug!(
+            body_len = body.len(),
+            body_head = &body[..body.len().min(64)],
+            "iterm2 OSC 1337 File= dispatched"
+        );
         // `File=k=v;k=v:<base64>`. Base64 alphabet has no `:`, so
         // splitting at the FIRST `:` cleanly separates params from
         // payload.
         let (params_str, payload_b64) = match body.split_once(':') {
             Some(pair) => pair,
-            None => return,
+            None => {
+                tracing::warn!(
+                    "iterm2: no `:` separator in OSC 1337 body — dropping"
+                );
+                return;
+            }
         };
 
         let mut width_cells: Option<u16> = None;
@@ -2201,10 +2211,15 @@ impl<'a> TerminalPerform<'a> {
             }
         }
         if !inline {
+            tracing::debug!("iterm2: inline=0 (save-to-disk) — dropping");
             return;
         }
         if let Some(declared) = declared_size {
             if declared > IMAGE_MAX_PAYLOAD_BYTES {
+                tracing::warn!(
+                    declared, max = IMAGE_MAX_PAYLOAD_BYTES,
+                    "iterm2: declared size > cap — dropping"
+                );
                 return;
             }
         }
@@ -2223,15 +2238,32 @@ impl<'a> TerminalPerform<'a> {
             .decode(&trimmed)
         {
             Ok(b) => b,
-            Err(_) => return,
+            Err(e) => {
+                tracing::warn!(
+                    b64_len = trimmed.len(),
+                    "iterm2: base64 decode failed: {e}"
+                );
+                return;
+            }
         };
         if payload.is_empty() || payload.len() > IMAGE_MAX_PAYLOAD_BYTES {
+            tracing::warn!(
+                len = payload.len(), max = IMAGE_MAX_PAYLOAD_BYTES,
+                "iterm2: decoded payload empty or oversize — dropping"
+            );
             return;
         }
 
         // Format sniff. Only PNG / JPEG / GIF make it through —
         // anything else is silently dropped.
-        let Some(format) = detect_image_format(&payload) else { return };
+        let Some(format) = detect_image_format(&payload) else {
+            tracing::warn!(
+                payload_len = payload.len(),
+                head = ?&payload[..payload.len().min(8)],
+                "iterm2: no format match for payload — dropping"
+            );
+            return;
+        };
 
         // Pixel-dim sniff for PNG when the sender didn't tell us.
         // JPEG / GIF dim-sniff is out of scope for v1; those rely
@@ -2275,14 +2307,25 @@ impl<'a> TerminalPerform<'a> {
         // `Terminal::register_image` exactly — kept inline rather
         // than calling through `Terminal` because the Perform
         // borrow can't go via `&mut self.terminal`.
+        let payload_len = payload.len();
         let Some(id) = self.register_image_inline(
             format,
             final_width_px,
             final_height_px,
             payload,
         ) else {
+            tracing::warn!(
+                ?format, payload_len,
+                "iterm2: register_image_inline rejected (size/cap)"
+            );
             return;
         };
+        tracing::info!(
+            ?format, payload_len,
+            width_px = final_width_px, height_px = final_height_px,
+            cols, rows, abs_row, col, image_id = id,
+            "iterm2: image registered + placement created"
+        );
         self.image_placements.push(crate::image::ImagePlacement {
             image_id: id,
             abs_row,
@@ -3942,6 +3985,11 @@ impl<'a> Perform for TerminalPerform<'a> {
                     }
                     raw.push_str(&String::from_utf8_lossy(part));
                 }
+                tracing::debug!(
+                    raw_len = raw.len(),
+                    raw_head = &raw[..raw.len().min(64)],
+                    "OSC 1337 received"
+                );
                 if let Some(path) = raw.strip_prefix("CurrentDir=") {
                     if !path.is_empty() {
                         *self.cwd = Some(percent_decode(path));
