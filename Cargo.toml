@@ -9,6 +9,14 @@ members = [
     "crates/rterm-render",
     "crates/rterm-app",
 ]
+# Vendored portable-pty 0.8.1 with PSEUDOCONSOLE_PASSTHROUGH_MODE
+# enabled (graceful fallback on older Windows). Kept out of
+# workspace.members so its 3rd-party tests/clippy don't ride along
+# with `cargo test --workspace`. See crates/portable-pty-rterm.
+exclude = ["crates/portable-pty-rterm"]
+
+[patch.crates-io]
+portable-pty = { path = "crates/portable-pty-rterm" }
 
 [workspace.package]
 version = "0.0.3"
