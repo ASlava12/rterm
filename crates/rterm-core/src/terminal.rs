@@ -528,20 +528,30 @@ enum AutoImageState {
     /// live in `autoimg_held` on Terminal; on mismatch the whole
     /// hold gets replayed into vte_buf so nothing is lost.
     ///
-    /// `onlcr_skip` flips to `true` the first time we see an
-    /// extra `\r` ahead of an expected `\n` — the calling card
-    /// of PTY-side ONLCR. Carried through to `InPngBody` so the
-    /// body accumulator can undo the doubled `\r\n` only when
-    /// the input is actually ONLCR-corrupted (raw streams stay
-    /// untouched, preserving legitimate `\r\n` byte sequences
-    /// inside compressed IDAT data).
-    MatchingPng { matched: u8, onlcr_skip: bool },
+    /// `onlcr_count` is the number of extra `\r` bytes we ate
+    /// while waiting for an expected `\n`. Counts the layers of
+    /// PTY ONLCR sitting between rterm and the program writing
+    /// the image:
+    ///
+    /// - `0` = raw stream (e.g. `stty -opost; cat …`).
+    /// - `1` = single ONLCR (local `cat` over the local PTY).
+    /// - `2` = double ONLCR (e.g. `cat` on a remote SSH host —
+    ///   remote PTY converts `\n` → `\r\n`, then the local PTY
+    ///   converts that `\n` again, so each original `\n` arrives
+    ///   as `\r\r\n` on the wire).
+    /// - `3+` = nested SSH hops or similar pipeline.
+    ///
+    /// The count gets carried into `InPngBody` so the body
+    /// accumulator can pop exactly that many `\r` bytes ahead of
+    /// each `\n` — the perfect inverse of the layered ONLCR
+    /// transform.
+    MatchingPng { matched: u8, onlcr_count: u8 },
     MatchingJpeg { matched: u8 },
-    /// Inside a PNG body, accumulating into `autoimg_buf`. When
-    /// `onlcr_mode` is `true`, the accumulator collapses every
-    /// `\r\n` into `\n` on the fly — see [`AutoImageState::MatchingPng`]
-    /// for the detection mechanism.
-    InPngBody { onlcr_mode: bool },
+    /// Inside a PNG body, accumulating into `autoimg_buf`.
+    /// `onlcr_level` mirrors the `onlcr_count` we ended the magic
+    /// match with — the byte accumulator pops up to that many
+    /// `\r` bytes ahead of each `\n`. `0` = raw passthrough.
+    InPngBody { onlcr_level: u8 },
     /// Inside a JPEG body. Watching for the EOI marker
     /// `\xFF\xD9`. `last_was_ff` carries the one-byte lookahead.
     /// JPEG magic doesn't contain a `\n`, so we can't sniff the
@@ -1583,7 +1593,7 @@ impl Terminal {
                         tracing::debug!("auto-detect: PNG magic candidate (0x89)");
                         self.autoimg_state = AutoImageState::MatchingPng {
                             matched: 1,
-                            onlcr_skip: false,
+                            onlcr_count: 0,
                         };
                         self.autoimg_held.clear();
                         self.autoimg_held.push(b);
@@ -1599,28 +1609,40 @@ impl Terminal {
                 }
                 vte_buf.push(b);
             }
-            AutoImageState::MatchingPng { matched, onlcr_skip } => {
+            AutoImageState::MatchingPng { matched, onlcr_count } => {
                 // PNG magic: \x89 P N G \r \n \x1a \n  (8 bytes).
                 const PNG_MAGIC: [u8; 8] = [
                     0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A,
                 ];
+                // Safety: cap layered ONLCR at 6 levels. A normal
+                // pipeline is 0/1/2 — anything beyond is either a
+                // pathological nested SSH chain or, more likely,
+                // not a PNG at all (we shouldn't keep eating
+                // arbitrary `\r` runs forever).
+                const MAX_ONLCR_LEVEL: u8 = 6;
                 let expected = PNG_MAGIC.get(matched as usize).copied();
                 // ONLCR-tolerance: when the next expected byte is
-                // `\n` (positions 5 / 7) and we instead see a `\r`,
-                // that's PTY ONLCR doubling the line break. Eat
-                // the spurious `\r` once and stay at the same
-                // position; the next byte should be the actual
-                // `\n`. Setting `onlcr_skip = true` also flags the
-                // body accumulator that follows so it can collapse
-                // the doubled CRLFs throughout IDAT chunks too.
-                if expected == Some(b'\n') && b == b'\r' && !onlcr_skip {
+                // `\n` (positions 5 / 7) and we see a `\r`, that's
+                // one layer of PTY ONLCR doubling the line break.
+                // Eat it, bump the count, stay at the same
+                // position. Multiple sequential `\r`s before the
+                // actual `\n` mean multiple ONLCR layers (e.g.
+                // SSH-through-a-PTY adds a second layer on top of
+                // the local PTY's). The count gets stashed into
+                // `InPngBody` so the body accumulator pops the
+                // matching number of `\r`s ahead of each `\n`.
+                if expected == Some(b'\n')
+                    && b == b'\r'
+                    && onlcr_count < MAX_ONLCR_LEVEL
+                {
                     tracing::debug!(
                         matched,
-                        "auto-detect: PNG magic — PTY ONLCR detected, normalising",
+                        next_count = onlcr_count + 1,
+                        "auto-detect: PNG magic — counting ONLCR layer",
                     );
                     self.autoimg_state = AutoImageState::MatchingPng {
                         matched,
-                        onlcr_skip: true,
+                        onlcr_count: onlcr_count + 1,
                     };
                     return;
                 }
@@ -1628,28 +1650,26 @@ impl Terminal {
                     self.autoimg_held.push(b);
                     if matched + 1 == PNG_MAGIC.len() as u8 {
                         tracing::info!(
-                            onlcr_mode = onlcr_skip,
+                            onlcr_level = onlcr_count,
                             "auto-detect: PNG magic confirmed, entering body capture",
                         );
-                        // Magic complete — flip to body mode. The
-                        // 8 magic bytes already in `held` go into
-                        // `autoimg_buf` as the start of the body.
                         let header: Vec<u8> =
                             std::mem::take(&mut self.autoimg_held);
                         self.autoimg_buf = header;
                         self.autoimg_state =
-                            AutoImageState::InPngBody { onlcr_mode: onlcr_skip };
+                            AutoImageState::InPngBody { onlcr_level: onlcr_count };
                     } else {
                         self.autoimg_state = AutoImageState::MatchingPng {
                             matched: matched + 1,
-                            // Reset ONLCR-skip flag once we've
-                            // consumed the actual `\n` — each
-                            // expected `\n` position gets its own
-                            // single-skip budget.
-                            onlcr_skip: if expected == Some(b'\n') {
-                                false
+                            // Reset the count once we've consumed
+                            // the actual `\n` — each expected
+                            // `\n` position gets a fresh count
+                            // (helps validate that both LFs in
+                            // the PNG magic see the same layering).
+                            onlcr_count: if expected == Some(b'\n') {
+                                0
                             } else {
-                                onlcr_skip
+                                onlcr_count
                             },
                         };
                     }
@@ -1659,8 +1679,6 @@ impl Terminal {
                         matched,
                         "auto-detect: PNG magic mismatch — replaying held bytes",
                     );
-                    // Mismatch — restore the held bytes to vte
-                    // (no data lost) + this byte too.
                     let held: Vec<u8> = std::mem::take(&mut self.autoimg_held);
                     vte_buf.extend_from_slice(&held);
                     vte_buf.push(b);
@@ -1691,7 +1709,7 @@ impl Terminal {
                     self.autoimg_state = AutoImageState::Ground;
                 }
             }
-            AutoImageState::InPngBody { onlcr_mode } => {
+            AutoImageState::InPngBody { onlcr_level } => {
                 // Watch for the PNG IEND chunk's fixed tail:
                 // `IEND` (4 bytes type) followed by the IEND CRC
                 // `\xae\x42\x60\x82` (4 bytes). Together always
@@ -1709,18 +1727,27 @@ impl Terminal {
                     self.autoimg_state = AutoImageState::Ground;
                     return;
                 }
-                // ONLCR undo, on the fly: when in ONLCR mode and
-                // we just got `\n` with the previous accumulated
-                // byte being `\r`, pop the `\r` before pushing
-                // the `\n`. Net effect: every `\r\n` pair in the
-                // stream collapses to `\n`, which precisely
-                // reverses ONLCR's per-byte transformation —
-                // including the case where the original PNG
-                // contained natural `\r\n` (ONLCR'd that becomes
-                // `\r\r\n`, and the collapse recovers `\r\n`).
-                if onlcr_mode && b == b'\n' && self.autoimg_buf.last() == Some(&b'\r')
-                {
-                    self.autoimg_buf.pop();
+                // Multi-layer ONLCR undo. For each `\n` arriving,
+                // pop up to `onlcr_level` `\r` bytes ahead of it.
+                // Level 1 (local cat): `\r\n` → `\n`. Level 2
+                // (cat over SSH): `\r\r\n` → `\n`. Higher levels
+                // (nested SSH) symmetrically.
+                if onlcr_level > 0 && b == b'\n' {
+                    for _ in 0..onlcr_level {
+                        if self.autoimg_buf.last() == Some(&b'\r') {
+                            self.autoimg_buf.pop();
+                        } else {
+                            // Fewer `\r`s than expected — the
+                            // sender's byte stream wasn't fully
+                            // ONLCR'd at this point (e.g. the
+                            // original byte was a standalone `\n`
+                            // with no preceding `\r`; the
+                            // ONLCR'd version has `\r×level \n`).
+                            // Bail out rather than pop into
+                            // unrelated bytes.
+                            break;
+                        }
+                    }
                 }
                 self.autoimg_buf.push(b);
                 if self.autoimg_buf.ends_with(&IEND_TAIL) {
@@ -7450,6 +7477,35 @@ mod tests {
         let p = t.image_placements()[0];
         let img = t.image(p.image_id).expect("image stored");
         assert_eq!(img.data, png, "body normalised back to original");
+    }
+
+    #[test]
+    fn auto_detect_recovers_from_double_onlcr_like_ssh() {
+        // `cat picture.png` on a remote host over SSH gets
+        // ONLCR'd by the remote PTY AND then again by the local
+        // PTY. Each original `\n` arrives as `\r\r\n`. Verify
+        // the layered-counter logic eats both `\r`s ahead of
+        // each LF and reconstructs the original bytes.
+        let mut t = term(80, 24);
+        t.set_auto_detect_inline_images(true);
+        let png = red_pixel_png();
+        let level1 = onlcr_corrupt(&png);
+        let level2 = onlcr_corrupt(&level1);
+        let mut stream = Vec::new();
+        stream.push(b'\n'); // eligibility
+        stream.extend_from_slice(&level2);
+        t.advance(&stream);
+        assert_eq!(
+            t.image_placements().len(),
+            1,
+            "double-ONLCR'd PNG (SSH chain) decoded"
+        );
+        let p = t.image_placements()[0];
+        let img = t.image(p.image_id).expect("image stored");
+        assert_eq!(
+            img.data, png,
+            "double-ONLCR body normalised back to original",
+        );
     }
 
     #[test]
