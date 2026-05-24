@@ -361,6 +361,17 @@ pub struct Terminal {
     /// per id to avoid an unbounded buffer if a sender drops the
     /// terminator. Cleared on RIS.
     kitty_chunks: HashMap<u32, KittyChunkBuffer>,
+    /// iTerm2 Multipart-protocol accumulator. `imgcat` (and the
+    /// upstream iTerm2 reference utility) switches from the
+    /// single-OSC `File=params:base64` envelope to a three-step
+    /// `MultipartFile=params` + N×`FilePart=<chunk>` +
+    /// `FileEnd` exchange for payloads above ~100 KB — terminals
+    /// and intervening TTY layers commonly truncate huge single
+    /// OSC strings, so the multipart variant is the only thing
+    /// that reliably gets a 2 MB PNG through (especially over
+    /// Windows ConPTY + PowerShell, where bare `cat picture.png`
+    /// is already lost). Cleared on RIS.
+    iterm2_multipart: Option<Iterm2MultipartState>,
     /// Master switch for the inline-image protocols
     /// (iTerm2 `OSC 1337 ; File =`, Kitty `APC G ...`). When
     /// `false`, both parser entry points drop their payload
@@ -493,6 +504,30 @@ const KITTY_CHUNK_TOTAL_CAP: usize = IMAGE_MAX_PAYLOAD_BYTES * 2;
 /// base64 payload. Once `m=0` arrives we decode the concatenated
 /// payload and apply.
 #[derive(Debug, Clone, Default)]
+/// In-flight iTerm2 `MultipartFile` transfer. Created on
+/// `MultipartFile=params` (the params don't include a base64
+/// payload — that comes in later `FilePart=` messages). Each
+/// `FilePart=<b64>` appends to `b64_payload`; `FileEnd` then
+/// re-assembles a synthetic `params:b64_payload` body and feeds
+/// it through the existing `dispatch_iterm2_file` pipeline so the
+/// finalize / decode / register logic stays in one place.
+///
+/// `b64_payload` is capped at the same `IMAGE_MAX_PAYLOAD_BYTES`
+/// limit as single-OSC `File=` (accounting for the ~33% base64
+/// inflation) so a malicious sender can't pin unbounded memory
+/// just by streaming `FilePart=` forever.
+struct Iterm2MultipartState {
+    /// Verbatim params from `MultipartFile=<HERE>`, e.g.
+    /// `"inline=1;size=2480251;name=<b64>"`.
+    params: String,
+    /// Concatenated base64 chunks from every `FilePart=`. Kept as
+    /// `String` rather than decoded `Vec<u8>` so the existing
+    /// `dispatch_iterm2_file` pipeline (which expects an
+    /// "params:base64" body) can reuse its own decoder + format
+    /// sniff path without a parallel code branch.
+    b64_payload: String,
+}
+
 struct KittyChunkBuffer {
     /// Format from the FIRST chunk's `f=` (24, 32, or 100).
     /// Defaults to 100 (PNG) when the sender omits it.
@@ -707,6 +742,7 @@ impl Terminal {
             apc_state: ApcState::default(),
             apc_buf: Vec::new(),
             kitty_chunks: HashMap::new(),
+            iterm2_multipart: None,
             inline_images_enabled: true,
             autoimg_enabled: false,
             autoimg_state: AutoImageState::default(),
@@ -1581,6 +1617,7 @@ impl Terminal {
             next_image_id: &mut self.next_image_id,
             image_bytes_total: &mut self.image_bytes_total,
             kitty_chunks: &mut self.kitty_chunks,
+            iterm2_multipart: &mut self.iterm2_multipart,
             inline_images_enabled: self.inline_images_enabled,
         };
         for _ in 0..rows {
@@ -2018,6 +2055,7 @@ impl Terminal {
             next_image_id: &mut self.next_image_id,
             image_bytes_total: &mut self.image_bytes_total,
             kitty_chunks: &mut self.kitty_chunks,
+            iterm2_multipart: &mut self.iterm2_multipart,
             inline_images_enabled: self.inline_images_enabled,
         };
         for &b in buf {
@@ -2093,6 +2131,7 @@ struct TerminalPerform<'a> {
     next_image_id: &'a mut u64,
     image_bytes_total: &'a mut usize,
     kitty_chunks: &'a mut HashMap<u32, KittyChunkBuffer>,
+    iterm2_multipart: &'a mut Option<Iterm2MultipartState>,
     inline_images_enabled: bool,
 }
 
@@ -4025,6 +4064,78 @@ impl<'a> Perform for TerminalPerform<'a> {
                     // let the shell move on. The whole branch is
                     // best-effort.
                     self.dispatch_iterm2_file(body);
+                } else if let Some(params) = raw.strip_prefix("MultipartFile=")
+                    .filter(|_| self.inline_images_enabled)
+                {
+                    // iTerm2 Multipart protocol — start. `imgcat`
+                    // uses this for payloads above ~100 KB so the
+                    // base64 string can be sent in chunks that
+                    // survive intervening TTY truncation. Just stash
+                    // params; payload comes via FilePart=.
+                    if self.iterm2_multipart.is_some() {
+                        tracing::warn!(
+                            "iterm2: nested MultipartFile= — discarding previous in-flight transfer"
+                        );
+                    }
+                    tracing::debug!(
+                        params_len = params.len(),
+                        params_head = &params[..params.len().min(96)],
+                        "iterm2: MultipartFile begin"
+                    );
+                    *self.iterm2_multipart = Some(Iterm2MultipartState {
+                        params: params.to_string(),
+                        b64_payload: String::new(),
+                    });
+                } else if let Some(chunk) = raw.strip_prefix("FilePart=")
+                    .filter(|_| self.inline_images_enabled)
+                {
+                    // Append a base64 chunk to the in-flight
+                    // multipart accumulator. Drop chunks that arrive
+                    // without a MultipartFile= preamble — likely a
+                    // truncated or out-of-order sender, no point
+                    // accumulating garbage.
+                    let Some(state) = self.iterm2_multipart.as_mut() else {
+                        tracing::warn!(
+                            chunk_len = chunk.len(),
+                            "iterm2: FilePart= without MultipartFile= — dropping"
+                        );
+                        return;
+                    };
+                    // Cap b64 length at ~max-payload × 4/3 (base64
+                    // inflation) so a sender can't pin unbounded
+                    // memory by streaming FilePart= forever.
+                    const MAX_B64: usize = IMAGE_MAX_PAYLOAD_BYTES * 4 / 3 + 64;
+                    if state.b64_payload.len() + chunk.len() > MAX_B64 {
+                        tracing::warn!(
+                            current = state.b64_payload.len(),
+                            cap = MAX_B64,
+                            "iterm2: multipart accumulator exceeded cap — dropping in-flight transfer"
+                        );
+                        *self.iterm2_multipart = None;
+                        return;
+                    }
+                    state.b64_payload.push_str(chunk);
+                } else if raw.starts_with("FileEnd")
+                    && self.inline_images_enabled
+                {
+                    // Multipart terminator. Reassemble the params +
+                    // payload into the same `params:b64` shape the
+                    // single-OSC File= dispatcher already understands
+                    // and feed it through unchanged.
+                    let Some(state) = self.iterm2_multipart.take() else {
+                        tracing::warn!(
+                            "iterm2: FileEnd without MultipartFile= — nothing to finalize"
+                        );
+                        return;
+                    };
+                    let mut body = state.params;
+                    body.push(':');
+                    body.push_str(&state.b64_payload);
+                    tracing::debug!(
+                        body_len = body.len(),
+                        "iterm2: MultipartFile finalize"
+                    );
+                    self.dispatch_iterm2_file(&body);
                 }
             }
             // OSC 8: hyperlink. Format: ESC ] 8 ; params ; URI ST
@@ -4634,8 +4745,10 @@ impl<'a> Perform for TerminalPerform<'a> {
                 // In-flight Kitty multi-chunk transfers are
                 // half-finished images by definition — they'd
                 // splash onto the freshly-cleared grid if we
-                // let them continue. Drop them too.
+                // let them continue. Drop them too. Same goes
+                // for iTerm2 Multipart accumulators.
                 self.kitty_chunks.clear();
+                *self.iterm2_multipart = None;
             }
             _ => {}
         }
@@ -7334,6 +7447,81 @@ mod tests {
         let stream = b"\x1b]1337;File=inline=1;width=4;height=2:not-real-base64===\x07";
         t.advance(stream);
         assert!(t.image_placements().is_empty());
+    }
+
+    #[test]
+    fn iterm2_multipart_protocol_reassembles_chunks_into_one_placement() {
+        // `imgcat` for files above ~100 KB switches from a single
+        // `File=...:base64 BEL` to a three-step `MultipartFile= +
+        // FilePart=* + FileEnd` exchange. The renderer must
+        // reassemble the chunks into a single image placement,
+        // identical to what a non-multipart envelope would have
+        // produced. Without this support every `FilePart=` falls
+        // into the OSC 1337 "unknown" path, the picture never
+        // shows, and we get zero on the grid — which is exactly
+        // what was happening over ConPTY + PowerShell on Windows
+        // before this branch landed.
+        use base64::Engine;
+        let mut t = term(80, 24);
+        let png = red_pixel_png();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        // Split the base64 across THREE deliberately uneven chunks
+        // so we exercise the "join across boundaries" path, not
+        // just a single trailing FilePart.
+        let split_a = b64.len() / 3;
+        let split_b = b64.len() * 2 / 3;
+        let (p1, rest) = b64.split_at(split_a);
+        let (p2, p3) = rest.split_at(split_b - split_a);
+        let mut stream = Vec::new();
+        stream.extend_from_slice(
+            b"\x1b]1337;MultipartFile=inline=1;width=4;height=2;name=cGljLnBuZw==\x07",
+        );
+        for chunk in [p1, p2, p3] {
+            stream.extend_from_slice(b"\x1b]1337;FilePart=");
+            stream.extend_from_slice(chunk.as_bytes());
+            stream.extend_from_slice(b"\x07");
+        }
+        stream.extend_from_slice(b"\x1b]1337;FileEnd\x07");
+        t.advance(&stream);
+        let placements = t.image_placements();
+        assert_eq!(
+            placements.len(),
+            1,
+            "multipart chunks reassembled into exactly one placement",
+        );
+        let p = placements[0];
+        assert_eq!(p.cols, 4, "width=4 cells from MultipartFile params honoured");
+        assert_eq!(p.rows, 2);
+        let img = t.image(p.image_id).expect("image stored");
+        assert!(matches!(img.format, crate::image::ImageFormat::Png));
+        assert_eq!(img.data, png, "reassembled bytes are byte-identical to source");
+    }
+
+    #[test]
+    fn iterm2_multipart_filepart_without_preamble_is_dropped() {
+        // A bare `FilePart=` (no MultipartFile= started) must NOT
+        // accumulate anything — otherwise a half-truncated stream
+        // could pin memory inside the parser. Subsequent valid
+        // multipart transfers should still work.
+        use base64::Engine;
+        let mut t = term(80, 24);
+        let png = red_pixel_png();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        let mut stream = Vec::new();
+        // Orphan chunk.
+        stream.extend_from_slice(b"\x1b]1337;FilePart=garbage\x07");
+        // Followed by a clean transfer.
+        stream.extend_from_slice(
+            b"\x1b]1337;MultipartFile=inline=1;width=4;height=2\x07",
+        );
+        stream.extend_from_slice(b"\x1b]1337;FilePart=");
+        stream.extend_from_slice(b64.as_bytes());
+        stream.extend_from_slice(b"\x07");
+        stream.extend_from_slice(b"\x1b]1337;FileEnd\x07");
+        t.advance(&stream);
+        // Exactly one placement — orphan got dropped, real one
+        // succeeded.
+        assert_eq!(t.image_placements().len(), 1);
     }
 
     #[test]
