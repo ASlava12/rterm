@@ -2086,10 +2086,21 @@ fn spawn_reader_thread(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut buf = [0u8; 8192];
+        // Optional raw-PTY dump. Set RTERM_DUMP_PTY=/path/to/file to
+        // append every chunk read from the master PTY, before any
+        // VT/auto-detect processing. Catches mid-stream byte loss /
+        // mangling — most useful for diagnosing ConPTY on Windows.
+        let mut pty_dump: Option<std::fs::File> = std::env::var("RTERM_DUMP_PTY")
+            .ok()
+            .and_then(|path| std::fs::OpenOptions::new().create(true).append(true).open(&path).ok());
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    if let Some(f) = pty_dump.as_mut() {
+                        use std::io::Write;
+                        let _ = f.write_all(&buf[..n]);
+                    }
                     // If the renderer thread panicked while holding the
                     // terminal mutex, the lock is poisoned. Earlier this
                     // hard-crashed the reader; instead, log + exit the
