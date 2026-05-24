@@ -1795,7 +1795,9 @@ fn run_gui(
     // restarts. Skipped when we don't know which file backs the running
     // config (e.g. an embedder that loaded Config in-memory).
     let on_theme_change: Option<rterm_render::ThemeChangeCallback> = config_path
+        .as_ref()
         .map(|path| {
+            let path = path.clone();
             let arc: rterm_render::ThemeChangeCallback =
                 Arc::new(move |name: &str| {
                     if let Err(e) = persist_theme_to_config(&path, name) {
@@ -1804,6 +1806,22 @@ fn run_gui(
                             theme = %name,
                             path = %path.display(),
                             "failed to persist [appearance].theme to config.toml"
+                        );
+                    }
+                });
+            arc
+        });
+    let on_image_auto_detect_change: Option<rterm_render::ImageAutoDetectCallback> =
+        config_path.as_ref().map(|path| {
+            let path = path.clone();
+            let arc: rterm_render::ImageAutoDetectCallback =
+                Arc::new(move |enabled: bool| {
+                    if let Err(e) = persist_image_auto_detect_to_config(&path, enabled) {
+                        tracing::warn!(
+                            error = %e,
+                            enabled,
+                            path = %path.display(),
+                            "failed to persist [image].auto_detect to config.toml"
                         );
                     }
                 });
@@ -1834,6 +1852,7 @@ fn run_gui(
         render_test_only,
         active_theme: initial_theme,
         on_theme_change,
+        on_image_auto_detect_change,
         os_decorations: config.window.os_decorations,
         allow_osc52: config.terminal.allow_osc52,
         // Pass the [guake] snapshot through unconditionally. The
@@ -1874,6 +1893,53 @@ fn run_gui(
 ///
 /// Creates parent directories as needed. Falls back to a full serialise
 /// only when the file doesn't exist or fails to parse as a TOML document.
+/// Rewrite `[image].auto_detect` in the user's `config.toml`,
+/// preserving comments / section ordering / whitespace via
+/// `toml_edit`. Mirrors [`persist_theme_to_config`]'s shape — the
+/// only differences are the section name (`image` not `appearance`)
+/// and the key (`auto_detect` not `theme`). No-ops when the value
+/// already matches so the file watcher doesn't see a self-trigger
+/// reload.
+fn persist_image_auto_detect_to_config(
+    path: &std::path::Path,
+    enabled: bool,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    if path.exists() {
+        if let Ok(body) = std::fs::read_to_string(path) {
+            if let Ok(mut doc) = body.parse::<toml_edit::DocumentMut>() {
+                let current = doc
+                    .get("image")
+                    .and_then(|i| i.get("auto_detect"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if current == enabled {
+                    return Ok(());
+                }
+                let image = doc
+                    .entry("image")
+                    .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+                if let Some(tbl) = image.as_table_mut() {
+                    tbl["auto_detect"] = toml_edit::value(enabled);
+                }
+                std::fs::write(path, doc.to_string()).with_context(|| {
+                    format!("write {} for image.auto_detect persist", path.display())
+                })?;
+                return Ok(());
+            }
+        }
+    }
+    let mut cfg = Config::default();
+    cfg.image.auto_detect = enabled;
+    let serialized = toml::to_string_pretty(&cfg).context("serialize config")?;
+    std::fs::write(path, serialized).with_context(|| {
+        format!("write {} for image.auto_detect persist", path.display())
+    })?;
+    Ok(())
+}
+
 fn persist_theme_to_config(path: &std::path::Path, name: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();

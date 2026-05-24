@@ -686,6 +686,9 @@ impl Terminal {
     /// `[image].auto_detect` in `config.toml` and from the
     /// Settings overlay's checkbox.
     pub fn set_auto_detect_inline_images(&mut self, enabled: bool) {
+        if self.autoimg_enabled != enabled {
+            tracing::info!(enabled, "auto-detect inline images toggled");
+        }
         self.autoimg_enabled = enabled;
         if !enabled {
             // Bail out of any partially-matched state when the
@@ -1545,12 +1548,14 @@ impl Terminal {
                     || vte_buf.is_empty();
                 if last_was_nl {
                     if b == 0x89 {
+                        tracing::debug!("auto-detect: PNG magic candidate (0x89)");
                         self.autoimg_state = AutoImageState::MatchingPng { matched: 1 };
                         self.autoimg_held.clear();
                         self.autoimg_held.push(b);
                         return;
                     }
                     if b == 0xFF {
+                        tracing::debug!("auto-detect: JPEG magic candidate (0xFF)");
                         self.autoimg_state = AutoImageState::MatchingJpeg { matched: 1 };
                         self.autoimg_held.clear();
                         self.autoimg_held.push(b);
@@ -1568,6 +1573,7 @@ impl Terminal {
                 if expected == Some(b) {
                     self.autoimg_held.push(b);
                     if matched + 1 == PNG_MAGIC.len() as u8 {
+                        tracing::info!("auto-detect: PNG magic confirmed, entering body capture");
                         // Magic complete — flip to body mode. The
                         // 8 magic bytes already in `held` go into
                         // `autoimg_buf` as the start of the body.
@@ -1581,6 +1587,11 @@ impl Terminal {
                         };
                     }
                 } else {
+                    tracing::debug!(
+                        ?b,
+                        matched,
+                        "auto-detect: PNG magic mismatch — replaying held bytes",
+                    );
                     // Mismatch — restore the held bytes to vte
                     // (no data lost) + this byte too.
                     let held: Vec<u8> = std::mem::take(&mut self.autoimg_held);
@@ -1672,6 +1683,12 @@ impl Terminal {
         vte_buf: &mut Vec<u8>,
     ) {
         let bytes = std::mem::take(&mut self.autoimg_buf);
+        let buf_len = bytes.len();
+        tracing::info!(
+            ?format,
+            buf_len,
+            "auto-detect: end-of-image marker — finalizing",
+        );
         self.autoimg_state = AutoImageState::Ground;
         // Push pre-image text to the grid first.
         self.feed_vte(vte_buf);
@@ -1686,6 +1703,10 @@ impl Terminal {
         };
         if format == crate::image::ImageFormat::Png && (width_px == 0 || height_px == 0)
         {
+            tracing::warn!(
+                buf_len,
+                "auto-detect: PNG header sniff failed — dumping bytes as text",
+            );
             // Couldn't even read the header — treat as decode
             // failure and dump bytes as text.
             vte_buf.extend_from_slice(&bytes);
@@ -1707,7 +1728,13 @@ impl Terminal {
         let sb_len = if on_alt { 0 } else { self.scrollback.len() };
         let abs_row = sb_len as i64 + self.cursor.row as i64;
         let col = self.cursor.col;
+        tracing::info!(
+            ?format, width_px = final_w, height_px = final_h,
+            cols, rows, abs_row, col,
+            "auto-detect: registering image",
+        );
         let Some(id) = self.register_image(format, final_w, final_h, bytes) else {
+            tracing::warn!("auto-detect: register_image rejected (size/cap)");
             return;
         };
         self.image_placements.push(crate::image::ImagePlacement {
@@ -1720,6 +1747,11 @@ impl Terminal {
             height_px: final_h,
             placement_id: 0,
         });
+        tracing::info!(
+            id,
+            placements_total = self.image_placements.len(),
+            "auto-detect: image placed",
+        );
         // Advance cursor past the image rows. Use a small
         // perform — same trick the Kitty commit path uses.
         let lfs = vec![b'\n'; rows as usize];

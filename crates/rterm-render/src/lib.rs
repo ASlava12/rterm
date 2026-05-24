@@ -2574,6 +2574,12 @@ struct ContextMenu {
 /// by rterm-app to persist the choice back to `~/.config/rterm/config.toml`.
 pub type ThemeChangeCallback = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Same shape as [`ThemeChangeCallback`], invoked when the user toggles
+/// `[image].auto_detect` from the Settings overlay. rterm-app
+/// implements this to rewrite the value in `~/.config/rterm/config.toml`
+/// so the choice sticks across restarts.
+pub type ImageAutoDetectCallback = Arc<dyn Fn(bool) + Send + Sync>;
+
 /// Active tab-switch animation. The accent stripe under the active tab
 /// slides from `from_idx` to `to_idx` over `TAB_SWITCH_ANIM_MS` ms.
 #[derive(Debug, Clone, Copy)]
@@ -3022,6 +3028,12 @@ pub struct RunConfig {
     /// back to `~/.config/rterm/config.toml` under `[appearance].theme`.
     /// `None` disables persistence.
     pub on_theme_change: Option<ThemeChangeCallback>,
+    /// Persistence callback for the Settings overlay's
+    /// `[x] Auto-detect inline images` checkbox. When `Some`,
+    /// flipping the box invokes this with the new value so
+    /// rterm-app can write it back into
+    /// `~/.config/rterm/config.toml`.
+    pub on_image_auto_detect_change: Option<ImageAutoDetectCallback>,
     /// Whether the OS should draw the window title bar and decorations.
     /// `false` (default) makes rterm own the entire window chrome —
     /// matches the Chrome/Firefox look. Set to `true` to fall back to
@@ -3188,6 +3200,9 @@ pub struct App {
     /// the user switches via `cycle_theme` / settings UI / Lua
     /// `set_theme`. `None` means "don't persist" (e.g. tests).
     on_theme_change: Option<ThemeChangeCallback>,
+    /// Persistence sink for the auto-detect toggle. See
+    /// [`RunConfig::on_image_auto_detect_change`].
+    on_image_auto_detect_change: Option<ImageAutoDetectCallback>,
     /// Whether the OS draws the title bar / window border. Cached at
     /// construction so the `resumed()` event creates the window with
     /// the matching `WindowAttributes::with_decorations` flag.
@@ -3378,6 +3393,7 @@ impl App {
             render_test_only,
             active_theme,
             on_theme_change,
+            on_image_auto_detect_change,
             os_decorations,
             allow_osc52,
             guake,
@@ -3462,6 +3478,7 @@ impl App {
                 active_theme
             },
             on_theme_change,
+            on_image_auto_detect_change,
             os_decorations,
             palette: None,
             window_focused: true,
@@ -4149,6 +4166,13 @@ impl App {
             Some(SettingsHit::ToggleAutoDetectImages) => {
                 self.image_auto_detect = !self.image_auto_detect;
                 self.propagate_auto_detect_to_panes();
+                // Persist the new value so it survives a restart.
+                // The callback (set by rterm-app) rewrites
+                // `[image].auto_detect` in config.toml via
+                // `toml_edit`, preserving comments + layout.
+                if let Some(cb) = self.on_image_auto_detect_change.as_ref() {
+                    cb(self.image_auto_detect);
+                }
             }
             Some(SettingsHit::OpenHelp) => {
                 self.show_settings = false;
