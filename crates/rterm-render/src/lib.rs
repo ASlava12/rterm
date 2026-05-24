@@ -2026,6 +2026,29 @@ impl GpuState {
                 let size = [pl.cols as f32 * cell_w, pl.rows as f32 * line_h];
                 let key = (p.pane_uid, pl.image_id);
                 live_keys.insert(key);
+                // One-shot trace per image so we can verify
+                // projection math (abs_row → viewport_row, then
+                // → pixel coords) is sane without spamming a
+                // frame loop's worth of log lines.
+                static FIRST_QUAD: std::sync::Once = std::sync::Once::new();
+                FIRST_QUAD.call_once(|| {
+                    tracing::info!(
+                        pane_uid = p.pane_uid,
+                        image_id = pl.image_id,
+                        abs_row = pl.abs_row,
+                        sb_len,
+                        scroll_offset = p.scroll_offset,
+                        viewport_row,
+                        grid_rows,
+                        pos_x = pos[0],
+                        pos_y = pos[1],
+                        size_w = size[0],
+                        size_h = size[1],
+                        pane_top = p.rect.top,
+                        pane_height = p.rect.height,
+                        "image_pass: first quad projection",
+                    );
+                });
                 image_quads.push(image_pass::ImageQuad {
                     key,
                     pos,

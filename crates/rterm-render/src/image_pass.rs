@@ -348,15 +348,32 @@ impl ImageLayer {
         let decoded = match image_decode::decode(image) {
             Some(d) => d,
             None => {
+                tracing::warn!(
+                    pane_uid = key.0,
+                    image_id = key.1,
+                    "image_pass: decode failed (see image_decode error above)",
+                );
                 self.failed.insert(key);
                 return false;
             }
         };
         // Refuse degenerate dimensions — wgpu requires at least 1×1.
         if decoded.width == 0 || decoded.height == 0 {
+            tracing::warn!(
+                pane_uid = key.0,
+                image_id = key.1,
+                "image_pass: degenerate dims after decode, refusing upload",
+            );
             self.failed.insert(key);
             return false;
         }
+        tracing::info!(
+            pane_uid = key.0,
+            image_id = key.1,
+            width = decoded.width,
+            height = decoded.height,
+            "image_pass: uploading texture",
+        );
         let extent = wgpu::Extent3d {
             width: decoded.width,
             height: decoded.height,
@@ -408,6 +425,12 @@ impl ImageLayer {
             ],
         });
         self.cache.insert(key, ImageCacheEntry { _texture: texture, bind_group });
+        tracing::info!(
+            pane_uid = key.0,
+            image_id = key.1,
+            cache_size = self.cache.len(),
+            "image_pass: texture cached, ready to draw",
+        );
         true
     }
 
@@ -519,6 +542,19 @@ impl ImageLayer {
         if self.groups.is_empty() {
             return;
         }
+        // Once-per-process trace for the first time we actually
+        // emit image draw calls. Confirms that the render path
+        // didn't get short-circuited upstream.
+        static FIRST_DRAW: std::sync::Once = std::sync::Once::new();
+        let group_count = self.groups.len();
+        let instance_count: u32 = self.groups.iter().map(|(_, r, _)| r.end - r.start).sum();
+        FIRST_DRAW.call_once(|| {
+            tracing::info!(
+                groups = group_count,
+                instances = instance_count,
+                "image_pass: drawing first image frame",
+            );
+        });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.viewport_bind_group, &[]);
         pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
@@ -534,6 +570,14 @@ impl ImageLayer {
             let cw = (clip[2].max(0.0) as u32).min(vp_w.saturating_sub(cx));
             let ch = (clip[3].max(0.0) as u32).min(vp_h.saturating_sub(cy));
             if cw == 0 || ch == 0 {
+                tracing::warn!(
+                    pane_uid = key.0,
+                    image_id = key.1,
+                    ?clip,
+                    vp_w,
+                    vp_h,
+                    "image_pass: scissor clamps to 0 — image off-screen, skipping draw",
+                );
                 continue;
             }
             pass.set_scissor_rect(cx, cy, cw, ch);

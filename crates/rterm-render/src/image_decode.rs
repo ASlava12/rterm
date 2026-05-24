@@ -94,7 +94,15 @@ pub fn decode(image: &Image) -> Option<DecodedImage> {
             let dyn_img = match image::load_from_memory(&image.data) {
                 Ok(d) => d,
                 Err(e) => {
-                    tracing::debug!("image decode failed: {e}");
+                    // Bumped to WARN: default log levels filter out
+                    // `debug`, so a real decode failure would be
+                    // invisible to a user trying to figure out why
+                    // their inline image isn't drawing.
+                    tracing::warn!(
+                        format = ?image.format,
+                        data_len = image.data.len(),
+                        "image decode failed: {e}",
+                    );
                     return None;
                 }
             };
