@@ -527,15 +527,26 @@ enum AutoImageState {
     /// `matched` counts the magic bytes seen so far. Held bytes
     /// live in `autoimg_held` on Terminal; on mismatch the whole
     /// hold gets replayed into vte_buf so nothing is lost.
-    MatchingPng { matched: u8 },
+    ///
+    /// `onlcr_skip` flips to `true` the first time we see an
+    /// extra `\r` ahead of an expected `\n` — the calling card
+    /// of PTY-side ONLCR. Carried through to `InPngBody` so the
+    /// body accumulator can undo the doubled `\r\n` only when
+    /// the input is actually ONLCR-corrupted (raw streams stay
+    /// untouched, preserving legitimate `\r\n` byte sequences
+    /// inside compressed IDAT data).
+    MatchingPng { matched: u8, onlcr_skip: bool },
     MatchingJpeg { matched: u8 },
-    /// Inside a PNG body, accumulating into `autoimg_buf`. Tail
-    /// holds the last 8 bytes of the buffer so we can match the
-    /// PNG IEND CRC sequence in O(1) per byte rather than
-    /// rescanning the whole accumulator.
-    InPngBody,
+    /// Inside a PNG body, accumulating into `autoimg_buf`. When
+    /// `onlcr_mode` is `true`, the accumulator collapses every
+    /// `\r\n` into `\n` on the fly — see [`AutoImageState::MatchingPng`]
+    /// for the detection mechanism.
+    InPngBody { onlcr_mode: bool },
     /// Inside a JPEG body. Watching for the EOI marker
     /// `\xFF\xD9`. `last_was_ff` carries the one-byte lookahead.
+    /// JPEG magic doesn't contain a `\n`, so we can't sniff the
+    /// PTY mode from it; default to assuming ONLCR (the common
+    /// path through auto-detect is `cat picture.jpg`).
     InJpegBody { last_was_ff: bool },
 }
 
@@ -1549,7 +1560,10 @@ impl Terminal {
                 if last_was_nl {
                     if b == 0x89 {
                         tracing::debug!("auto-detect: PNG magic candidate (0x89)");
-                        self.autoimg_state = AutoImageState::MatchingPng { matched: 1 };
+                        self.autoimg_state = AutoImageState::MatchingPng {
+                            matched: 1,
+                            onlcr_skip: false,
+                        };
                         self.autoimg_held.clear();
                         self.autoimg_held.push(b);
                         return;
@@ -1564,54 +1578,66 @@ impl Terminal {
                 }
                 vte_buf.push(b);
             }
-            AutoImageState::MatchingPng { matched } => {
+            AutoImageState::MatchingPng { matched, onlcr_skip } => {
                 // PNG magic: \x89 P N G \r \n \x1a \n  (8 bytes).
                 const PNG_MAGIC: [u8; 8] = [
                     0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A,
                 ];
                 let expected = PNG_MAGIC.get(matched as usize).copied();
+                // ONLCR-tolerance: when the next expected byte is
+                // `\n` (positions 5 / 7) and we instead see a `\r`,
+                // that's PTY ONLCR doubling the line break. Eat
+                // the spurious `\r` once and stay at the same
+                // position; the next byte should be the actual
+                // `\n`. Setting `onlcr_skip = true` also flags the
+                // body accumulator that follows so it can collapse
+                // the doubled CRLFs throughout IDAT chunks too.
+                if expected == Some(b'\n') && b == b'\r' && !onlcr_skip {
+                    tracing::debug!(
+                        matched,
+                        "auto-detect: PNG magic — PTY ONLCR detected, normalising",
+                    );
+                    self.autoimg_state = AutoImageState::MatchingPng {
+                        matched,
+                        onlcr_skip: true,
+                    };
+                    return;
+                }
                 if expected == Some(b) {
                     self.autoimg_held.push(b);
                     if matched + 1 == PNG_MAGIC.len() as u8 {
-                        tracing::info!("auto-detect: PNG magic confirmed, entering body capture");
+                        tracing::info!(
+                            onlcr_mode = onlcr_skip,
+                            "auto-detect: PNG magic confirmed, entering body capture",
+                        );
                         // Magic complete — flip to body mode. The
                         // 8 magic bytes already in `held` go into
                         // `autoimg_buf` as the start of the body.
                         let header: Vec<u8> =
                             std::mem::take(&mut self.autoimg_held);
                         self.autoimg_buf = header;
-                        self.autoimg_state = AutoImageState::InPngBody;
+                        self.autoimg_state =
+                            AutoImageState::InPngBody { onlcr_mode: onlcr_skip };
                     } else {
                         self.autoimg_state = AutoImageState::MatchingPng {
                             matched: matched + 1,
+                            // Reset ONLCR-skip flag once we've
+                            // consumed the actual `\n` — each
+                            // expected `\n` position gets its own
+                            // single-skip budget.
+                            onlcr_skip: if expected == Some(b'\n') {
+                                false
+                            } else {
+                                onlcr_skip
+                            },
                         };
                     }
                 } else {
-                    // Heuristic: matched ≥ 5 bytes (`\x89 P N G \r`)
-                    // and the next byte is another `\r` instead of
-                    // the expected `\n` (0x0A) is the calling card
-                    // of PTY-side ONLCR conversion — the line
-                    // discipline doubled every `\n` in the binary
-                    // stream. We can't fix it from this side (raw
-                    // `\r\n` strip would corrupt natural CRLF in
-                    // IDAT data), so emit a one-shot tip that
-                    // points the user at `stty -onlcr` and bail
-                    // out.
-                    if matched >= 5 && b == b'\r' {
-                        tracing::warn!(
-                            "auto-detect: PNG magic mangled by PTY ONLCR \
-                             (got CR where LF expected). Run `stty -onlcr; \
-                             cat file.png; stty onlcr` — or wrap in a shell \
-                             function. See the `[image].auto_detect` config \
-                             doc for details."
-                        );
-                    } else {
-                        tracing::debug!(
-                            ?b,
-                            matched,
-                            "auto-detect: PNG magic mismatch — replaying held bytes",
-                        );
-                    }
+                    tracing::debug!(
+                        ?b,
+                        matched,
+                        "auto-detect: PNG magic mismatch — replaying held bytes",
+                    );
                     // Mismatch — restore the held bytes to vte
                     // (no data lost) + this byte too.
                     let held: Vec<u8> = std::mem::take(&mut self.autoimg_held);
@@ -1644,7 +1670,7 @@ impl Terminal {
                     self.autoimg_state = AutoImageState::Ground;
                 }
             }
-            AutoImageState::InPngBody => {
+            AutoImageState::InPngBody { onlcr_mode } => {
                 // Watch for the PNG IEND chunk's fixed tail:
                 // `IEND` (4 bytes type) followed by the IEND CRC
                 // `\xae\x42\x60\x82` (4 bytes). Together always
@@ -1662,6 +1688,19 @@ impl Terminal {
                     self.autoimg_state = AutoImageState::Ground;
                     return;
                 }
+                // ONLCR undo, on the fly: when in ONLCR mode and
+                // we just got `\n` with the previous accumulated
+                // byte being `\r`, pop the `\r` before pushing
+                // the `\n`. Net effect: every `\r\n` pair in the
+                // stream collapses to `\n`, which precisely
+                // reverses ONLCR's per-byte transformation —
+                // including the case where the original PNG
+                // contained natural `\r\n` (ONLCR'd that becomes
+                // `\r\r\n`, and the collapse recovers `\r\n`).
+                if onlcr_mode && b == b'\n' && self.autoimg_buf.last() == Some(&b'\r')
+                {
+                    self.autoimg_buf.pop();
+                }
                 self.autoimg_buf.push(b);
                 if self.autoimg_buf.ends_with(&IEND_TAIL) {
                     self.finalize_auto_image(crate::image::ImageFormat::Png, vte_buf);
@@ -1674,6 +1713,14 @@ impl Terminal {
                     vte_buf.push(b);
                     self.autoimg_state = AutoImageState::Ground;
                     return;
+                }
+                // JPEG magic doesn't include `\n` so we can't
+                // sniff PTY mode the way we do for PNG. The
+                // primary path through auto-detect is `cat
+                // picture.jpg`, so default to ONLCR undo —
+                // mirrors the PNG `onlcr_mode = true` branch.
+                if b == b'\n' && self.autoimg_buf.last() == Some(&b'\r') {
+                    self.autoimg_buf.pop();
                 }
                 self.autoimg_buf.push(b);
                 // JPEG EOI marker is `\xFF \xD9`. JPEG byte-
@@ -7338,6 +7385,41 @@ mod tests {
         t.advance(&stream);
         // No placement.
         assert!(t.image_placements().is_empty());
+    }
+
+    #[test]
+    fn auto_detect_recovers_from_pty_onlcr_corruption() {
+        // Simulate what PTY ONLCR does to a `cat picture.png`
+        // stream: every `\n` (0x0A) in the binary output gets
+        // a `\r` (0x0D) prepended. The magic-match has to
+        // tolerate the extra CR and the body has to undo the
+        // doubled CRLFs so `image::load_from_memory` could
+        // decompress IDAT.
+        let mut t = term(80, 24);
+        t.set_auto_detect_inline_images(true);
+        let png = red_pixel_png();
+        let onlcr: Vec<u8> = onlcr_corrupt(&png);
+        let mut stream = Vec::new();
+        stream.push(b'\n'); // eligibility (line start)
+        stream.extend_from_slice(&onlcr);
+        t.advance(&stream);
+        assert_eq!(t.image_placements().len(), 1, "ONLCR-corrupted PNG decoded");
+        // The stored payload should be the normalized version =
+        // exactly the original PNG bytes.
+        let p = t.image_placements()[0];
+        let img = t.image(p.image_id).expect("image stored");
+        assert_eq!(img.data, png, "body normalised back to original");
+    }
+
+    fn onlcr_corrupt(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 64);
+        for &b in bytes {
+            if b == b'\n' {
+                out.push(b'\r');
+            }
+            out.push(b);
+        }
+        out
     }
 
     #[test]

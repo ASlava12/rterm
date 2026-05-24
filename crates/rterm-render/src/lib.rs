@@ -2026,7 +2026,17 @@ impl GpuState {
                 let size = [pl.cols as f32 * cell_w, pl.rows as f32 * line_h];
                 let key = (p.pane_uid, pl.image_id);
                 live_keys.insert(key);
-                image_quads.push(image_pass::ImageQuad { key, pos, size });
+                image_quads.push(image_pass::ImageQuad {
+                    key,
+                    pos,
+                    size,
+                    // Scissor to the owning pane's pixel rect so
+                    // an image scrolled above its pane (or one
+                    // taller than the pane height) doesn't paint
+                    // into the header strip / status bar / a
+                    // neighbouring pane.
+                    clip: [p.rect.left, p.rect.top, p.rect.width, p.rect.height],
+                });
             }
         }
         // GC textures for image ids that no longer have placements

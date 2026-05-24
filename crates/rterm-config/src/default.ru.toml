@@ -268,16 +268,14 @@ enabled = true
 # превратились бы в картинку. Переключается через Settings оверлей
 # (Ctrl+Shift+, → "Auto-detect inline images").
 #
-# Caveat: PTY-уровневый ONLCR (стандартная tty-дисциплина) дублирует
-# каждый `\n` в выводе программ, пишущих в stdout. Голый
-# `cat picture.png` приедет с покорёженной PNG magic + IDAT и не
-# раскодируется. Решение — обернуть в stty:
-#     stty -onlcr; cat picture.png; stty onlcr
-# или один раз определить shell-функцию:
-#     catimg() { stty -onlcr; cat "$1"; stty onlcr; }
-# Программы, использующие OSC 1337 / Kitty APC обёртки
-# (`chafa --format=iterm`, `kitten icat`, и т.д.), этой проблемы
-# не имеют — в их base64 payload'е нет `\n` байт.
+# `cat picture.png` "просто работает" — парсер обнаруживает PTY
+# ONLCR в PNG-заголовке (двойной `\r` перед `\n` — характерный
+# признак) и применяет обратное преобразование `\r\n → \n` к
+# телу. Raw-потоки (`stty -opost; cat picture.png`) определяются
+# как не-ONLCR и нормализация к ним не применяется, так что
+# восстановление безопасно в обоих режимах. JPEG откатывается на
+# безусловный ONLCR-undo, потому что его 3-байтная magic не
+# содержит `\n` для sniff'а — нормально для основного `cat`-пути.
 #
 #   Тип:    bool. По умолчанию: false.
 auto_detect = false

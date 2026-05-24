@@ -80,6 +80,13 @@ pub struct ImageQuad {
     pub key: CacheKey,
     pub pos: [f32; 2],
     pub size: [f32; 2],
+    /// Owning pane's pixel rect — applied as a scissor when this
+    /// quad draws so an image whose footprint extends past the
+    /// pane (scrolled, larger than viewport, ...) doesn't paint
+    /// over the header strip or another pane underneath. All
+    /// quads with the same `key` share one pane, so the per-
+    /// group scissor uses the first quad's rect.
+    pub clip: [f32; 4], // [left, top, width, height]
 }
 
 const INITIAL_CAPACITY: u64 = 16;
@@ -148,11 +155,12 @@ pub struct ImageLayer {
     failed: HashSet<CacheKey>,
     instance_buffer: wgpu::Buffer,
     capacity: u64,
-    /// Per-frame draw groups: `(key, [first..last])` index ranges
-    /// into `instance_buffer`. One draw call per group; each call
-    /// binds the matching `ImageCacheEntry`'s bind group and
-    /// instances the shared quad.
-    groups: Vec<(CacheKey, std::ops::Range<u32>)>,
+    /// Per-frame draw groups: `(key, range, clip_rect)`. One draw
+    /// call per group; the call binds the matching cache entry +
+    /// pushes a scissor matching the owning pane's pixel rect so
+    /// an image's footprint that extends past the pane stays
+    /// confined.
+    groups: Vec<(CacheKey, std::ops::Range<u32>, [f32; 4])>,
     viewport: [f32; 2],
     /// Scratch buffer reused per-frame for the staging fill of
     /// `instance_buffer` — same trick `BgLayer` uses to avoid
@@ -454,12 +462,17 @@ impl ImageLayer {
                 continue;
             }
             let start = instances.len() as u32;
-            for q in by_key.get(key).into_iter().flatten() {
+            // All quads in this group share the same owning
+            // pane → same scissor rect. Read it from the first
+            // quad of the group.
+            let group_quads = by_key.get(key).map(|v| v.as_slice()).unwrap_or(&[]);
+            let clip = group_quads.first().map(|q| q.clip).unwrap_or([0.0, 0.0, 0.0, 0.0]);
+            for q in group_quads {
                 instances.push(Instance { pos: q.pos, size: q.size });
             }
             let end = instances.len() as u32;
             if end > start {
-                self.groups.push((*key, start..end));
+                self.groups.push((*key, start..end, clip));
             }
         }
 
@@ -509,11 +522,27 @@ impl ImageLayer {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.viewport_bind_group, &[]);
         pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-        for (key, range) in &self.groups {
+        let vp_w = self.viewport[0] as u32;
+        let vp_h = self.viewport[1] as u32;
+        for (key, range, clip) in &self.groups {
             let Some(entry) = self.cache.get(key) else { continue };
+            // Clamp the scissor to the viewport so wgpu doesn't
+            // reject the call on an out-of-bounds rect (DPI /
+            // layout math can round a pixel past the edge).
+            let cx = clip[0].max(0.0) as u32;
+            let cy = clip[1].max(0.0) as u32;
+            let cw = (clip[2].max(0.0) as u32).min(vp_w.saturating_sub(cx));
+            let ch = (clip[3].max(0.0) as u32).min(vp_h.saturating_sub(cy));
+            if cw == 0 || ch == 0 {
+                continue;
+            }
+            pass.set_scissor_rect(cx, cy, cw, ch);
             pass.set_bind_group(1, &entry.bind_group, &[]);
             pass.draw(0..6, range.clone());
         }
+        // Restore the full-viewport scissor so the text / overlay
+        // passes that follow aren't accidentally clipped to the
+        // last image's pane.
+        pass.set_scissor_rect(0, 0, vp_w.max(1), vp_h.max(1));
     }
-
 }
