@@ -45,10 +45,15 @@ jobs:
             os: ubuntu-24.04-arm
             archive: tar.gz
             bin: rterm
-          - target: x86_64-apple-darwin
-            os: macos-13
-            archive: tar.gz
-            bin: rterm
+          # x86_64-apple-darwin dropped from the release matrix:
+          # GitHub's `macos-13` Intel runner pool degraded to 4+ hour
+          # queue times in mid-2026 (Apple Silicon eclipsed Intel
+          # Macs years prior). The remaining Intel-Mac user base
+          # gets first-class compatibility via Rosetta 2, which
+          # transparently runs the `aarch64-apple-darwin` binary.
+          # When/if `macos-13` queue health recovers, add the leg
+          # back — the build steps below are target-parameterised
+          # and don't need any other change.
           - target: aarch64-apple-darwin
             os: macos-14
             archive: tar.gz

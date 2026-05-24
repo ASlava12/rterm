@@ -19,7 +19,7 @@ exclude = ["crates/portable-pty-rterm"]
 portable-pty = { path = "crates/portable-pty-rterm" }
 
 [workspace.package]
-version = "0.0.4"
+version = "0.0.5"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT OR Apache-2.0"
