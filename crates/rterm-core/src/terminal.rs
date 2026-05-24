@@ -1169,6 +1169,27 @@ impl Terminal {
         // behind `Terminal::dispatch_apc`.
         let mut vte_buf: Vec<u8> = Vec::with_capacity(bytes.len());
         for &b in bytes {
+            // While the auto-detect state machine is mid-body
+            // (collecting raw PNG / JPEG bytes), bypass the APC
+            // pre-parser entirely. Compressed image payloads are
+            // effectively random bytes, so a 2.5 MiB PNG hits
+            // `\x1B _` (the APC start sequence) ~38 times by
+            // chance. Without this bypass each accidental match
+            // pulls bytes into the APC buffer until a BEL / ST
+            // terminator, leaving 4900-ish bytes missing from
+            // the image accumulator — diagnosed via a buf-vs-disk
+            // md5 diff. The APC state was Ground before we
+            // entered the body (transition gate in MatchingPng)
+            // and stays Ground; APC resumes cleanly on the next
+            // byte after the body terminator.
+            if matches!(
+                self.autoimg_state,
+                AutoImageState::InPngBody { .. }
+                    | AutoImageState::InJpegBody { .. }
+            ) {
+                self.route_to_vte(b, &mut vte_buf);
+                continue;
+            }
             match self.apc_state {
                 ApcState::Ground => {
                     if b == 0x1B {
@@ -7429,6 +7450,43 @@ mod tests {
         let p = t.image_placements()[0];
         let img = t.image(p.image_id).expect("image stored");
         assert_eq!(img.data, png, "body normalised back to original");
+    }
+
+    #[test]
+    fn auto_detect_body_bypasses_apc_so_random_esc_bytes_dont_eat_payload() {
+        // PNG IDAT is deflate-compressed binary data — ~38
+        // occurrences of `\x1B _` per 2.5 MiB on average. Each
+        // would otherwise trip the APC pre-parser and yank
+        // bytes out of the image accumulator. Take a real
+        // 1×1 PNG, splice the APC-framing trap (`ESC _ … ESC \`)
+        // between the IHDR chunk and IDAT, and verify the
+        // stored payload matches the spliced input byte-for-byte.
+        let mut t = term(80, 24);
+        t.set_auto_detect_inline_images(true);
+        // Real 1×1 PNG body — its IHDR sniffs cleanly so
+        // finalize_auto_image actually registers the image.
+        let real_png = red_pixel_png();
+        // Splice the APC trap right after IHDR (bytes 8..33).
+        // Anywhere in the body would work; this offset puts
+        // the trap close to the start so a buggy parser wouldn't
+        // accidentally pass by burning out before reaching it.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&real_png[..33]);
+        payload.extend_from_slice(b"\x1b_evil-apc-trap-bytes\x1b\\");
+        payload.extend_from_slice(&real_png[33..]);
+        let mut stream = Vec::new();
+        stream.push(b'\n'); // eligibility
+        stream.extend_from_slice(&payload);
+        t.advance(&stream);
+        // Placement registered means: magic matched, body fully
+        // accumulated, IEND detected, IHDR sniff succeeded.
+        assert_eq!(t.image_placements().len(), 1, "image survived APC trap");
+        let p = t.image_placements()[0];
+        let img = t.image(p.image_id).expect("image stored");
+        assert_eq!(
+            img.data, payload,
+            "APC trap bytes preserved verbatim — bypass kept stream intact",
+        );
     }
 
     fn onlcr_corrupt(bytes: &[u8]) -> Vec<u8> {
