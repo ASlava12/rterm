@@ -7651,26 +7651,30 @@ impl App {
                     if let Ok(mut t) = pane.terminal.lock() {
                         t.advance(b"\x1bc");
                     }
-                    // Ask the shell to emit RIS itself, via a one-line
-                    // command that works in BOTH bash and PowerShell.
-                    // Earlier attempt (write raw `\x1bc` to PTY) failed
-                    // on PowerShell because PSReadLine intercepts ESC
-                    // bytes before the round-trip — only the trailing
-                    // `c` survived and pwsh tried to run it as a
-                    // command. The line below is pure ASCII at the
-                    // keystroke level (`\033` is four chars, not an
-                    // ESC byte), so PSReadLine and bash readline both
-                    // accept it as plain typed input. Each shell
-                    // executes ONE of the two semicolon-separated
-                    // statements successfully and errors on the
-                    // other; the successful one prints `ESC c` to
-                    // stdout, which travels back through ConPTY's
-                    // output parser and clears ConPTY's stuck G0/G1
-                    // (the actual fix for the post-`cat-binary`
-                    // `\ → ç` corruption). The other statement's
-                    // error message is cosmetic noise but harmless.
+                    // Ask the shell to emit RIS itself, via two
+                    // commands sent as SEPARATE input lines. Earlier
+                    // semicolon-joined variant failed: bash treats
+                    // `;` as an in-line separator and a syntax error
+                    // anywhere on the line (the PowerShell half's
+                    // `[Console]::Write` parses as bash `test` with
+                    // unbalanced brackets) aborts the WHOLE line —
+                    // including the printf half that would otherwise
+                    // have emitted RIS. With `\r` between them each
+                    // line commits to readline independently: the
+                    // shell-appropriate command runs successfully,
+                    // the other gets a recoverable error of its own,
+                    // and the successful one's `ESC c` travels back
+                    // through ConPTY's output parser to clear the
+                    // stuck G0/G1 designators.
+                    //
+                    // Pure ASCII at the keystroke level (the `\033`
+                    // is the four characters `\`, `0`, `3`, `3`, not
+                    // an ESC byte), so PSReadLine on Windows doesn't
+                    // intercept anything — earlier attempt with raw
+                    // `\x1bc` lost the ESC to PSReadLine and only
+                    // the trailing `c` made it to pwsh as input.
                     pane.send_input(
-                        b"printf '\\033c';[Console]::Write([char]27+'c')\r",
+                        b"printf '\\033c'\r[Console]::Write([char]27+'c')\r",
                     );
                 }
             }
