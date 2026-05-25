@@ -7651,18 +7651,27 @@ impl App {
                     if let Ok(mut t) = pane.terminal.lock() {
                         t.advance(b"\x1bc");
                     }
-                    // Write RIS bytes into the PTY input — the shell's
-                    // tty-echo on a bare-bash session will bounce them
-                    // back through ConPTY's output direction, where
-                    // ConPTY's own parser sees ESC c and clears its
-                    // internal G0/G1 designators. That's the part that
-                    // actually rescues `\ → ç` post-`cat-binary`
-                    // breakage on Windows. PowerShell + PSReadLine
-                    // intercepts ESC before the echo path so this
-                    // doesn't always work there — the help-overlay
-                    // text documents that opening a fresh tab is the
-                    // guaranteed recovery.
-                    pane.send_input(b"\x1bc");
+                    // Ask the shell to emit RIS itself, via a one-line
+                    // command that works in BOTH bash and PowerShell.
+                    // Earlier attempt (write raw `\x1bc` to PTY) failed
+                    // on PowerShell because PSReadLine intercepts ESC
+                    // bytes before the round-trip — only the trailing
+                    // `c` survived and pwsh tried to run it as a
+                    // command. The line below is pure ASCII at the
+                    // keystroke level (`\033` is four chars, not an
+                    // ESC byte), so PSReadLine and bash readline both
+                    // accept it as plain typed input. Each shell
+                    // executes ONE of the two semicolon-separated
+                    // statements successfully and errors on the
+                    // other; the successful one prints `ESC c` to
+                    // stdout, which travels back through ConPTY's
+                    // output parser and clears ConPTY's stuck G0/G1
+                    // (the actual fix for the post-`cat-binary`
+                    // `\ → ç` corruption). The other statement's
+                    // error message is cosmetic noise but harmless.
+                    pane.send_input(
+                        b"printf '\\033c';[Console]::Write([char]27+'c')\r",
+                    );
                 }
             }
             AppAction::SwapPaneNext => self.swap_focused_pane(1),
