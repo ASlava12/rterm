@@ -4771,6 +4771,19 @@ impl<'a> Perform for TerminalPerform<'a> {
                 // for iTerm2 Multipart accumulators.
                 self.kitty_chunks.clear();
                 *self.iterm2_multipart = None;
+                // Drop any dynamic OSC 0/1/2 title cached from a
+                // previous session. On Windows specifically, a
+                // ConPTY-mangled `cat picture.png` round-trips
+                // garbage UTF-8 into the title (via French-NRCS-
+                // translated `\x1b]0;…\a`); RIS recovery would
+                // otherwise leave that garbage stuck in the tab
+                // strip until the shell happened to emit a fresh
+                // OSC 0/1/2 — which most bash PS1s never do.
+                // Resetting here lets `Pane::dynamic_title` fall
+                // back to the static spawn-time label until the
+                // shell next advertises a real title.
+                *self.current_title = None;
+                self.title_stack.clear();
             }
             _ => {}
         }
