@@ -6300,6 +6300,20 @@ impl App {
                     self.clear_active_scrollback();
                     return Some(false);
                 }
+                // Ctrl+Shift+R — Reset focused pane. Resets our own
+                // VT parser state AND writes RIS bytes to the PTY so
+                // that, when the shell echoes them back, the
+                // intervening ConPTY (Windows) sees RIS and clears
+                // its OWN state. Without the echo round-trip a
+                // random `ESC ( R` from earlier `cat picture.png`
+                // output leaves ConPTY's G0 stuck in French NRCS,
+                // which makes every subsequent `\`, `@`, `~` etc.
+                // render as their French-NRCS substitutes (`ç`, `à`,
+                // `¨`, …) and locks the pane until the user opens a
+                // new tab.
+                "R" | "r" => {
+                    return Some(self.dispatch_action(AppAction::ResetPane));
+                }
                 "H" | "h" => {
                     self.show_help = !self.show_help;
                     if !self.show_help {
@@ -7630,9 +7644,25 @@ impl App {
             AppAction::CopyHoveredUrl => self.copy_hovered_url(),
             AppAction::ResetPane => {
                 if let Some(pane) = self.focused_pane() {
+                    // Reset OUR terminal-side VT state first (charsets,
+                    // scroll region, modes). This makes the local view
+                    // sane immediately even if the round-trip below
+                    // doesn't reach ConPTY.
                     if let Ok(mut t) = pane.terminal.lock() {
                         t.advance(b"\x1bc");
                     }
+                    // Write RIS bytes into the PTY input — the shell's
+                    // tty-echo on a bare-bash session will bounce them
+                    // back through ConPTY's output direction, where
+                    // ConPTY's own parser sees ESC c and clears its
+                    // internal G0/G1 designators. That's the part that
+                    // actually rescues `\ → ç` post-`cat-binary`
+                    // breakage on Windows. PowerShell + PSReadLine
+                    // intercepts ESC before the echo path so this
+                    // doesn't always work there — the help-overlay
+                    // text documents that opening a fresh tab is the
+                    // guaranteed recovery.
+                    pane.send_input(b"\x1bc");
                 }
             }
             AppAction::SwapPaneNext => self.swap_focused_pane(1),

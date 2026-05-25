@@ -84,7 +84,30 @@ impl PaneSpawner for GuiSpawner {
         term.set_inline_images_enabled(self.config.image.enabled);
         // Honour `[image].auto_detect` — off by default; opt-in
         // detection of raw PNG / JPEG magic bytes in the input.
-        term.set_auto_detect_inline_images(self.config.image.auto_detect);
+        // Hard-override to OFF on Windows: ConPTY processes binary
+        // child output through its own VT screen buffer, so a `cat
+        // picture.png` corrupts the local console state (random
+        // `ESC ( R` bytes in the PNG flip ConPTY's G0 to French
+        // NRCS, then every `\` / `@` / `~` in subsequent prompts
+        // renders as `ç` / `à` / `¨`). Until ConPTY grows real
+        // binary-safe passthrough, the auto-detect knob on Windows
+        // would mostly act as a foot-gun pointing at this exact
+        // failure mode — iTerm2 OSC 1337 / Kitty APC G (both
+        // wrapped in escape sequences ConPTY preserves) still work
+        // and are the recommended path on this platform.
+        #[cfg(target_os = "windows")]
+        let auto_detect = {
+            if self.config.image.auto_detect {
+                tracing::warn!(
+                    "[image].auto_detect is enabled in config but force-disabled on Windows \
+                     (ConPTY mangles raw binary — use imgcat / kitty +kitten icat instead)"
+                );
+            }
+            false
+        };
+        #[cfg(not(target_os = "windows"))]
+        let auto_detect = self.config.image.auto_detect;
+        term.set_auto_detect_inline_images(auto_detect);
         // Decode-validator: when the auto-detect path collects
         // a body, ask the renderer's image crate whether the
         // bytes actually decode before registering. Failed
