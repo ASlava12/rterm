@@ -3358,6 +3358,19 @@ impl<'a> Perform for TerminalPerform<'a> {
         } else {
             *self.charset_g0
         };
+        // Diagnostic: log every print of a non-ASCII Latin-1 char.
+        // If the user's prompt is rendering `\` as `ç`, EITHER the
+        // bytes arriving from the shell are actually `0xE7` (and
+        // we're correctly rendering U+00E7), OR our charset/print
+        // path is remapping. This log narrows down which.
+        if ch as u32 >= 0x80 && ch as u32 <= 0xFF {
+            tracing::trace!(
+                ch_u = ch as u32,
+                ch_disp = ?(ch),
+                active = ?active,
+                "print: latin-1 char arriving"
+            );
+        }
         let ch = if active == Charset::DecSpecialGraphics {
             dec_special_graphic(ch).unwrap_or(ch)
         } else {
@@ -4633,15 +4646,24 @@ impl<'a> Perform for TerminalPerform<'a> {
         // designates G1. We recognise `B` (ASCII, default) and `0` (DEC
         // Special Graphics). Other charsets are silently treated as ASCII.
         if intermediates == b"(" || intermediates == b")" {
+            let target_label = if intermediates == b"(" { "G0" } else { "G1" };
+            let new_charset = match byte {
+                b'0' => Charset::DecSpecialGraphics,
+                _ => Charset::Ascii,
+            };
+            tracing::debug!(
+                target = target_label,
+                designator_byte = byte,
+                designator_char = ?(byte as char),
+                ?new_charset,
+                "SCS — designate charset"
+            );
             let target = if intermediates == b"(" {
                 &mut *self.charset_g0
             } else {
                 &mut *self.charset_g1
             };
-            *target = match byte {
-                b'0' => Charset::DecSpecialGraphics,
-                _ => Charset::Ascii,
-            };
+            *target = new_charset;
             return;
         }
         if !intermediates.is_empty() {
