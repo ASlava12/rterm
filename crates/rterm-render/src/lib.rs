@@ -7651,6 +7651,17 @@ impl App {
                     if let Ok(mut t) = pane.terminal.lock() {
                         t.advance(b"\x1bc");
                     }
+                    // Drop the pane's cached OSC 0/1/2 title too.
+                    // RIS already cleared `terminal.current_title`, but
+                    // `pane.dynamic_title` is a snapshot the renderer
+                    // pulls every frame via `Terminal::take_title()` —
+                    // and `take_title` only updates the snapshot when
+                    // the terminal has a new title to hand out, so a
+                    // stale (now-None) terminal cache leaves the pane
+                    // copy stuck on the pre-RIS garbage.
+                    if let Ok(mut dt) = pane.dynamic_title.lock() {
+                        *dt = None;
+                    }
                     // Ask the shell to emit RIS itself, via two
                     // commands sent as SEPARATE input lines. Earlier
                     // semicolon-joined variant failed: bash treats
