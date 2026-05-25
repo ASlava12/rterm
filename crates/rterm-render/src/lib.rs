@@ -7673,8 +7673,17 @@ impl App {
                     // intercept anything — earlier attempt with raw
                     // `\x1bc` lost the ESC to PSReadLine and only
                     // the trailing `c` made it to pwsh as input.
+                    // Trailing `\x0c` (Ctrl+L) is a readline / PSReadLine
+                    // binding that clears the screen and redraws the
+                    // prompt at row 0. RIS already cleared most of
+                    // the screen, but the half of the dual-command
+                    // pair that DIDN'T match the current shell will
+                    // have printed its `command not found` / `syntax
+                    // error` complaint into the freshly-reset grid.
+                    // Ctrl+L wipes that residual error so the user
+                    // ends up on a clean prompt.
                     pane.send_input(
-                        b"printf '\\033c'\r[Console]::Write([char]27+'c')\r",
+                        b"printf '\\033c'\r[Console]::Write([char]27+'c')\r\x0c",
                     );
                 }
             }
