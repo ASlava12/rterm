@@ -7648,8 +7648,23 @@ impl App {
                     // scroll region, modes). This makes the local view
                     // sane immediately even if the round-trip below
                     // doesn't reach ConPTY.
+                    //
+                    // Also drop the scrollback. Default RIS preserves
+                    // saved lines per common xterm convention, but
+                    // Ctrl+Shift+R is a user-initiated panic button
+                    // and the scrollback is exactly what was making
+                    // recovery painful: a Windows `cat picture.png`
+                    // leaves ~10 000 lines of UTF-8-replacement
+                    // garbage in scrollback, and the *next* inline
+                    // image (e.g. via imgcat) gets an `abs_row` so
+                    // high up the virtual stream that the renderer's
+                    // viewport projection puts the quad mostly
+                    // out-of-frame. Wiping scrollback as part of the
+                    // reset gives the new image a low, sane abs_row
+                    // and clears the visible junk on top.
                     if let Ok(mut t) = pane.terminal.lock() {
                         t.advance(b"\x1bc");
+                        t.clear_scrollback();
                     }
                     // Drop the pane's cached OSC 0/1/2 title too.
                     // RIS already cleared `terminal.current_title`, but
