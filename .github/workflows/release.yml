@@ -38,6 +38,19 @@ jobs:
             os: ubuntu-latest
             archive: tar.gz
             bin: rterm
+          # Second x86_64 Linux build on the older runner — links
+          # against glibc 2.35 instead of 2.39, so the binary still
+          # loads on Ubuntu 22.04 LTS / Debian 12 / RHEL 9 / any
+          # distro shipped after early 2022. Field report from a
+          # v0.0.5 user: `version `GLIBC_2.39' not found` on a 22.04
+          # box, fixed by this leg. Tagged with an `-glibc2.35`
+          # suffix so the two archives don't collide and downstream
+          # users can grab the right one.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            archive: tar.gz
+            bin: rterm
+            archive_suffix: -glibc2.35
           # GitHub-hosted Linux/ARM64 runner (GA April 2025, free for
           # public repos). Native compile — no `cross` toolchain or
           # qemu emulation needed.
@@ -122,7 +135,7 @@ jobs:
         if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
-          stage="rterm-${{ steps.ver.outputs.tag }}-${{ matrix.target }}"
+          stage="rterm-${{ steps.ver.outputs.tag }}-${{ matrix.target }}${{ matrix.archive_suffix }}"
           mkdir -p "$stage"
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$stage/"
           cp README.md LICENSE-MIT LICENSE-APACHE "$stage/" 2>/dev/null || true
@@ -133,7 +146,7 @@ jobs:
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          $stage = "rterm-${{ steps.ver.outputs.tag }}-${{ matrix.target }}"
+          $stage = "rterm-${{ steps.ver.outputs.tag }}-${{ matrix.target }}${{ matrix.archive_suffix }}"
           New-Item -ItemType Directory -Path $stage | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" $stage
           if (Test-Path README.md) { Copy-Item README.md $stage }
@@ -161,7 +174,7 @@ jobs:
       - name: Upload archive
         uses: actions/upload-artifact@v4
         with:
-          name: archive-${{ matrix.target }}
+          name: archive-${{ matrix.target }}${{ matrix.archive_suffix }}
           path: ${{ env.ARTIFACT }}
           if-no-files-found: error
 
