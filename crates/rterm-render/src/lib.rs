@@ -13214,39 +13214,65 @@ impl ApplicationHandler<UserEvent> for App {
                         return;
                     }
 
-                    // Coalesce rapid PTY output bursts. The render loop
-                    // re-requests a redraw every frame, so on a fast
-                    // present mode it spins at hundreds+ of FPS and will
-                    // happily present an INTERMEDIATE state — e.g. bash
-                    // answers Ctrl+C with two back-to-back writes (a
-                    // `\r`/erase that parks the cursor at column 0, then
-                    // the redrawn prompt), and the frame in between shows
-                    // the cursor flicking to the line start. If the
-                    // focused pane emitted output within the last few ms,
-                    // hold the present so the burst settles and only the
-                    // final state is shown. Capped so a continuously
-                    // streaming pane (e.g. `yes`) still renders smoothly
-                    // and output is never delayed more than the cap.
-                    const COALESCE_SETTLE_MS: u64 = 3;
+                    // Coalesce rapid PTY output so we never present a
+                    // half-finished redraw. The render loop re-requests a
+                    // frame every tick, so on a fast present mode it spins
+                    // at hundreds+ FPS and would otherwise show transient
+                    // states. Two cases:
+                    //
+                    //  * Sub-frame burst — hold a few ms until output
+                    //    settles, capped low so streaming stays smooth.
+                    //
+                    //  * Mid-redraw after a BARE CR — a shell echoing ^C or
+                    //    redrawing a prompt emits `\r` (cursor → column 0,
+                    //    OVER the existing line) and then, often after a
+                    //    network / ConPTY gap, the replacement line. Showing
+                    //    the in-between frame flicks the cursor to the line
+                    //    start (the Ctrl+C complaint). Detect it precisely:
+                    //    cursor at column 0 on a NON-blank PRIMARY-screen row
+                    //    (a CRLF newline lands on a BLANK row, so normal
+                    //    streaming and alt-screen TUIs never trip it) and
+                    //    hold longer for the redraw to arrive — bounded so a
+                    //    genuinely stuck link still updates.
+                    const SETTLE_MS: u64 = 3;
                     const COALESCE_MAX: Duration = Duration::from_millis(12);
+                    const REDRAW_FRESH_MS: u64 = 250;
+                    const REDRAW_MAX: Duration = Duration::from_millis(180);
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
-                    let focus_idle_ms = tab
-                        .focused_index()
+                    let focus = tab.focused_index();
+                    let focus_idle_ms = focus
                         .and_then(|i| tab.panes().get(i).map(|p| p.last_output_ms.load(Ordering::Relaxed)))
                         .map(|last| now_ms.saturating_sub(last))
                         .unwrap_or(u64::MAX);
-                    let coalesce = match (focus_idle_ms < COALESCE_SETTLE_MS, self.coalesce_started_at) {
-                        (true, None) => {
+                    let mid_redraw = focus
+                        .and_then(|i| guards.get(i))
+                        .map(|g| {
+                            let cur = g.cursor();
+                            !g.is_on_alt_screen()
+                                && cur.col == 0
+                                && g.visible_row(0, cur.row)
+                                    .map(|row| row.iter().any(|c| c.ch != ' '))
+                                    .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    let want_hold = focus_idle_ms < SETTLE_MS
+                        || (mid_redraw && focus_idle_ms < REDRAW_FRESH_MS);
+                    let cap = if mid_redraw { REDRAW_MAX } else { COALESCE_MAX };
+                    let coalesce = match self.coalesce_started_at {
+                        None if want_hold => {
                             self.coalesce_started_at = Some(Instant::now());
                             true
                         }
-                        // Keep holding until output quiesces — but never
-                        // past the cap, so streaming output still flows.
-                        (true, Some(started)) => started.elapsed() < COALESCE_MAX,
-                        (false, _) => {
+                        None => false,
+                        Some(started) if started.elapsed() >= cap => {
+                            self.coalesce_started_at = None;
+                            false
+                        }
+                        Some(_) if want_hold => true,
+                        Some(_) => {
                             self.coalesce_started_at = None;
                             false
                         }
