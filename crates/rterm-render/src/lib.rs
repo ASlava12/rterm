@@ -6181,6 +6181,15 @@ impl App {
         let shift = mods.contains(ModifiersState::SHIFT);
         let alt = mods.contains(ModifiersState::ALT);
 
+        // Alt+Tab / Alt+Shift+Tab is the OS window switcher. Swallow it
+        // so the meta-Tab (ESC + \t) never leaks into the PTY — a shell
+        // or TUI reads that as forward/back tab and visibly switches its
+        // own tab/pane. rterm takes no action; the compositor still does
+        // the actual window switch.
+        if is_window_switch_chord(&event.logical_key, alt, ctrl) {
+            return Some(false);
+        }
+
         // xterm-style Insert shortcuts: Ctrl+Insert copies, Shift+Insert
         // pastes. Both ignore Alt to avoid shadowing user bindings, and
         // require their sole modifier (Ctrl-only or Shift-only) so e.g.
@@ -9831,6 +9840,15 @@ fn app_menu_items() -> Vec<MenuItem> {
     ]
 }
 
+/// True for the OS window-switcher chord (Alt+Tab / Alt+Shift+Tab).
+/// rterm swallows it so the meta-Tab (`ESC` + `\t`) never reaches the
+/// PTY, where a shell or TUI would read it as forward/back-tab and flip
+/// its own tab. The compositor still performs the real window switch.
+/// `Ctrl` is excluded so a deliberate Ctrl+Alt+Tab isn't captured here.
+fn is_window_switch_chord(key: &Key, alt: bool, ctrl: bool) -> bool {
+    alt && !ctrl && matches!(key, Key::Named(NamedKey::Tab))
+}
+
 /// True when `key` is a "bare modifier" — a logical key that, pressed
 /// on its own, only modifies subsequent keystrokes (Ctrl, Shift, Alt,
 /// Super, AltGraph, Fn, lock keys). Such presses must not destroy the
@@ -10840,6 +10858,15 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Focused(focused) => {
                 self.window_focused = focused;
+                if !focused {
+                    // Focus left (commonly via Alt+Tab): the OS grabs the
+                    // chord, so we never see the key-release for any held
+                    // modifier and the cached state would go stale — a
+                    // "stuck" Alt then mangles the next keystroke (turning
+                    // a plain Tab into meta-Tab, etc.). Reset to a clean
+                    // slate; the next ModifiersChanged repopulates it.
+                    self.modifiers = ModifiersState::empty();
+                }
                 if focused {
                     // Clear any taskbar urgent flag the bell may have set.
                     if let Some(s) = self.state.as_ref() {
@@ -14360,6 +14387,20 @@ mod tests {
         assert!(!is_font_reset_key(&PhysicalKey::Code(KeyCode::Numpad0)));
         assert!(!is_font_reset_key(&PhysicalKey::Code(KeyCode::Equal)));
         assert!(!is_font_reset_key(&PhysicalKey::Code(KeyCode::Minus)));
+    }
+
+    #[test]
+    fn alt_tab_is_recognised_as_window_switch_chord() {
+        let tab = Key::Named(NamedKey::Tab);
+        // Alt+Tab → swallow (shift is irrelevant: Alt+Shift+Tab too).
+        assert!(is_window_switch_chord(&tab, true, false));
+        // Plain Tab must still reach the PTY (forward completion).
+        assert!(!is_window_switch_chord(&tab, false, false));
+        // Ctrl+Alt+Tab is not the OS switcher — don't capture it here.
+        assert!(!is_window_switch_chord(&tab, true, true));
+        // Alt + a non-Tab key is not the switch chord.
+        assert!(!is_window_switch_chord(&Key::Named(NamedKey::Enter), true, false));
+        assert!(!is_window_switch_chord(&Key::Character("a".into()), true, false));
     }
 
     #[test]
