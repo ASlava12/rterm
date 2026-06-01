@@ -3404,6 +3404,11 @@ pub struct App {
     /// recommended by the spec — protects against a crashed app stranding
     /// the terminal in deferred-render limbo).
     sync_started_at: Option<Instant>,
+    /// Set while the renderer is holding a frame to let a burst of PTY
+    /// output settle (see the coalescing defer in the redraw handler).
+    /// `None` when not currently coalescing. Bounds the hold so a
+    /// continuously-streaming pane still renders.
+    coalesce_started_at: Option<Instant>,
 }
 
 const CURSOR_BLINK_PERIOD_MS: u128 = 1000;
@@ -3577,6 +3582,7 @@ impl App {
             last_exit_code: None,
             custom_window_title: None,
             sync_started_at: None,
+            coalesce_started_at: None,
         }
     }
 
@@ -13207,6 +13213,51 @@ impl ApplicationHandler<UserEvent> for App {
                         state.window.request_redraw();
                         return;
                     }
+
+                    // Coalesce rapid PTY output bursts. The render loop
+                    // re-requests a redraw every frame, so on a fast
+                    // present mode it spins at hundreds+ of FPS and will
+                    // happily present an INTERMEDIATE state — e.g. bash
+                    // answers Ctrl+C with two back-to-back writes (a
+                    // `\r`/erase that parks the cursor at column 0, then
+                    // the redrawn prompt), and the frame in between shows
+                    // the cursor flicking to the line start. If the
+                    // focused pane emitted output within the last few ms,
+                    // hold the present so the burst settles and only the
+                    // final state is shown. Capped so a continuously
+                    // streaming pane (e.g. `yes`) still renders smoothly
+                    // and output is never delayed more than the cap.
+                    const COALESCE_SETTLE_MS: u64 = 3;
+                    const COALESCE_MAX: Duration = Duration::from_millis(12);
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let focus_idle_ms = tab
+                        .focused_index()
+                        .and_then(|i| tab.panes().get(i).map(|p| p.last_output_ms.load(Ordering::Relaxed)))
+                        .map(|last| now_ms.saturating_sub(last))
+                        .unwrap_or(u64::MAX);
+                    let coalesce = match (focus_idle_ms < COALESCE_SETTLE_MS, self.coalesce_started_at) {
+                        (true, None) => {
+                            self.coalesce_started_at = Some(Instant::now());
+                            true
+                        }
+                        // Keep holding until output quiesces — but never
+                        // past the cap, so streaming output still flows.
+                        (true, Some(started)) => started.elapsed() < COALESCE_MAX,
+                        (false, _) => {
+                            self.coalesce_started_at = None;
+                            false
+                        }
+                    };
+                    if coalesce {
+                        drop(draws);
+                        drop(guards);
+                        state.window.request_redraw();
+                        return;
+                    }
+
                     // Log first render (or each error) so the user can
                     // see whether the pipeline is actually presenting.
                     static FIRST: std::sync::Once = std::sync::Once::new();
