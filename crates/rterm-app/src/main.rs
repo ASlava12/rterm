@@ -29,7 +29,7 @@ use anyhow::{Context, Result};
 use rterm_config::Config;
 use rterm_core::{Position, Size, Terminal};
 use rterm_plugin::PluginHost;
-use rterm_pty::{Pty, PtyControl};
+use rterm_pty::{Pty, PtyControl, SharedChild};
 use rterm_render::palette::Palette;
 use rterm_render::{EventSink, Pane, PaneSpawner, SharedTerminal, TerminalIo, UserBinding};
 
@@ -144,9 +144,17 @@ impl PaneSpawner for GuiSpawner {
             Arc::clone(&activity),
             Arc::clone(&last_output_ms),
         );
+        // Watch the child for exit independently of the reader's EOF.
+        // On Windows, ConPTY frequently leaves the master reader blocked
+        // forever when the shell runs `exit`, so the reader's own
+        // `alive = false` path never fires and the tab appears to hang.
+        // Polling `try_wait` here flips `alive` so the renderer's prune
+        // pass closes the pane / tab. Harmless on Unix (the reader's EOF
+        // already covers it; whichever fires first wins).
+        let exit_watcher = spawn_exit_watcher(pty.child_handle(), Arc::clone(&alive));
         let io: Arc<dyn TerminalIo> = Arc::new(PtyAdapter(control));
 
-        let keepalive: Box<dyn std::any::Any + Send> = Box::new((pty, join));
+        let keepalive: Box<dyn std::any::Any + Send> = Box::new((pty, join, exit_watcher));
         Ok(Pane::new(terminal, io, program, alive, activity, last_output_ms, keepalive, self.history.clone()))
     }
 }
@@ -2098,6 +2106,32 @@ fn overlay_palette(mut p: Palette, c: &rterm_config::ColorsConfig) -> Palette {
     if let Some(v) = c.bright_cyan { p.named[14] = v; }
     if let Some(v) = c.bright_white { p.named[15] = v; }
     p
+}
+
+/// Background thread that flips `alive` to `false` as soon as the
+/// spawned child exits — even if the master reader never sees EOF.
+/// This is the fix for "`exit` doesn't close the tab" on Windows:
+/// ConPTY commonly leaves the reader blocked after the shell exits, so
+/// without this poll the pane-prune pass never runs. It polls instead
+/// of blocking so a single shared child handle works on every platform;
+/// the ~150 ms cadence is imperceptible for a one-shot close and costs
+/// nothing while the shell runs.
+fn spawn_exit_watcher(child: SharedChild, alive: Arc<AtomicBool>) -> thread::JoinHandle<()> {
+    thread::spawn(move || loop {
+        let gone = match child.lock() {
+            Ok(mut c) => match c.try_wait() {
+                Ok(Some(_)) => true, // exited cleanly
+                Ok(None) => false,   // still running
+                Err(_) => true,      // can't query → assume gone, don't hang
+            },
+            Err(_) => true, // mutex poisoned → give up watching
+        };
+        if gone {
+            alive.store(false, Ordering::Release);
+            break;
+        }
+        thread::sleep(Duration::from_millis(150));
+    })
 }
 
 fn spawn_reader_thread(

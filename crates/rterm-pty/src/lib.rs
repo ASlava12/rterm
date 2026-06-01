@@ -12,10 +12,15 @@ use rterm_core::Size;
 
 type SharedMaster = Arc<Mutex<Box<dyn MasterPty + Send>>>;
 type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
+/// Shared, waitable handle to the spawned child. Cloned out via
+/// [`Pty::child_handle`] so an exit-watcher thread can `try_wait` it
+/// independently of the owning `Pty` (needed on Windows, where ConPTY
+/// often never EOFs the master reader when the shell exits).
+pub type SharedChild = Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>;
 
 pub struct Pty {
     master: SharedMaster,
-    child: Box<dyn portable_pty::Child + Send + Sync>,
+    child: SharedChild,
     writer: SharedWriter,
     pid: Option<u32>,
 }
@@ -88,7 +93,7 @@ impl Pty {
 
         Ok(Self {
             master: Arc::new(Mutex::new(pair.master)),
-            child,
+            child: Arc::new(Mutex::new(child)),
             writer: Arc::new(Mutex::new(writer)),
             pid,
         })
@@ -118,11 +123,21 @@ impl Pty {
     }
 
     pub fn try_wait(&mut self) -> Result<Option<portable_pty::ExitStatus>> {
-        Ok(self.child.try_wait()?)
+        let mut child = self.child.lock().expect("pty child mutex poisoned");
+        Ok(child.try_wait()?)
     }
 
     pub fn kill(&mut self) -> Result<()> {
-        self.child.kill().context("pty kill")
+        let mut child = self.child.lock().expect("pty child mutex poisoned");
+        child.kill().context("pty kill")
+    }
+
+    /// Shared, waitable handle to the child for an out-of-band exit
+    /// watcher. Polling `try_wait` on this lets the app detect a shell
+    /// that exited without the master reader seeing EOF — the common
+    /// ConPTY case behind "`exit` doesn't close the tab" on Windows.
+    pub fn child_handle(&self) -> SharedChild {
+        Arc::clone(&self.child)
     }
 }
 
