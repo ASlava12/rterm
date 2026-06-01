@@ -25,11 +25,21 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
+  # Strip debuginfo from the dev/test profiles that back the clippy +
+  # `cargo test` gate below. Cuts peak rustc memory and target/ disk
+  # use with zero effect on the shipped `--release` binary (separate
+  # profile). Matters on the memory-constrained aarch64 Linux runner,
+  # which started OOM-ing mid-compile on an otherwise unchanged tree.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
   build:
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    # Safety net: if a hosted runner wedges (the aarch64 Linux pool has
+    # been flaky), fail in a bounded time instead of hanging for hours.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -58,6 +68,12 @@ jobs:
             os: ubuntu-24.04-arm
             archive: tar.gz
             bin: rterm
+            # The free ARM64 Linux runner OOMs when rustc fans out to
+            # all cores on a cold cache (the full wgpu/naga/cosmic-text
+            # tree), so the job dies mid-compile ("runner shutdown").
+            # Cap parallelism on THIS leg only; every other runner keeps
+            # building at full speed. Empty on the other legs.
+            jobs_flag: "--jobs 2"
           # x86_64-apple-darwin dropped from the release matrix:
           # GitHub's `macos-13` Intel runner pool degraded to 4+ hour
           # queue times in mid-2026 (Apple Silicon eclipsed Intel
@@ -114,11 +130,11 @@ jobs:
 
       - name: Pre-release sanity (clippy + lib tests)
         run: |
-          cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
-          cargo test --workspace --lib --target ${{ matrix.target }}
+          cargo clippy --workspace --all-targets --target ${{ matrix.target }} ${{ matrix.jobs_flag }} -- -D warnings
+          cargo test --workspace --lib --target ${{ matrix.target }} ${{ matrix.jobs_flag }}
 
       - name: Build release binary
-        run: cargo build --release -p rterm-app --target ${{ matrix.target }}
+        run: cargo build --release -p rterm-app --target ${{ matrix.target }} ${{ matrix.jobs_flag }}
 
       # Tag minus the leading `v` — used as the on-disk version
       # string inside packaged filenames. Set as a step output so
