@@ -336,21 +336,14 @@ impl App {
                 while cursor_byte > 0 && !modal.text.is_char_boundary(cursor_byte) {
                     cursor_byte -= 1;
                 }
-                // Collapse the buffer into newline-delimited lines.
-                // `split('\n')` keeps a trailing empty entry when
-                // the buffer ends with `\n` — which is what the
-                // user expects to see (an editable empty line).
-                let lines: Vec<&str> = modal.text.split('\n').collect();
-                // Find cursor's line + offset within that line.
-                let cursor_line = modal.text[..cursor_byte]
-                    .bytes()
-                    .filter(|b| *b == b'\n')
-                    .count();
-                let line_start_byte = modal.text[..cursor_byte]
-                    .rfind('\n')
-                    .map(|i| i + 1)
-                    .unwrap_or(0);
-                let cursor_in_line = cursor_byte - line_start_byte;
+                // Soft-wrap the buffer into display rows so a line
+                // wider than the modal stays visible instead of
+                // clipping at the right edge. `↪` in the left margin
+                // marks a wrap continuation; `↵` at a row's end marks
+                // a real newline — so the two read differently.
+                let wrap_cols = self.paste_modal_wrap_cols();
+                let rows = crate::paste_confirm::display_rows(&modal.text, wrap_cols);
+                let cursor_row = crate::paste_confirm::cursor_row_idx(&rows, cursor_byte);
                 // Viewport height in rows, computed from the
                 // overlay rect. Falls back to a sensible default
                 // when cell metrics aren't ready yet (first frame
@@ -374,36 +367,43 @@ impl App {
                 let visible_rows = total_rows
                     .saturating_sub(HEADER_ROWS + BOTTOM_PAD_ROWS)
                     .max(1);
-                // Use the persisted `scroll_line` — the App's
-                // pre-render hook (`clamp_paste_modal_scroll`)
-                // already adjusted it for this frame so the cursor
-                // is in view but otherwise the viewport is stable
-                // across frames. Click-to-position relies on this:
-                // the click handler reads the SAME scroll_line, so
-                // a click on a visible row maps to that exact line.
-                let scroll = modal.scroll_line().min(lines.len().saturating_sub(1));
-                let end = (scroll + visible_rows).min(lines.len());
-                for (i, line) in lines[scroll..end].iter().enumerate() {
-                    let absolute_line = scroll + i;
-                    let rendered = if absolute_line == cursor_line {
-                        // Insert cursor mark at byte offset within
-                        // this line (already char-boundary-aligned
-                        // by the cursor invariants).
-                        let split = cursor_in_line.min(line.len());
-                        let (pre, post) = line.split_at(split);
-                        format!("  {pre}▏{post}\n")
+                // Use the persisted `scroll_line` (a DISPLAY-row index)
+                // — the App's pre-render hook (`clamp_paste_modal_scroll`)
+                // already adjusted it for this frame so the cursor is in
+                // view but otherwise the viewport is stable across frames.
+                // Click-to-position relies on this: the hit-test reads the
+                // SAME scroll_line + wrap, so a click maps to that row.
+                let scroll = modal.scroll_line().min(rows.len().saturating_sub(1));
+                let end = (scroll + visible_rows).min(rows.len());
+                for (offset, dr) in rows[scroll..end].iter().enumerate() {
+                    let abs = scroll + offset;
+                    let seg = &modal.text[dr.start..dr.end];
+                    // Left margin: `↪ ` for soft-wrap continuations,
+                    // two spaces for a fresh logical line. Both are two
+                    // cells wide so the text column never shifts.
+                    storage.push(if dr.is_continuation { "↪ ".to_string() } else { "  ".to_string() });
+                    spans.push((storage.len() - 1, muted, false));
+                    // Row text, with the caret `▏` spliced in when the
+                    // cursor lives on this row.
+                    if abs == cursor_row {
+                        let split = cursor_byte.saturating_sub(dr.start).min(seg.len());
+                        let (pre, post) = seg.split_at(split);
+                        storage.push(format!("{pre}▏{post}"));
                     } else {
-                        format!("  {line}\n")
-                    };
-                    storage.push(rendered);
+                        storage.push(seg.to_string());
+                    }
                     spans.push((storage.len() - 1, fg, false));
+                    // Trailing newline glyph (only on rows that end a
+                    // hard line) + the actual line break.
+                    storage.push(if dr.ends_newline { "↵\n".to_string() } else { "\n".to_string() });
+                    spans.push((storage.len() - 1, muted, false));
                 }
                 // Scroll-position hint at the bottom — same idiom
                 // as the suggestion-popup's `↓ N more`.
-                if scroll > 0 || end < lines.len() {
-                    let total = lines.len();
+                if scroll > 0 || end < rows.len() {
+                    let total = rows.len();
                     storage.push(format!(
-                        "  ─ line {}–{} / {} ─\n",
+                        "  ─ row {}–{} / {} ─\n",
                         scroll + 1,
                         end,
                         total,

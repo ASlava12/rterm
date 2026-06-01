@@ -57,7 +57,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, Modifiers, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::dpi::PhysicalPosition;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{CursorIcon, ResizeDirection, Window, WindowAttributes, WindowId};
 
 pub use winit;
@@ -735,6 +735,13 @@ pub struct OverlayDraw<'a> {
     /// behaving as before.
     pub nowrap: bool,
 }
+
+/// Cells reserved on the left of every paste-editor row — the
+/// line-start indent (`"  "`) and the soft-wrap continuation marker
+/// (`"↪ "`) are both this wide, so cursor / selection / wrap math can
+/// treat the text area as starting this many cells in. Keep in lock
+/// step with the margin strings emitted by `paste_confirmation_spans`.
+const PASTE_EDIT_INDENT_CELLS: usize = 2;
 
 /// Enumerate monospace family names installed on the system, deduplicated
 /// and case-insensitively sorted. Used by the `--list-fonts` CLI flag so
@@ -1756,21 +1763,24 @@ impl GpuState {
             .unwrap_or(caps.formats[0]);
         // Pick an alpha-supporting composite mode when the user wants
         // transparency; otherwise stick with the platform default.
-        let alpha_mode = if opacity < 1.0 {
-            caps.alpha_modes
-                .iter()
-                .copied()
-                .find(|m| {
-                    matches!(
-                        m,
-                        wgpu::CompositeAlphaMode::PreMultiplied
-                            | wgpu::CompositeAlphaMode::PostMultiplied
-                    )
-                })
-                .unwrap_or(caps.alpha_modes[0])
-        } else {
-            caps.alpha_modes[0]
-        };
+        let alpha_mode = pick_alpha_mode(opacity, &caps.alpha_modes);
+        if opacity < 1.0 && !alpha_mode_is_transparent(alpha_mode) {
+            // No alpha-capable mode → the surface composites opaque no
+            // matter what we put in the clear alpha. Warn loudly rather
+            // than silently ignoring the configured opacity, since the
+            // usual cause is the environment (WSL2/WSLg, some GL
+            // backends) and not the config.
+            tracing::warn!(
+                requested_opacity = opacity,
+                available_alpha_modes = ?caps.alpha_modes,
+                "window opacity < 1.0 requested but the GPU surface \
+                 advertises no alpha-capable composite mode — the window \
+                 will render OPAQUE. This is common on WSL2/WSLg and some \
+                 GL backends; transparency needs a compositor that honours \
+                 per-pixel window alpha (a native Wayland/X11 compositor, \
+                 macOS, or Windows with DWM)."
+            );
+        }
 
         // Present mode: pick whatever the surface advertises that
         // matches our preference. `AutoVsync` is the right default
@@ -2126,15 +2136,11 @@ impl GpuState {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("rterm-encoder") });
         {
-            // For a brief bell flash, lift the clear toward a warm tint so
-            // the bell is visible even with a fully-painted screen.
+            // For a brief bell flash, lift the clear color a touch so the
+            // bell registers even on a fully-painted screen (see
+            // `flash_clear_color` for the soft-neutral-pulse rationale).
             let clear = if flash {
-                wgpu::Color {
-                    r: (self.clear_color.r + 0.25).min(1.0),
-                    g: (self.clear_color.g + 0.15).min(1.0),
-                    b: self.clear_color.b,
-                    a: 1.0,
-                }
+                flash_clear_color(self.clear_color)
             } else {
                 self.clear_color
             };
@@ -2902,7 +2908,14 @@ impl ActiveSelection {
         // selection extends below.
         let start_col = if s_r >= 0 { s_col } else { 0 };
         let end_col = if e_r <= max_r {
-            e_col
+            // `e_col` is the INCLUSIVE max cell, but `NormSelection::end`
+            // is EXCLUSIVE (see `contains`: `col >= end.col` is dropped).
+            // Bump by one so the last cell of the selection stays
+            // highlighted — mirrors the `c_max + 1` the block branch
+            // above already does. Without it every linear selection lost
+            // its final cell: a double-click dropped the word's last
+            // glyph, and a drag-left dropped the originally-clicked cell.
+            e_col.saturating_add(1)
         } else {
             // Below the viewport — let it absorb the full row width
             // by setting the end col to u16::MAX; `selection_text`
@@ -6256,6 +6269,17 @@ impl App {
         if !(ctrl && shift) {
             return None;
         }
+        // Ctrl+Shift+0 resets the font size. Match the PHYSICAL `0` key
+        // so it fires on every layout: on German / Spanish / French
+        // keyboards Shift+0 produces a character other than `)`, which
+        // the logical-key arm below (`"0" | ")"`) would silently miss.
+        // The physical `0` key is layout-invariant and unambiguous (it
+        // never doubles as a tab selector — those are 1‑9).
+        if is_font_reset_key(&event.physical_key) {
+            let initial = self.font_size;
+            self.set_font_size_absolute(initial);
+            return Some(false);
+        }
         match &event.logical_key {
             Key::Character(c) => match c.as_str() {
                 "T" | "t" => {
@@ -7269,7 +7293,12 @@ impl App {
                     let a = (sel.anchor.abs_row, sel.anchor.col);
                     let f = (sel.focus.abs_row, sel.focus.col);
                     let (s, e) = if a <= f { (a, f) } else { (f, a) };
-                    (s.0, s.1, e.0, e.1, false)
+                    // `e.1` is the inclusive max column; the copy loop
+                    // below uses `e_col` as an EXCLUSIVE upper bound
+                    // (`row[lo..hi]`), so bump by one — the same +1 the
+                    // block arm applies — or the last selected glyph is
+                    // dropped from the copied text.
+                    (s.0, s.1, e.0, e.1.saturating_add(1), false)
                 };
             let total = sb_len as i64 + grid_rows as i64;
             for abs_r in abs_s_row..=abs_e_row {
@@ -7902,6 +7931,9 @@ impl App {
         // `paste_modal_visible_rows(&self)` from inside the
         // `&mut modal` scope below would trigger E0502.
         let viewport = self.paste_modal_visible_rows().saturating_sub(1).max(1);
+        // Width that the editor wraps at — needed by the display-row
+        // aware up/down navigation. Computed before the `&mut` borrow.
+        let wrap_cols = self.paste_modal_wrap_cols();
         let Some(modal) = self.paste_confirmation.as_mut() else { return };
         let ctrl = self.modifiers.contains(ModifiersState::CONTROL);
         let shift = self.modifiers.contains(ModifiersState::SHIFT);
@@ -7969,12 +8001,12 @@ impl App {
                     Key::Named(NamedKey::Delete) => modal.edit_delete(),
                     Key::Named(NamedKey::ArrowLeft) => modal.edit_left(),
                     Key::Named(NamedKey::ArrowRight) => modal.edit_right(),
-                    Key::Named(NamedKey::ArrowUp) => modal.edit_up(),
-                    Key::Named(NamedKey::ArrowDown) => modal.edit_down(),
+                    Key::Named(NamedKey::ArrowUp) => modal.edit_up(wrap_cols),
+                    Key::Named(NamedKey::ArrowDown) => modal.edit_down(wrap_cols),
                     Key::Named(NamedKey::Home) => modal.edit_home(),
                     Key::Named(NamedKey::End) => modal.edit_end(),
-                    Key::Named(NamedKey::PageUp) => modal.edit_up_n(viewport),
-                    Key::Named(NamedKey::PageDown) => modal.edit_down_n(viewport),
+                    Key::Named(NamedKey::PageUp) => modal.edit_up_n(viewport, wrap_cols),
+                    Key::Named(NamedKey::PageDown) => modal.edit_down_n(viewport, wrap_cols),
                     Key::Named(NamedKey::Tab) => modal.edit_insert('\t'),
                     Key::Named(NamedKey::Space) => modal.edit_insert(' '),
                     // Ctrl shortcuts come before the generic
@@ -8138,53 +8170,46 @@ impl App {
         if viewport_row >= visible_rows {
             return None;
         }
-        let lines: Vec<&str> = modal_ref.text.split('\n').collect();
         let cursor_byte = match modal_ref.mode {
-            paste_confirm::PasteMode::Edit { cursor, .. } => cursor,
+            paste_confirm::PasteMode::Edit { cursor, .. } => cursor.min(modal_ref.text.len()),
             _ => return None,
         };
-        let cursor_line = modal_ref.text[..cursor_byte.min(modal_ref.text.len())]
-            .bytes()
-            .filter(|b| *b == b'\n')
-            .count();
+        // Project onto soft-wrapped DISPLAY rows, not raw logical
+        // lines — the renderer slices the same rows, so `scroll +
+        // viewport_row` lands on exactly the row under the cursor.
+        let wrap_cols = self.paste_modal_wrap_cols();
+        let rows = paste_confirm::display_rows(&modal_ref.text, wrap_cols);
         let scroll = modal_ref.scroll_line();
-        let absolute_line = scroll + viewport_row;
-        if absolute_line >= lines.len() {
+        let absolute_row = scroll + viewport_row;
+        if absolute_row >= rows.len() {
             return Some(modal_ref.text.len());
         }
+        let dr = rows[absolute_row];
+        let cursor_row = paste_confirm::cursor_row_idx(&rows, cursor_byte);
         const LINE_INDENT_CELLS: f32 = 2.0;
         let raw_col_cells = ((xf - rect.left) / cell_w - LINE_INDENT_CELLS).max(0.0);
         let mut target_col = raw_col_cells as usize;
-        // Cursor mark `▏` occupies a full cell on its line; clicks
+        // Cursor mark `▏` occupies a full cell on its row; clicks
         // past the caret pick up one extra column visually. Pull it
         // back so the projected byte matches the source text.
-        if absolute_line == cursor_line {
-            let cursor_col_chars = modal_ref.text[..cursor_byte]
-                .rsplit('\n')
-                .next()
-                .unwrap_or("")
-                .chars()
-                .count();
+        if absolute_row == cursor_row {
+            let cursor_col_chars =
+                modal_ref.text[dr.start..cursor_byte.min(dr.end)].chars().count();
             if target_col > cursor_col_chars {
                 target_col = target_col.saturating_sub(1);
             }
         }
-        let line_text = lines[absolute_line];
-        let mut byte_in_line = line_text.len();
-        for (i, (offset, _)) in line_text.char_indices().enumerate() {
+        // Map the column (char count) within this display row to a
+        // byte offset in the buffer.
+        let seg = &modal_ref.text[dr.start..dr.end];
+        let mut byte_in_seg = seg.len();
+        for (i, (offset, _)) in seg.char_indices().enumerate() {
             if i == target_col {
-                byte_in_line = offset;
+                byte_in_seg = offset;
                 break;
             }
         }
-        let mut byte_to_line_start = 0usize;
-        for (i, l) in lines.iter().enumerate() {
-            if i == absolute_line {
-                break;
-            }
-            byte_to_line_start += l.len() + 1;
-        }
-        Some(byte_to_line_start + byte_in_line)
+        Some(dr.start + byte_in_seg)
     }
 
     /// Click-to-position in the Edit mini-editor. Pixel coords →
@@ -8240,6 +8265,7 @@ impl App {
         // Take viewport rows in a pre-pass so we don't hold a
         // mut borrow across the call.
         let visible_rows = self.paste_modal_visible_rows();
+        let wrap_cols = self.paste_modal_wrap_cols();
         let Some(modal) = self.paste_confirmation.as_mut() else { return };
         let PasteMode::Edit { .. } = modal.mode else {
             return; // Confirm mode: absorb only.
@@ -8261,7 +8287,7 @@ impl App {
         // wheel-scroll convention. Cursor stays where the user
         // left it; the renderer's clamp will pull the viewport
         // back when the user types again.
-        modal.scroll_by(-(lines as i64), visible_rows);
+        modal.scroll_by(-(lines as i64), visible_rows, wrap_cols);
     }
 
     /// Clamp the paste modal's `scroll_line` so the cursor stays
@@ -8273,8 +8299,9 @@ impl App {
     /// fight the wheel handler's intentional decoupling.
     fn clamp_paste_modal_scroll(&mut self) {
         let visible = self.paste_modal_visible_rows();
+        let wrap_cols = self.paste_modal_wrap_cols();
         if let Some(modal) = self.paste_confirmation.as_mut() {
-            modal.ensure_cursor_visible(visible);
+            modal.ensure_cursor_visible(visible, wrap_cols);
         }
     }
 
@@ -8301,6 +8328,31 @@ impl App {
         // Same reservation as the renderer: 2 header rows + 1
         // bottom-padding row.
         total_rows.saturating_sub(3).max(1)
+    }
+
+    /// Text columns available per row in the paste-modal editor, after
+    /// reserving the left margin (line-start indent / `↪ ` marker) and
+    /// one trailing cell for the caret `▏` / `↵` glyph. The renderer,
+    /// hit-test, and selection quads all derive their wrap point from
+    /// this single source so they never disagree. Falls back to a wide
+    /// default before cell metrics are ready.
+    fn paste_modal_wrap_cols(&self) -> usize {
+        let cell_w = self
+            .state
+            .as_ref()
+            .map(|s| s.text.cell_width())
+            .filter(|w| *w > 0.0)
+            .unwrap_or(8.0);
+        let rect_w = self
+            .paste_confirmation
+            .as_ref()
+            .and_then(|m| self.paste_confirmation_rect(m))
+            .map(|r| r.width)
+            .unwrap_or(680.0);
+        let inner_cols = (rect_w / cell_w) as usize;
+        inner_cols
+            .saturating_sub(PASTE_EDIT_INDENT_CELLS + 1)
+            .max(1)
     }
 
     /// Rectangles for the active text selection inside the paste-
@@ -8330,37 +8382,29 @@ impl App {
         let visible_rows = self.paste_modal_visible_rows();
         let scroll = modal.scroll_line();
         let text = modal.text.as_str();
-        let lines: Vec<&str> = text.split('\n').collect();
-        // Pre-compute byte offset of each line's start so we can
-        // map (sel_lo, sel_hi) onto per-line column spans cheaply.
-        let mut line_starts: Vec<usize> = Vec::with_capacity(lines.len() + 1);
-        let mut off = 0usize;
-        for l in &lines {
-            line_starts.push(off);
-            off += l.len() + 1; // +1 = '\n'
-        }
-        line_starts.push(off); // sentinel past end
-        let end_visible = (scroll + visible_rows).min(lines.len());
+        // Highlight per soft-wrapped DISPLAY row, matching the renderer.
+        let wrap_cols = self.paste_modal_wrap_cols();
+        let rows = paste_confirm::display_rows(text, wrap_cols);
+        let end_visible = (scroll + visible_rows).min(rows.len());
         let mut quads: Vec<bg::BgQuad> = Vec::new();
         let accent = palette::default_fg().map(|c| c.saturating_sub(40));
-        for i in scroll..end_visible {
-            let line_start = line_starts[i];
-            let line_end_excl = line_starts[i + 1].saturating_sub(1); // exclude the trailing '\n'
-            // Range of the selection that falls within this line.
-            let lo = sel_lo.max(line_start);
-            let hi = sel_hi.min(line_end_excl);
+        for (offset, dr) in rows[scroll..end_visible].iter().enumerate() {
+            // Range of the selection that falls within this row's
+            // content [dr.start, dr.end).
+            let lo = sel_lo.max(dr.start);
+            let hi = sel_hi.min(dr.end);
             if hi < lo {
                 continue;
             }
-            // Selection that ends exactly at end-of-line (i.e.
-            // includes the trailing newline) gets a 1-cell wide
-            // trailing highlight so the user sees the newline was
-            // selected too — matches VS Code / most editors.
-            let trailing_newline = sel_hi > line_end_excl;
+            // A selection that swallows the row's real newline gets a
+            // 1-cell trailing highlight so the user sees the `\n` was
+            // taken too — matches VS Code. Only hard-newline rows have
+            // a newline to select; soft-wrap boundaries don't.
+            let trailing_newline = dr.ends_newline && sel_hi > dr.end;
             if hi == lo && !trailing_newline {
                 continue;
             }
-            let pre_chars = text[line_start..lo].chars().count();
+            let pre_chars = text[dr.start..lo].chars().count();
             let in_chars = text[lo..hi].chars().count();
             let left = rect.left + (LINE_INDENT_CELLS + pre_chars as f32) * cell_w;
             let mut width = in_chars as f32 * cell_w;
@@ -8370,7 +8414,7 @@ impl App {
             if width <= 0.0 {
                 continue;
             }
-            let row_top = rect.top + (HEADER_ROWS + (i - scroll)) as f32 * line_h;
+            let row_top = rect.top + (HEADER_ROWS + offset) as f32 * line_h;
             quads.push(bg::BgQuad::from_srgb(
                 [left, row_top],
                 [width, line_h],
@@ -9966,6 +10010,62 @@ fn descend_leftmost(tree: &tree::Tree<Pane>, from: &[bool]) -> tree::TreePath {
         .filter(|p| p.len() >= from.len() && p[..from.len()] == *from)
         .min()
         .unwrap_or_else(|| from.to_vec())
+}
+
+/// Clear colour for a bell visual flash: a small, NEUTRAL lift of all
+/// three channels so the flash reads as a soft dim pulse rather than
+/// the old harsh warm-yellow tint. The configured alpha is preserved
+/// so a transparent window doesn't snap opaque for the flash duration.
+fn flash_clear_color(base: wgpu::Color) -> wgpu::Color {
+    const FLASH_LIFT: f64 = 0.10;
+    wgpu::Color {
+        r: (base.r + FLASH_LIFT).min(1.0),
+        g: (base.g + FLASH_LIFT).min(1.0),
+        b: (base.b + FLASH_LIFT).min(1.0),
+        a: base.a,
+    }
+}
+
+/// Whether a composite-alpha mode actually honours the surface alpha
+/// (i.e. can produce a see-through window). `Opaque` (and anything
+/// that isn't a pre/post-multiplied blend) cannot.
+fn alpha_mode_is_transparent(mode: wgpu::CompositeAlphaMode) -> bool {
+    matches!(
+        mode,
+        wgpu::CompositeAlphaMode::PreMultiplied | wgpu::CompositeAlphaMode::PostMultiplied
+    )
+}
+
+/// Choose the surface composite-alpha mode. When the user asked for
+/// transparency (`opacity < 1.0`) prefer a mode that honours the
+/// surface alpha; if the surface offers none, fall back to its default
+/// (typically `Opaque`) — the caller warns in that case. With full
+/// opacity, just take the platform default.
+fn pick_alpha_mode(
+    opacity: f32,
+    available: &[wgpu::CompositeAlphaMode],
+) -> wgpu::CompositeAlphaMode {
+    let default = available
+        .first()
+        .copied()
+        .unwrap_or(wgpu::CompositeAlphaMode::Opaque);
+    if opacity < 1.0 {
+        available
+            .iter()
+            .copied()
+            .find(|m| alpha_mode_is_transparent(*m))
+            .unwrap_or(default)
+    } else {
+        default
+    }
+}
+
+/// Whether a key event's PHYSICAL key is the `0` of the Ctrl+Shift+0
+/// "reset font size" chord. Matched physically (not by character) so
+/// it fires on layouts where Shift+0 is not `)` — German, Spanish,
+/// French, etc.
+fn is_font_reset_key(physical: &PhysicalKey) -> bool {
+    matches!(physical, PhysicalKey::Code(KeyCode::Digit0))
 }
 
 /// Map a US-keyboard shifted-digit symbol back to its digit character.
@@ -14061,7 +14161,57 @@ mod tests {
         };
         let n = norm(&s);
         assert_eq!(n.start, pt(2, 10));
-        assert_eq!(n.end, pt(5, 3));
+        // end.col is exclusive: anchor col 3 is the inclusive max, so
+        // the normalised end bumps to 4 to keep cell (5,3) selected.
+        assert_eq!(n.end, pt(5, 4));
+    }
+
+    /// Both endpoints of a single-row linear selection must stay
+    /// highlighted regardless of drag direction. Regression for the
+    /// off-by-one where the inclusive max cell was dropped:
+    ///   - drag LEFT lost the originally-clicked (anchor) cell;
+    ///   - a double-click word lost its last glyph.
+    #[test]
+    fn active_selection_linear_includes_both_endpoints() {
+        // Drag RIGHT: pressed col 2, swept to col 5.
+        let right = ActiveSelection {
+            pane_idx: 0,
+            anchor: ap(7, 2),
+            focus: ap(7, 5),
+            mode: SelectionMode::Char,
+            pivot: None,
+        };
+        let n = norm(&right);
+        assert!(n.contains(7, 2), "anchor cell included");
+        assert!(n.contains(7, 5), "cell under cursor included");
+        assert!(!n.contains(7, 6), "one past the focus excluded");
+
+        // Drag LEFT: pressed col 5, swept to col 2 — the clicked
+        // (anchor) cell at col 5 used to fall outside the highlight.
+        let left = ActiveSelection {
+            pane_idx: 0,
+            anchor: ap(7, 5),
+            focus: ap(7, 2),
+            mode: SelectionMode::Char,
+            pivot: None,
+        };
+        let n = norm(&left);
+        assert!(n.contains(7, 2), "cell under cursor included");
+        assert!(n.contains(7, 5), "originally-clicked cell included");
+        assert!(!n.contains(7, 6), "one past the clicked cell excluded");
+
+        // Double-click word "hello" at cols 0..=4 lands as anchor=0,
+        // focus=4 (the inclusive last glyph). The 'o' must highlight.
+        let word = ActiveSelection {
+            pane_idx: 0,
+            anchor: ap(3, 0),
+            focus: ap(3, 4),
+            mode: SelectionMode::Word,
+            pivot: Some((ap(3, 0), ap(3, 4))),
+        };
+        let n = norm(&word);
+        assert!(n.contains(3, 4), "last glyph of the word included");
+        assert!(!n.contains(3, 5), "delimiter after the word excluded");
     }
 
     /// Selection scrolled fully above the viewport returns None
@@ -14095,7 +14245,8 @@ mod tests {
         // abs_row 4 == viewport row 2.
         let n = s.to_visible_norm(10, 8, 24).expect("visible");
         assert_eq!(n.start, pt(0, 0));
-        assert_eq!(n.end, pt(2, 5));
+        // Focus col 5 is the inclusive max; exclusive end is 6.
+        assert_eq!(n.end, pt(2, 6));
     }
 
     #[test]
@@ -14117,7 +14268,9 @@ mod tests {
         };
         let n = norm(&active);
         assert_eq!(n.start, pt(5, 0));
-        assert_eq!(n.end, pt(5, 10));
+        // Inclusive max col 10 → exclusive end 11, so "world" keeps its
+        // final glyph highlighted.
+        assert_eq!(n.end, pt(5, 11));
     }
 
     #[test]
@@ -14138,7 +14291,8 @@ mod tests {
         };
         let n = norm(&active);
         assert_eq!(n.start, pt(5, 0));
-        assert_eq!(n.end, pt(5, 10));
+        // Inclusive max col 10 → exclusive end 11.
+        assert_eq!(n.end, pt(5, 11));
     }
 
     #[test]
@@ -14160,6 +14314,52 @@ mod tests {
         // row_only forward path is taken because drag.row == pivot.row.
         assert_eq!(anchor, ap(3, 0));
         assert_eq!(focus, ap(3, 5));
+    }
+
+    #[test]
+    fn flash_clear_color_is_neutral_and_preserves_alpha() {
+        // From a dark, semi-transparent base the bell flash lifts all
+        // three channels by the SAME amount (neutral — no warm cast)
+        // and keeps the alpha so a transparent window stays transparent.
+        let base = wgpu::Color { r: 0.02, g: 0.03, b: 0.04, a: 0.8 };
+        let f = flash_clear_color(base);
+        let dr = f.r - base.r;
+        let dg = f.g - base.g;
+        let db = f.b - base.b;
+        assert!(dr > 0.0, "flash brightens the screen");
+        assert!((dr - dg).abs() < 1e-9 && (dg - db).abs() < 1e-9, "equal lift → no colour cast");
+        assert_eq!(f.a, base.a, "configured opacity preserved during flash");
+        // Channels saturate at 1.0 — no overflow past white.
+        let bright = wgpu::Color { r: 0.95, g: 1.0, b: 0.99, a: 1.0 };
+        let fb = flash_clear_color(bright);
+        assert_eq!((fb.r, fb.g, fb.b), (1.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn pick_alpha_mode_prefers_transparent_below_full_opacity() {
+        use wgpu::CompositeAlphaMode::*;
+        // opacity < 1.0 → take a pre/post-multiplied mode when offered.
+        assert_eq!(pick_alpha_mode(0.9, &[Opaque, PreMultiplied]), PreMultiplied);
+        assert_eq!(pick_alpha_mode(0.85, &[Opaque, PostMultiplied]), PostMultiplied);
+        // opacity < 1.0 but only Opaque available → fall back to it, and
+        // it reports as non-transparent so the caller's warning fires.
+        let only_opaque = pick_alpha_mode(0.9, &[Opaque]);
+        assert_eq!(only_opaque, Opaque);
+        assert!(!alpha_mode_is_transparent(only_opaque));
+        assert!(alpha_mode_is_transparent(PreMultiplied));
+        // Full opacity → platform default (first), never overridden.
+        assert_eq!(pick_alpha_mode(1.0, &[Opaque, PreMultiplied]), Opaque);
+    }
+
+    #[test]
+    fn font_reset_matches_physical_zero_only() {
+        // The reset chord keys off the PHYSICAL `0` so it's layout-proof.
+        assert!(is_font_reset_key(&PhysicalKey::Code(KeyCode::Digit0)));
+        // Neither other digits, the numpad zero, nor the zoom keys reset.
+        assert!(!is_font_reset_key(&PhysicalKey::Code(KeyCode::Digit1)));
+        assert!(!is_font_reset_key(&PhysicalKey::Code(KeyCode::Numpad0)));
+        assert!(!is_font_reset_key(&PhysicalKey::Code(KeyCode::Equal)));
+        assert!(!is_font_reset_key(&PhysicalKey::Code(KeyCode::Minus)));
     }
 
     #[test]

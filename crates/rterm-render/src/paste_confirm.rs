@@ -196,52 +196,48 @@ impl PasteConfirmation {
     /// every frame by the renderer (in `&mut self` context, before
     /// cloning) AND on every cursor-moving edit. Idempotent — if
     /// the cursor is already in view, `scroll_line` is unchanged.
-    pub(crate) fn ensure_cursor_visible(&mut self, visible_rows: usize) {
-        let (cursor, scroll_line) = match &mut self.mode {
-            PasteMode::Edit { cursor, scroll_line, .. } => (cursor, scroll_line),
+    pub(crate) fn ensure_cursor_visible(&mut self, visible_rows: usize, wrap_cols: usize) {
+        let cursor = match self.mode {
+            PasteMode::Edit { cursor, .. } => cursor.min(self.text.len()),
             _ => return,
         };
+        // `scroll_line` indexes DISPLAY rows (post soft-wrap), so the
+        // viewport math runs against wrapped rows, not logical lines.
+        let rows = display_rows(&self.text, wrap_cols);
+        let cursor_row = cursor_row_idx(&rows, cursor);
+        let total_rows = rows.len();
         let visible = visible_rows.max(1);
-        let total_lines = if self.text.is_empty() {
-            1
-        } else {
-            self.text.matches('\n').count() + 1
+        let scroll_line = match &mut self.mode {
+            PasteMode::Edit { scroll_line, .. } => scroll_line,
+            _ => return,
         };
-        let cursor_line = self.text[..(*cursor).min(self.text.len())]
-            .bytes()
-            .filter(|b| *b == b'\n')
-            .count();
         // If cursor is above the viewport top → snap viewport to it.
-        if cursor_line < *scroll_line {
-            *scroll_line = cursor_line;
+        if cursor_row < *scroll_line {
+            *scroll_line = cursor_row;
         }
         // If cursor is at or below the viewport bottom → snap up.
         let bottom = scroll_line.saturating_add(visible);
-        if cursor_line >= bottom {
-            *scroll_line = cursor_line + 1 - visible;
+        if cursor_row >= bottom {
+            *scroll_line = cursor_row + 1 - visible;
         }
         // Clamp against the buffer's end so we don't scroll past
-        // the last line.
-        let max_scroll = total_lines.saturating_sub(visible);
+        // the last row.
+        let max_scroll = total_rows.saturating_sub(visible);
         if *scroll_line > max_scroll {
             *scroll_line = max_scroll;
         }
     }
 
-    /// Move the viewport (independently of cursor) by `delta` lines.
-    /// Positive = scroll DOWN (later lines). Negative = scroll UP.
+    /// Move the viewport (independently of cursor) by `delta` display
+    /// rows. Positive = scroll DOWN (later rows). Negative = scroll UP.
     /// Used by the mouse wheel handler.
-    pub(crate) fn scroll_by(&mut self, delta: i64, visible_rows: usize) {
+    pub(crate) fn scroll_by(&mut self, delta: i64, visible_rows: usize, wrap_cols: usize) {
+        let total_rows = display_rows(&self.text, wrap_cols).len();
         let scroll_line = match &mut self.mode {
             PasteMode::Edit { scroll_line, .. } => scroll_line,
             _ => return,
         };
-        let total_lines = if self.text.is_empty() {
-            1
-        } else {
-            self.text.matches('\n').count() + 1
-        };
-        let max_scroll = total_lines.saturating_sub(visible_rows.max(1));
+        let max_scroll = total_rows.saturating_sub(visible_rows.max(1));
         let cur = *scroll_line as i64;
         let next = (cur + delta).clamp(0, max_scroll as i64);
         *scroll_line = next as usize;
@@ -462,50 +458,40 @@ impl PasteConfirmation {
         *cursor = i;
     }
 
-    /// Move cursor up one line, preserving column. Stays at line 0
-    /// when already on the first line. Approximate column: byte
-    /// offset from the line start; works correctly for ASCII and
-    /// for cases where the target line also has the matching
-    /// multi-byte char at the same position.
-    pub(crate) fn edit_up(&mut self) {
-        let cursor = match &mut self.mode {
-            PasteMode::Edit { cursor, .. } => cursor,
+    /// Move cursor up one DISPLAY row, preserving the column. On the
+    /// first row the cursor jumps to its start (buffer start). Column
+    /// is measured in characters from the row start and clamped to the
+    /// target row's width, so navigation tracks soft-wrapped rows the
+    /// same way it tracks hard-newline lines.
+    pub(crate) fn edit_up(&mut self, wrap_cols: usize) {
+        let cursor = match self.mode {
+            PasteMode::Edit { cursor, .. } => cursor.min(self.text.len()),
             _ => return,
         };
-        let bytes = self.text.as_bytes();
-        // Find current line start + column.
-        let mut line_start = *cursor;
-        while line_start > 0 && bytes[line_start - 1] != b'\n' {
-            line_start -= 1;
+        let rows = display_rows(&self.text, wrap_cols);
+        let idx = cursor_row_idx(&rows, cursor);
+        let new = if idx == 0 {
+            rows[0].start
+        } else {
+            let col = col_in_row(&self.text, &rows[idx], cursor);
+            byte_at_col(&self.text, &rows[idx - 1], col)
+        };
+        let new = floor_char_boundary(&self.text, new);
+        if let PasteMode::Edit { cursor, .. } = &mut self.mode {
+            *cursor = new;
         }
-        if line_start == 0 {
-            // Already on first line — jump to col 0.
-            *cursor = 0;
-            return;
-        }
-        let col = *cursor - line_start;
-        // Find previous line's start.
-        let prev_line_end = line_start - 1; // position of the '\n'
-        let mut prev_line_start = prev_line_end;
-        while prev_line_start > 0 && bytes[prev_line_start - 1] != b'\n' {
-            prev_line_start -= 1;
-        }
-        let prev_line_len = prev_line_end - prev_line_start;
-        let new_col = col.min(prev_line_len);
-        let raw = prev_line_start + new_col;
-        *cursor = floor_char_boundary(&self.text, raw);
     }
 
-    /// Move cursor up `n` lines. Used by PageUp (n = viewport-1).
-    pub(crate) fn edit_up_n(&mut self, n: usize) {
+    /// Move cursor up `n` display rows. Used by PageUp (n = viewport-1).
+    pub(crate) fn edit_up_n(&mut self, n: usize, wrap_cols: usize) {
         for _ in 0..n {
             let before = match self.mode {
                 PasteMode::Edit { cursor, .. } => cursor,
                 _ => return,
             };
-            self.edit_up();
+            self.edit_up(wrap_cols);
             // Stop when we hit the top — `edit_up` becomes a no-op
-            // on line 0, but loops would still spin. Early-exit on
+            // on row 0, but loops would still spin. Early-exit on
             // a fixed-point.
             match self.mode {
                 PasteMode::Edit { cursor, .. } if cursor == before && before == 0 => return,
@@ -514,14 +500,14 @@ impl PasteConfirmation {
         }
     }
 
-    /// Move cursor down `n` lines. Used by PageDown.
-    pub(crate) fn edit_down_n(&mut self, n: usize) {
+    /// Move cursor down `n` display rows. Used by PageDown.
+    pub(crate) fn edit_down_n(&mut self, n: usize, wrap_cols: usize) {
         for _ in 0..n {
             let before = match self.mode {
                 PasteMode::Edit { cursor, .. } => cursor,
                 _ => return,
             };
-            self.edit_down();
+            self.edit_down(wrap_cols);
             match self.mode {
                 PasteMode::Edit { cursor, .. } if cursor == before => return,
                 _ => {}
@@ -529,35 +515,25 @@ impl PasteConfirmation {
         }
     }
 
-    /// Move cursor down one line. Mirror of `edit_up`.
-    pub(crate) fn edit_down(&mut self) {
-        let cursor = match &mut self.mode {
-            PasteMode::Edit { cursor, .. } => cursor,
+    /// Move cursor down one DISPLAY row, preserving the column. On the
+    /// last row the cursor jumps to the buffer end. Mirror of `edit_up`.
+    pub(crate) fn edit_down(&mut self, wrap_cols: usize) {
+        let cursor = match self.mode {
+            PasteMode::Edit { cursor, .. } => cursor.min(self.text.len()),
             _ => return,
         };
-        let bytes = self.text.as_bytes();
-        let mut line_start = *cursor;
-        while line_start > 0 && bytes[line_start - 1] != b'\n' {
-            line_start -= 1;
+        let rows = display_rows(&self.text, wrap_cols);
+        let idx = cursor_row_idx(&rows, cursor);
+        let new = if idx + 1 >= rows.len() {
+            self.text.len()
+        } else {
+            let col = col_in_row(&self.text, &rows[idx], cursor);
+            byte_at_col(&self.text, &rows[idx + 1], col)
+        };
+        let new = floor_char_boundary(&self.text, new);
+        if let PasteMode::Edit { cursor, .. } = &mut self.mode {
+            *cursor = new;
         }
-        let mut line_end = *cursor;
-        while line_end < bytes.len() && bytes[line_end] != b'\n' {
-            line_end += 1;
-        }
-        if line_end >= bytes.len() {
-            *cursor = bytes.len();
-            return;
-        }
-        let col = *cursor - line_start;
-        let next_line_start = line_end + 1;
-        let mut next_line_end = next_line_start;
-        while next_line_end < bytes.len() && bytes[next_line_end] != b'\n' {
-            next_line_end += 1;
-        }
-        let next_line_len = next_line_end - next_line_start;
-        let new_col = col.min(next_line_len);
-        let raw = next_line_start + new_col;
-        *cursor = floor_char_boundary(&self.text, raw);
     }
 }
 
@@ -579,6 +555,104 @@ fn ceil_char_boundary(s: &str, pos: usize) -> usize {
         p += 1;
     }
     p
+}
+
+/// One on-screen row of the paste editor after soft-wrapping. A
+/// logical line (text between `\n`s) becomes one or more display
+/// rows: the first keeps `is_continuation = false`, every wrapped
+/// remainder sets it. `ends_newline` marks the row sitting just
+/// before a real `\n` in the buffer — the renderer paints `↵` there
+/// and `↪` in the left margin of continuation rows, so a soft wrap
+/// reads differently from a hard newline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DisplayRow {
+    /// Byte offset in `text` where this row's visible content starts.
+    pub(crate) start: usize,
+    /// Byte offset where the content ends (exclusive) — never past
+    /// the logical line's terminating `\n`.
+    pub(crate) end: usize,
+    /// Soft-wrap continuation of the row above (same logical line).
+    pub(crate) is_continuation: bool,
+    /// A real `\n` immediately follows `end`.
+    pub(crate) ends_newline: bool,
+}
+
+/// Break `text` into display rows, wrapping each logical line every
+/// `wrap_cols` characters. Column counting is by `char` (one cell per
+/// char) to match the hit-test / selection-quad math elsewhere in the
+/// modal — pasted payloads are overwhelmingly ASCII, and a rare wide
+/// glyph only nudges the wrap point by a cell. Always returns at least
+/// one row (the empty buffer → one empty row), and a buffer ending in
+/// `\n` yields a trailing empty row so the editable blank line shows.
+pub(crate) fn display_rows(text: &str, wrap_cols: usize) -> Vec<DisplayRow> {
+    let wrap_cols = wrap_cols.max(1);
+    let mut rows = Vec::new();
+    let mut logical_start = 0usize;
+    loop {
+        let nl = text[logical_start..].find('\n').map(|i| logical_start + i);
+        let logical_end = nl.unwrap_or(text.len());
+        let has_nl = nl.is_some();
+        let mut chunk_start = logical_start;
+        let mut chars_in_chunk = 0usize;
+        let mut first = true;
+        for (rel, _) in text[logical_start..logical_end].char_indices() {
+            let abs = logical_start + rel;
+            if chars_in_chunk == wrap_cols && abs > chunk_start {
+                rows.push(DisplayRow {
+                    start: chunk_start,
+                    end: abs,
+                    is_continuation: !first,
+                    ends_newline: false,
+                });
+                first = false;
+                chunk_start = abs;
+                chars_in_chunk = 0;
+            }
+            chars_in_chunk += 1;
+        }
+        rows.push(DisplayRow {
+            start: chunk_start,
+            end: logical_end,
+            is_continuation: !first,
+            ends_newline: has_nl,
+        });
+        match nl {
+            Some(p) => logical_start = p + 1,
+            None => break,
+        }
+    }
+    rows
+}
+
+/// Index of the display row that owns `cursor`: the last row whose
+/// `start <= cursor`. A cursor exactly on a soft-wrap boundary
+/// (`row[k].end == row[k+1].start`) resolves to the START of the
+/// lower row, matching how typing flows onto the wrapped line.
+pub(crate) fn cursor_row_idx(rows: &[DisplayRow], cursor: usize) -> usize {
+    let mut idx = 0;
+    for (i, r) in rows.iter().enumerate() {
+        if r.start <= cursor {
+            idx = i;
+        } else {
+            break;
+        }
+    }
+    idx
+}
+
+/// Character column of `cursor` within `row`, clamped to the row.
+fn col_in_row(text: &str, row: &DisplayRow, cursor: usize) -> usize {
+    let end = cursor.clamp(row.start, row.end);
+    text[row.start..end].chars().count()
+}
+
+/// Byte offset of character column `col` within `row`, clamped to the
+/// row's end when `col` runs past the row's content.
+fn byte_at_col(text: &str, row: &DisplayRow, col: usize) -> usize {
+    match text[row.start..row.end].char_indices().nth(col) {
+        Some((rel, _)) => row.start + rel,
+        None => row.end,
+    }
 }
 
 /// True when a paste should trigger the confirmation modal.
@@ -784,8 +858,11 @@ mod tests {
     fn edit_arrows_navigate_lines_preserving_column() {
         let mut p = pc("first line\nsecond line\nthird line");
         p.enter_edit_mode(); // cursor at end
+        // Wide wrap so each logical line is exactly one display row —
+        // this exercises the plain up-navigation path.
+        const W: usize = 80;
         // Walk up — should land on column 10 of line 2, etc.
-        p.edit_up();
+        p.edit_up(W);
         match p.mode {
             PasteMode::Edit { cursor, .. } => {
                 // line 2 = "second line", len 11. col 10 of line 3
@@ -796,7 +873,7 @@ mod tests {
             }
             _ => panic!(),
         }
-        p.edit_up();
+        p.edit_up(W);
         match p.mode {
             PasteMode::Edit { cursor, .. } => {
                 // Line 1 starts at 0 — col 10.
@@ -833,5 +910,80 @@ mod tests {
             PasteMode::Edit { cursor, .. } => assert_eq!(cursor, 4),
             _ => panic!(),
         }
+    }
+
+    fn cursor_of(p: &PasteConfirmation) -> usize {
+        match p.mode {
+            PasteMode::Edit { cursor, .. } => cursor,
+            _ => panic!("not in edit mode"),
+        }
+    }
+
+    #[test]
+    fn display_rows_wraps_long_logical_line() {
+        // "abcdefg" at width 3 → "abc" | "def" | "g".
+        let rows = display_rows("abcdefg", 3);
+        assert_eq!(rows.len(), 3);
+        assert_eq!((rows[0].start, rows[0].end), (0, 3));
+        assert!(!rows[0].is_continuation);
+        assert!(!rows[0].ends_newline);
+        assert!(rows[1].is_continuation, "wrapped remainder is a continuation");
+        assert_eq!((rows[2].start, rows[2].end), (6, 7));
+        assert!(rows[2].is_continuation);
+        // No '\n' anywhere → the final row does not end a hard line.
+        assert!(!rows[2].ends_newline);
+    }
+
+    #[test]
+    fn display_rows_marks_hard_newline_vs_soft_wrap() {
+        // "abcd\nef": logical line 1 wraps at 3 → "abc","d"; line 2 "ef".
+        let rows = display_rows("abcd\nef", 3);
+        assert_eq!(rows.len(), 3);
+        // "abc" — soft wrap, no newline.
+        assert!(!rows[0].is_continuation && !rows[0].ends_newline);
+        // "d" — continuation that ALSO ends the hard line (the '\n').
+        assert!(rows[1].is_continuation && rows[1].ends_newline);
+        // "ef" — fresh logical line, last row, no trailing newline.
+        assert!(!rows[2].is_continuation && !rows[2].ends_newline);
+    }
+
+    #[test]
+    fn display_rows_preserves_trailing_blank_line() {
+        // Buffer ending in '\n' must show an editable empty row.
+        let rows = display_rows("ab\n", 8);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].ends_newline);
+        assert_eq!((rows[1].start, rows[1].end), (3, 3), "trailing empty row");
+        // Empty buffer is still one row.
+        assert_eq!(display_rows("", 8).len(), 1);
+    }
+
+    #[test]
+    fn cursor_row_idx_resolves_soft_boundary_to_lower_row() {
+        // "abcdef" width 3 → rows [0,3) and [3,6). Byte 3 is the
+        // boundary; it belongs to the START of the lower row.
+        let rows = display_rows("abcdef", 3);
+        assert_eq!(cursor_row_idx(&rows, 0), 0);
+        assert_eq!(cursor_row_idx(&rows, 2), 0);
+        assert_eq!(cursor_row_idx(&rows, 3), 1, "boundary → lower row");
+        assert_eq!(cursor_row_idx(&rows, 6), 1, "end of buffer → last row");
+    }
+
+    #[test]
+    fn edit_down_then_up_moves_by_display_row_on_wrapped_line() {
+        // One long logical line, wrapped at 4 cols: rows are
+        // "0123","4567","89". Down from the top row should land on
+        // the second display row (not jump past the whole line).
+        let mut p = pc("0123456789");
+        p.enter_edit_mode(); // cursor at end (10)
+        // Put the cursor at the very start, then walk down one row.
+        p.edit_home(); // logical line start = 0
+        assert_eq!(cursor_of(&p), 0);
+        p.edit_down(4);
+        assert_eq!(cursor_of(&p), 4, "down → start of 2nd display row");
+        p.edit_down(4);
+        assert_eq!(cursor_of(&p), 8, "down → start of 3rd display row");
+        p.edit_up(4);
+        assert_eq!(cursor_of(&p), 4, "up → back to 2nd display row");
     }
 }
