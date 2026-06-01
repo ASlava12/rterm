@@ -185,10 +185,20 @@ pub enum MouseTracking {
     AnyEvent,
 }
 
+/// One line evicted into the scrollback ring. Carries the row's cells
+/// plus its soft-wrap flag (`wrapped` = the line continued onto the
+/// next one via autowrap, with no hard newline) so copy can rejoin a
+/// wrapped line instead of inserting a spurious `\n` at the boundary.
+#[derive(Clone)]
+struct ScrollbackRow {
+    cells: Vec<Cell>,
+    wrapped: bool,
+}
+
 pub struct Terminal {
     grids: [Grid; 2],
     active: usize,
-    scrollback: VecDeque<Vec<Cell>>,
+    scrollback: VecDeque<ScrollbackRow>,
     scrollback_limit: usize,
     cursor: Position,
     saved: [Option<CursorState>; 2],
@@ -1105,7 +1115,7 @@ impl Terminal {
     }
 
     pub fn scrollback_line(&self, idx_from_top: usize) -> Option<&[Cell]> {
-        self.scrollback.get(idx_from_top).map(|v| v.as_slice())
+        self.scrollback.get(idx_from_top).map(|v| v.cells.as_slice())
     }
 
     /// Visible-row lookup that transparently mixes scrollback and the live
@@ -1130,10 +1140,32 @@ impl Terminal {
         let off = (offset as usize).min(sb_len);
         if (r as usize) < off {
             let sb_idx = sb_len - off + r as usize;
-            self.scrollback.get(sb_idx).map(|v| v.as_slice())
+            self.scrollback.get(sb_idx).map(|v| v.cells.as_slice())
         } else {
             self.grids[self.active]
                 .row(r - off as u16)
+        }
+    }
+
+    /// Soft-wrap flag for the visible row at `(offset, r)` — mirrors the
+    /// scrollback/grid mapping of [`Terminal::visible_row`]. `true` means
+    /// this visible row continues onto the next one via autowrap (no hard
+    /// newline). Copy uses it to avoid inserting a `\n` at the boundary.
+    pub fn row_wrapped(&self, offset: u16, r: u16) -> bool {
+        let rows = self.size().rows;
+        if r >= rows {
+            return false;
+        }
+        if self.active == ALT {
+            return self.grids[ALT].is_wrapped(r);
+        }
+        let sb_len = self.scrollback.len();
+        let off = (offset as usize).min(sb_len);
+        if (r as usize) < off {
+            let sb_idx = sb_len - off + r as usize;
+            self.scrollback.get(sb_idx).map(|v| v.wrapped).unwrap_or(false)
+        } else {
+            self.grids[self.active].is_wrapped(r - off as u16)
         }
     }
 
@@ -1180,8 +1212,12 @@ impl Terminal {
         if size.rows > 0 && size.rows < old_rows {
             let evict = old_rows - size.rows;
             let blank = Cell::default();
+            // Capture the soft-wrap flags of the rows about to be evicted
+            // (0..evict) before scroll_up shifts them off the grid.
+            let evicted_wrapped: Vec<bool> =
+                (0..evict).map(|i| self.grids[PRIMARY].is_wrapped(i)).collect();
             let evicted = self.grids[PRIMARY].scroll_up(0, old_rows - 1, evict, blank);
-            for row in evicted {
+            for (row, wrapped) in evicted.into_iter().zip(evicted_wrapped) {
                 while self.scrollback.len() >= self.scrollback_limit {
                     if self.scrollback.pop_front().is_none() {
                         break;
@@ -1193,7 +1229,7 @@ impl Terminal {
                     shift_marks_after_scrollback_drop(&mut self.command_marks, 1);
                 }
                 if self.scrollback_limit > 0 {
-                    self.scrollback.push_back(row);
+                    self.scrollback.push_back(ScrollbackRow { cells: row, wrapped });
                 }
             }
             // Alt screen has no scrollback; just scroll content up.
@@ -2067,7 +2103,7 @@ impl Terminal {
 struct TerminalPerform<'a> {
     grids: &'a mut [Grid; 2],
     active: &'a mut usize,
-    scrollback: &'a mut VecDeque<Vec<Cell>>,
+    scrollback: &'a mut VecDeque<ScrollbackRow>,
     scrollback_limit: usize,
     cursor: &'a mut Position,
     saved: &'a mut [Option<CursorState>; 2],
@@ -2477,9 +2513,21 @@ impl<'a> TerminalPerform<'a> {
         let top = self.region.top;
         let bottom = self.region.bottom;
         let blank = self.blank_cell();
+        let to_scrollback = *self.active == PRIMARY && top == 0;
+        // Capture the soft-wrap flags of the rows about to be evicted
+        // (top..) before scroll_up shifts them, so each line keeps its
+        // wrap state as it rides into scrollback.
+        let evicted_wrapped: Vec<bool> = if to_scrollback {
+            let shift = (n as usize).min((bottom - top + 1) as usize);
+            (0..shift)
+                .map(|i| self.grids[*self.active].is_wrapped(top + i as u16))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let evicted = self.grid_mut().scroll_up(top, bottom, n, blank);
-        if *self.active == PRIMARY && top == 0 {
-            for row in evicted {
+        if to_scrollback {
+            for (row, wrapped) in evicted.into_iter().zip(evicted_wrapped) {
                 // Use `>=` (not `==`) so `scrollback_limit = 0` actually
                 // disables scrollback rather than letting the ring grow
                 // unbounded — `==` only triggered eviction at the exact
@@ -2495,7 +2543,7 @@ impl<'a> TerminalPerform<'a> {
                     shift_marks_after_scrollback_drop(self.command_marks, 1);
                 }
                 if self.scrollback_limit > 0 {
-                    self.scrollback.push_back(row);
+                    self.scrollback.push_back(ScrollbackRow { cells: row, wrapped });
                 }
             }
         }
@@ -2694,6 +2742,13 @@ impl<'a> TerminalPerform<'a> {
             1 => self.erase_range(Position { row, col: 0 }, cursor),
             2 => self.erase_range(Position { row, col: 0 }, Position { row, col: last_col }),
             _ => {}
+        }
+        // Erasing to (or past) the end of the line breaks any soft-wrap
+        // continuation it had, so copy must not merge it with the next
+        // row. Progress bars / line editors redraw with `\r` + `ESC[K`,
+        // so this keeps the flag honest. (Mode 1 leaves the tail intact.)
+        if matches!(mode, 0 | 2) {
+            self.grid_mut().set_wrapped(row, false);
         }
     }
 
@@ -3385,6 +3440,13 @@ impl<'a> Perform for TerminalPerform<'a> {
         // don't, wrap (or pin) using the COMBINED width.
         if self.cursor.col + width > size.cols {
             if *self.autowrap {
+                // Mark the row we're leaving as soft-wrapped (its text
+                // continues on the next row with no hard newline) BEFORE
+                // the linefeed, so the flag is captured if this scroll
+                // evicts the row into scrollback. Copy uses it to avoid
+                // splicing a spurious `\n` at the wrap point.
+                let r = self.cursor.row;
+                self.grid_mut().set_wrapped(r, true);
                 self.linefeed();
                 self.cursor.col = 0;
             } else {
@@ -6213,6 +6275,40 @@ mod tests {
             .map(|c| t.grid().cell(Position { col: c, row: 1 }).unwrap().ch)
             .collect();
         assert_eq!(row1, "XY  ");
+    }
+
+    #[test]
+    fn autowrap_marks_soft_wrap_but_hard_newline_does_not() {
+        // Soft wrap: 6 chars at width 4 → row 0 fills and the text
+        // continues onto row 1. The autowrapped row is flagged so copy
+        // can rejoin it without inserting a `\n`.
+        let mut t = term(4, 4);
+        t.advance(b"abcdef");
+        assert!(t.row_wrapped(0, 0), "autowrapped row 0 is marked wrapped");
+        assert!(!t.row_wrapped(0, 1), "continuation row is not itself wrapped");
+
+        // Exact-width line + a HARD newline must NOT be marked wrapped:
+        // the line ended with a real `\n`, so copy keeps the newline.
+        let mut t2 = term(4, 4);
+        t2.advance(b"abcd\r\nXY");
+        assert!(!t2.row_wrapped(0, 0), "exact-width + newline is not a soft wrap");
+        assert!(!t2.row_wrapped(0, 1), "second line is not wrapped");
+    }
+
+    #[test]
+    fn soft_wrap_flag_rides_into_scrollback() {
+        // A 2-row terminal: wrap fills row 0→1, then more output scrolls
+        // the wrapped row 0 into scrollback. Its flag must survive so a
+        // copy spanning scrollback still rejoins the wrapped line.
+        let mut t = term(4, 2);
+        t.advance(b"abcdef"); // "abcd" (row0, wrapped) + "ef" (row1)
+        t.advance(b"\r\nghij\r\nklmn"); // push more lines, scroll row0 out
+        // Row 0 ("abcd") now lives in scrollback at offset reaching it.
+        // Find it: scroll back far enough that visible row 0 == "abcd".
+        let sb = t.scrollback_len() as u16;
+        assert!(sb >= 1, "wrapped line evicted to scrollback");
+        // The oldest scrollback line is the wrapped "abcd".
+        assert!(t.row_wrapped(sb, 0), "wrapped flag preserved in scrollback");
     }
 
     #[test]

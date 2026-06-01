@@ -7355,7 +7355,24 @@ impl App {
                     }
                 }
                 if abs_r < abs_e_row {
-                    text.push('\n');
+                    // Skip the newline when this row soft-wrapped into the
+                    // next one (autowrap filled it to the margin — there's
+                    // no real `\n` there), so a wrapped line copies as one
+                    // logical line. Block selection keeps rows independent,
+                    // so it always joins with `\n`.
+                    let soft_wrapped = !block && {
+                        if (abs_r as usize) < sb_len {
+                            let off =
+                                (sb_len - abs_r as usize).min(u16::MAX as usize) as u16;
+                            term.row_wrapped(off, 0)
+                        } else {
+                            let g_row = (abs_r as usize - sb_len) as u16;
+                            term.row_wrapped(0, g_row)
+                        }
+                    };
+                    if !soft_wrapped {
+                        text.push('\n');
+                    }
                 }
             }
         }

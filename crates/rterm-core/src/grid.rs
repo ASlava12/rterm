@@ -68,12 +68,31 @@ pub struct Position {
 pub struct Grid {
     size: Size,
     cells: Vec<Cell>,
+    /// Per-row soft-wrap flag: `line_wrapped[r]` is true when row `r`
+    /// filled to the right margin via autowrap and its text continues
+    /// on row `r + 1` with no hard newline between them. Copy uses this
+    /// to round-trip a wrapped line as ONE logical line instead of
+    /// splicing a spurious `\n` at every visual row boundary.
+    line_wrapped: Vec<bool>,
 }
 
 impl Grid {
     pub fn new(size: Size) -> Self {
         let cells = vec![Cell::default(); size.cols as usize * size.rows as usize];
-        Self { size, cells }
+        let line_wrapped = vec![false; size.rows as usize];
+        Self { size, cells, line_wrapped }
+    }
+
+    /// Whether row `r` soft-wraps into `r + 1` (see `line_wrapped`).
+    pub fn is_wrapped(&self, row: u16) -> bool {
+        self.line_wrapped.get(row as usize).copied().unwrap_or(false)
+    }
+
+    /// Mark (or clear) row `r`'s soft-wrap flag. Out-of-range is a no-op.
+    pub fn set_wrapped(&mut self, row: u16, wrapped: bool) {
+        if let Some(w) = self.line_wrapped.get_mut(row as usize) {
+            *w = wrapped;
+        }
     }
 
     pub fn size(&self) -> Size {
@@ -103,12 +122,17 @@ impl Grid {
             new_cells[new_start..new_start + copy_cols]
                 .copy_from_slice(&self.cells[old_start..old_start + copy_cols]);
         }
+        // Carry wrap flags for surviving rows; new rows start unwrapped.
+        let mut new_wrapped = vec![false; new_size.rows as usize];
+        new_wrapped[..copy_rows].copy_from_slice(&self.line_wrapped[..copy_rows]);
+        self.line_wrapped = new_wrapped;
         self.size = new_size;
         self.cells = new_cells;
     }
 
     pub fn clear(&mut self) {
         self.cells.fill(Cell::default());
+        self.line_wrapped.fill(false);
     }
 
     /// Iterate row `row` as a slice. None if out of bounds.
@@ -168,6 +192,16 @@ impl Grid {
         let blank_end = blank_start + shift * cols;
         self.cells[blank_start..blank_end].fill(blank);
 
+        // Shift wrap flags in lockstep with the cells: region survivors
+        // move up by `shift`, the freed tail resets to unwrapped.
+        let survive_rows = region_rows - shift;
+        for i in 0..survive_rows {
+            self.line_wrapped[top_row + i] = self.line_wrapped[top_row + i + shift];
+        }
+        for i in 0..shift {
+            self.line_wrapped[top_row + survive_rows + i] = false;
+        }
+
         evicted
     }
 
@@ -193,6 +227,16 @@ impl Grid {
                 .copy_within(region_start..region_start + survive_len, blank_end);
         }
         self.cells[region_start..blank_end].fill(blank);
+
+        // Mirror the move for wrap flags: survivors shift down by
+        // `shift`, the inserted top rows reset to unwrapped.
+        let survive_rows = region_rows - shift;
+        for i in (0..survive_rows).rev() {
+            self.line_wrapped[top_row + shift + i] = self.line_wrapped[top_row + i];
+        }
+        for i in 0..shift {
+            self.line_wrapped[top_row + i] = false;
+        }
     }
 
     fn index(&self, pos: Position) -> Option<usize> {
