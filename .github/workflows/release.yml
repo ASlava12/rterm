@@ -40,6 +40,12 @@ jobs:
     # Safety net: if a hosted runner wedges (the aarch64 Linux pool has
     # been flaky), fail in a bounded time instead of hanging for hours.
     timeout-minutes: 90
+    # Per-leg opt-in via `matrix.allow_failure`: a flaky runner on a
+    # single target (the free ARM64 Linux pool) must not block the whole
+    # release. Defaults to false, so every other leg stays a strict gate
+    # and `publish` (needs: build) still runs as long as the blocking
+    # legs pass.
+    continue-on-error: ${{ matrix.allow_failure || false }}
     strategy:
       fail-fast: false
       matrix:
@@ -68,12 +74,19 @@ jobs:
             os: ubuntu-24.04-arm
             archive: tar.gz
             bin: rterm
-            # The free ARM64 Linux runner OOMs when rustc fans out to
-            # all cores on a cold cache (the full wgpu/naga/cosmic-text
-            # tree), so the job dies mid-compile ("runner shutdown").
-            # Cap parallelism on THIS leg only; every other runner keeps
-            # building at full speed. Empty on the other legs.
+            # GitHub's free ARM64 Linux runner pool is flaky: jobs get
+            # SIGTERM'd mid-step (apt or cold-cache compile) regardless
+            # of our workload — the dependency graph is identical to
+            # releases that built fine on the same runner type. Two
+            # mitigations, both scoped to THIS leg:
+            #   * `--jobs 2` keeps peak compiler memory down in case the
+            #     runner is also RAM-starved (belt-and-suspenders).
+            #   * `allow_failure` makes the leg non-blocking (see the
+            #     job-level `continue-on-error`) so a killed runner can't
+            #     stop the other 5 artifacts from publishing. When the
+            #     runner does cooperate, the ARM64-Linux tarball ships too.
             jobs_flag: "--jobs 2"
+            allow_failure: true
           # x86_64-apple-darwin dropped from the release matrix:
           # GitHub's `macos-13` Intel runner pool degraded to 4+ hour
           # queue times in mid-2026 (Apple Silicon eclipsed Intel
