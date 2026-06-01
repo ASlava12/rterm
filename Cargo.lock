@@ -2306,7 +2306,7 @@ checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 
 [[package]]
 name = "rterm-app"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2332,7 +2332,7 @@ dependencies = [
 
 [[package]]
 name = "rterm-config"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "anyhow",
  "serde",
@@ -2343,7 +2343,7 @@ dependencies = [
 
 [[package]]
 name = "rterm-core"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "base64",
  "bitflags 2.11.1",
@@ -2355,7 +2355,7 @@ dependencies = [
 
 [[package]]
 name = "rterm-history"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "anyhow",
  "rusqlite",
@@ -2364,7 +2364,7 @@ dependencies = [
 
 [[package]]
 name = "rterm-plugin"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "anyhow",
  "mlua",
@@ -2376,7 +2376,7 @@ dependencies = [
 
 [[package]]
 name = "rterm-pty"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "anyhow",
  "portable-pty",
@@ -2387,7 +2387,7 @@ dependencies = [
 
 [[package]]
 name = "rterm-render"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "anyhow",
  "arboard",
