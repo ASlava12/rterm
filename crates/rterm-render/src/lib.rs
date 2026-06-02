@@ -1845,6 +1845,21 @@ impl GpuState {
         tracing::info!("building text layer");
         let mut text = TextLayer::new(&device, &queue, format, font_size, font_family);
         text.resize(&queue, config.width, config.height);
+        // HiDPI layout diagnostic: the physical/logical numbers behind
+        // scale-factor bugs (grid not filling the window, cursor/buttons
+        // at the wrong x). Plain INFO so it shows without RUST_LOG.
+        {
+            let (cols, rows) = text.cells_for(config.width, config.height, PAD);
+            tracing::info!(
+                scale_factor = window.scale_factor(),
+                inner_size = ?(size.width, size.height),
+                surface = ?(config.width, config.height),
+                cell_width = text.cell_width(),
+                line_height = text.line_height(),
+                grid = ?(cols, rows),
+                "layout diagnostic",
+            );
+        }
         tracing::info!("building bg layer");
         let mut bg = BgLayer::new(&device, format);
         bg.resize(config.width, config.height);
@@ -10053,12 +10068,14 @@ fn descend_leftmost(tree: &tree::Tree<Pane>, from: &[bool]) -> tree::TreePath {
         .unwrap_or_else(|| from.to_vec())
 }
 
-/// Clear colour for a bell visual flash: a small, NEUTRAL lift of all
-/// three channels so the flash reads as a soft dim pulse rather than
-/// the old harsh warm-yellow tint. The configured alpha is preserved
-/// so a transparent window doesn't snap opaque for the flash duration.
+/// Clear colour for a bell visual flash: a SMALL, neutral lift of all
+/// three channels — a soft dim pulse, not a screen-wide flash. On a dark
+/// theme a bigger lift reads as a near-white "flashbang", so keep it
+/// low (and `bell_visual = false` disables it entirely). The configured
+/// alpha is preserved so a transparent window doesn't snap opaque for
+/// the flash. Tunable via `FLASH_LIFT`.
 fn flash_clear_color(base: wgpu::Color) -> wgpu::Color {
-    const FLASH_LIFT: f64 = 0.10;
+    const FLASH_LIFT: f64 = 0.04;
     wgpu::Color {
         r: (base.r + FLASH_LIFT).min(1.0),
         g: (base.g + FLASH_LIFT).min(1.0),
@@ -13214,65 +13231,38 @@ impl ApplicationHandler<UserEvent> for App {
                         return;
                     }
 
-                    // Coalesce rapid PTY output so we never present a
-                    // half-finished redraw. The render loop re-requests a
-                    // frame every tick, so on a fast present mode it spins
-                    // at hundreds+ FPS and would otherwise show transient
-                    // states. Two cases:
+                    // Coalesce sub-frame PTY bursts only. The render loop
+                    // re-requests a frame every tick, so on a fast present
+                    // mode it spins at hundreds+ FPS and could present a
+                    // multi-write burst mid-way. If the focused pane emitted
+                    // output within the last few ms, hold the present briefly
+                    // so the burst lands as one frame; cap it LOW so output
+                    // is never delayed noticeably.
                     //
-                    //  * Sub-frame burst — hold a few ms until output
-                    //    settles, capped low so streaming stays smooth.
-                    //
-                    //  * Mid-redraw after a BARE CR — a shell echoing ^C or
-                    //    redrawing a prompt emits `\r` (cursor → column 0,
-                    //    OVER the existing line) and then, often after a
-                    //    network / ConPTY gap, the replacement line. Showing
-                    //    the in-between frame flicks the cursor to the line
-                    //    start (the Ctrl+C complaint). Detect it precisely:
-                    //    cursor at column 0 on a NON-blank PRIMARY-screen row
-                    //    (a CRLF newline lands on a BLANK row, so normal
-                    //    streaming and alt-screen TUIs never trip it) and
-                    //    hold longer for the redraw to arrive — bounded so a
-                    //    genuinely stuck link still updates.
+                    // NOTE: an earlier version also held frames much longer
+                    // (up to 180 ms) while a bare-CR redraw was in flight to
+                    // hide the Ctrl+C cursor flick. That fired on every zle
+                    // line-redraw too, which made typing over SSH feel laggy
+                    // — so it's gone. The residual Ctrl+C flick on a high-
+                    // latency link is the lesser evil vs. input lag.
                     const SETTLE_MS: u64 = 3;
                     const COALESCE_MAX: Duration = Duration::from_millis(12);
-                    const REDRAW_FRESH_MS: u64 = 250;
-                    const REDRAW_MAX: Duration = Duration::from_millis(180);
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
-                    let focus = tab.focused_index();
-                    let focus_idle_ms = focus
+                    let focus_idle_ms = tab
+                        .focused_index()
                         .and_then(|i| tab.panes().get(i).map(|p| p.last_output_ms.load(Ordering::Relaxed)))
                         .map(|last| now_ms.saturating_sub(last))
                         .unwrap_or(u64::MAX);
-                    let mid_redraw = focus
-                        .and_then(|i| guards.get(i))
-                        .map(|g| {
-                            let cur = g.cursor();
-                            !g.is_on_alt_screen()
-                                && cur.col == 0
-                                && g.visible_row(0, cur.row)
-                                    .map(|row| row.iter().any(|c| c.ch != ' '))
-                                    .unwrap_or(false)
-                        })
-                        .unwrap_or(false);
-                    let want_hold = focus_idle_ms < SETTLE_MS
-                        || (mid_redraw && focus_idle_ms < REDRAW_FRESH_MS);
-                    let cap = if mid_redraw { REDRAW_MAX } else { COALESCE_MAX };
-                    let coalesce = match self.coalesce_started_at {
-                        None if want_hold => {
+                    let coalesce = match (focus_idle_ms < SETTLE_MS, self.coalesce_started_at) {
+                        (true, None) => {
                             self.coalesce_started_at = Some(Instant::now());
                             true
                         }
-                        None => false,
-                        Some(started) if started.elapsed() >= cap => {
-                            self.coalesce_started_at = None;
-                            false
-                        }
-                        Some(_) if want_hold => true,
-                        Some(_) => {
+                        (true, Some(started)) => started.elapsed() < COALESCE_MAX,
+                        (false, _) => {
                             self.coalesce_started_at = None;
                             false
                         }
@@ -14451,7 +14441,7 @@ mod tests {
         assert!((dr - dg).abs() < 1e-9 && (dg - db).abs() < 1e-9, "equal lift → no colour cast");
         assert_eq!(f.a, base.a, "configured opacity preserved during flash");
         // Channels saturate at 1.0 — no overflow past white.
-        let bright = wgpu::Color { r: 0.95, g: 1.0, b: 0.99, a: 1.0 };
+        let bright = wgpu::Color { r: 0.99, g: 1.0, b: 0.985, a: 1.0 };
         let fb = flash_clear_color(bright);
         assert_eq!((fb.r, fb.g, fb.b), (1.0, 1.0, 1.0));
     }
