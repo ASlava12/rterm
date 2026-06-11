@@ -1013,9 +1013,12 @@ impl TextLayer {
     pub fn set_font_size(&mut self, font_size: f32) {
         // `f32::clamp` panics on NaN. Plugins / hot-reload could push a
         // bogus value through `rterm.set_font_size`, so fall back to the
-        // current size rather than crashing.
+        // current size rather than crashing. The value here is PHYSICAL
+        // pixels (logical points × scale factor — see
+        // `App::set_font_size_absolute`), so the ceiling allows the
+        // logical 96 pt maximum on up-to-4× HiDPI displays.
         let font_size = if font_size.is_finite() {
-            font_size.clamp(6.0, 96.0)
+            font_size.clamp(6.0, 384.0)
         } else {
             return;
         };
@@ -2000,7 +2003,7 @@ impl GpuState {
         title_bar: Option<&TitleBarDraw<'_>>,
         status_bar: Option<&StatusBarDraw<'_>>,
         overlay: Option<&OverlayDraw<'_>>,
-        flash: bool,
+        flash: f32,
         show_scrollbar: bool,
         before_panes: &[bg::BgQuad],
         after_panes: &[bg::BgQuad],
@@ -2154,8 +2157,9 @@ impl GpuState {
             // For a brief bell flash, lift the clear color a touch so the
             // bell registers even on a fully-painted screen (see
             // `flash_clear_color` for the soft-neutral-pulse rationale).
-            let clear = if flash {
-                flash_clear_color(self.clear_color)
+            // `flash` is the fade intensity (1.0 at the BEL, easing to 0).
+            let clear = if flash > 0.0 {
+                flash_clear_color(self.clear_color, flash as f64)
             } else {
                 self.clear_color
             };
@@ -2555,6 +2559,14 @@ const HELP_VISIBLE_LINES: usize = 28;
 /// cols values (sometimes 1), and reformat each output line to those
 /// transient widths.
 const RESIZE_DEBOUNCE_MS: u128 = 120;
+
+/// How long a BEL's visual flash takes to fade back to the normal
+/// background. The intensity ramps 1 → 0 over this window (see
+/// `flash_clear_color`), so there is no hard "off" edge. A repeated
+/// BEL (held Backspace on an empty prompt) re-arms the deadline each
+/// time, which pins the lift at a steady low level instead of
+/// strobing — one smooth fade when the bells stop.
+const BELL_FLASH_FADE_MS: u64 = 150;
 
 #[derive(Debug, Clone)]
 struct SearchState {
@@ -3156,7 +3168,16 @@ pub struct App {
     state: Option<GpuState>,
     title: String,
     initial_size: (u32, u32),
+    /// Current font size in LOGICAL points — the value the user
+    /// configured / adjusted, before HiDPI scaling. The renderer works
+    /// in physical pixels: `set_font_size_absolute` multiplies this by
+    /// the window's scale factor before handing it to `TextLayer`.
     font_size: f32,
+    /// Font size captured at startup, before any `rterm.set_font_size`
+    /// or `font_increase`/`decrease` action overrides it. Used by
+    /// `font_reset` to return to the user's configured value (mirrors
+    /// `initial_opacity`).
+    initial_font_size: f32,
     font_family: String,
     opacity: f32,
     /// Opacity captured at startup, before any `rterm.set_opacity` or
@@ -3188,7 +3209,10 @@ pub struct App {
     /// Pane index currently receiving PTY mouse events. Set when a press
     /// happens while mouse reporting is on; cleared on release.
     mouse_pty_pane: Option<usize>,
-    /// Until-instant for a bell-induced visual flash of the surface clear.
+    /// Until-instant for a bell-induced visual flash of the surface
+    /// clear. The flash intensity fades linearly from 1.0 down to 0 as
+    /// this deadline approaches (window = `BELL_FLASH_FADE_MS`), so the
+    /// pulse eases out rather than blinking off.
     flash_until: Option<Instant>,
     search: Option<SearchState>,
     /// Path to the Split whose gap is currently being dragged.
@@ -3503,6 +3527,7 @@ impl App {
             title,
             initial_size: size,
             font_size,
+            initial_font_size: font_size,
             font_family,
             // Guard against NaN — `f32::clamp` panics on non-finite
             // inputs. NaN sneaks in if the config file is hand-edited
@@ -4221,7 +4246,7 @@ impl App {
             }
             Some(SettingsHit::FontDelta(d)) => {
                 if d == 0.0 {
-                    let initial = self.font_size;
+                    let initial = self.initial_font_size;
                     self.set_font_size_absolute(initial);
                 } else {
                     self.adjust_font_size(d);
@@ -4312,7 +4337,7 @@ impl App {
                 "t" => self.cycle_theme(if shift { -1 } else { 1 }),
                 "f" => self.adjust_font_size(if shift { -1.0 } else { 1.0 }),
                 "0" => {
-                    let initial = self.font_size;
+                    let initial = self.initial_font_size;
                     self.set_font_size_absolute(initial);
                 }
                 "o" => self.adjust_opacity(if shift { -0.05 } else { 0.05 }),
@@ -6306,7 +6331,7 @@ impl App {
         // The physical `0` key is layout-invariant and unambiguous (it
         // never doubles as a tab selector — those are 1‑9).
         if is_font_reset_key(&event.physical_key) {
-            let initial = self.font_size;
+            let initial = self.initial_font_size;
             self.set_font_size_absolute(initial);
             return Some(false);
         }
@@ -6452,7 +6477,7 @@ impl App {
                     return Some(false);
                 }
                 "0" | ")" => {
-                    let initial = self.font_size;
+                    let initial = self.initial_font_size;
                     self.set_font_size_absolute(initial);
                     return Some(false);
                 }
@@ -7701,7 +7726,7 @@ impl App {
             AppAction::FontIncrease => self.adjust_font_size(1.0),
             AppAction::FontDecrease => self.adjust_font_size(-1.0),
             AppAction::FontReset => {
-                let initial = self.font_size;
+                let initial = self.initial_font_size;
                 self.set_font_size_absolute(initial);
             }
             // Opacity stepping mirrors font_increase / font_decrease: a
@@ -10074,12 +10099,18 @@ fn descend_leftmost(tree: &tree::Tree<Pane>, from: &[bool]) -> tree::TreePath {
 /// low (and `bell_visual = false` disables it entirely). The configured
 /// alpha is preserved so a transparent window doesn't snap opaque for
 /// the flash. Tunable via `FLASH_LIFT`.
-fn flash_clear_color(base: wgpu::Color) -> wgpu::Color {
-    const FLASH_LIFT: f64 = 0.04;
+///
+/// `intensity` (0..=1) scales the lift so the pulse can FADE OUT over a
+/// few frames instead of snapping off — the hard on/off step is what
+/// reads as "blinking" when a shell rings BEL on every ignored
+/// backspace. Squared so the tail eases out instead of cutting.
+fn flash_clear_color(base: wgpu::Color, intensity: f64) -> wgpu::Color {
+    const FLASH_LIFT: f64 = 0.003;
+    let lift = FLASH_LIFT * (intensity.clamp(0.0, 1.0)).powi(2);
     wgpu::Color {
-        r: (base.r + FLASH_LIFT).min(1.0),
-        g: (base.g + FLASH_LIFT).min(1.0),
-        b: (base.b + FLASH_LIFT).min(1.0),
+        r: (base.r + lift).min(1.0),
+        g: (base.g + lift).min(1.0),
+        b: (base.b + lift).min(1.0),
         a: base.a,
     }
 }
@@ -10736,9 +10767,13 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
+        // Font size travels to the renderer in PHYSICAL pixels — the
+        // wgpu surface is physical-sized, so shaping at the logical
+        // point size on a HiDPI display would draw half-size glyphs.
+        let scale = (window.scale_factor() as f32).max(0.1);
         match pollster::block_on(GpuState::new(
             window.clone(),
-            self.font_size,
+            self.font_size * scale,
             self.font_family.clone(),
             self.opacity,
         )) {
@@ -10890,6 +10925,17 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(state) = self.state.as_ref() {
                     state.window.request_redraw();
                 }
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                // Window moved to a monitor with a different DPI (or
+                // the user changed the display scale). Re-derive the
+                // physical font pixel size from the logical point size
+                // so glyphs stay the same visual size instead of
+                // shrinking/growing with the scale change. The
+                // follow-up `Resized` event handles the surface.
+                tracing::info!(scale_factor, "scale factor changed — re-deriving font size");
+                let logical = self.font_size;
+                self.set_font_size_absolute(logical);
             }
             WindowEvent::ModifiersChanged(Modifiers { .. }) => {
                 if let WindowEvent::ModifiersChanged(m) = &event {
@@ -12017,7 +12063,8 @@ impl ApplicationHandler<UserEvent> for App {
                 // legacy "plugin" literal.
                 if self.events.take_pending_bell() {
                     if self.bell_visual {
-                        self.flash_until = Some(Instant::now() + Duration::from_millis(100));
+                        self.flash_until =
+                            Some(Instant::now() + Duration::from_millis(BELL_FLASH_FADE_MS));
                     }
                     // Same shape as the VT BEL emission above:
                     // `<tab>:<pane>\t<uid>`. `0:0\t0` sentinel when no
@@ -12554,11 +12601,11 @@ impl ApplicationHandler<UserEvent> for App {
                     let snap = if let Ok(t) = pane.terminal.lock() {
                         let rows = t.size().rows;
                         let text = grid_text_snapshot(&t);
-                        let font_size = self
-                            .state
-                            .as_ref()
-                            .map(|s| s.text.font_size())
-                            .unwrap_or(self.font_size);
+                        // Logical points — the same unit plugins pass to
+                        // `rterm.set_font_size`. The TextLayer's value is
+                        // physical (scale-multiplied) and would read 2×
+                        // too big on HiDPI.
+                        let font_size = self.font_size;
                         let font_family = self
                             .state
                             .as_ref()
@@ -12686,7 +12733,8 @@ impl ApplicationHandler<UserEvent> for App {
                     // `terminal.bell_urgent` for users who want one but
                     // not the other.
                     if self.bell_visual {
-                        self.flash_until = Some(Instant::now() + Duration::from_millis(100));
+                        self.flash_until =
+                            Some(Instant::now() + Duration::from_millis(BELL_FLASH_FADE_MS));
                     }
                     if self.bell_urgent && !self.window_focused {
                         if let Some(s) = self.state.as_ref() {
@@ -13103,11 +13151,24 @@ impl ApplicationHandler<UserEvent> for App {
                     // Paste-confirmation modal in Edit mode wants
                     // wrap-off so its mini-editor reads "1 buffer
                     // line == 1 visual row" — the click-to-cursor
-                    // hit-test math relies on this.
-                    let overlay_nowrap = matches!(
-                        self.paste_confirmation.as_ref().map(|m| &m.mode),
-                        Some(paste_confirm::PasteMode::Edit { .. }),
-                    );
+                    // hit-test math relies on this. The settings
+                    // overlay needs the same guarantee: its click
+                    // hit-zones (`settings_hits`) are computed as
+                    // `row × line_height`, so a word-wrapped line
+                    // would shift every row below it away from its
+                    // hit rect. Wrap-off keeps buttons clickable at
+                    // any font size (overflow clips at the panel
+                    // edge instead of re-flowing).
+                    let settings_overlay_shown = self.show_settings
+                        && self.paste_confirmation.is_none()
+                        && self.rename_tab.is_none()
+                        && self.context_menu.is_none()
+                        && self.palette.is_none();
+                    let overlay_nowrap = settings_overlay_shown
+                        || matches!(
+                            self.paste_confirmation.as_ref().map(|m| &m.mode),
+                            Some(paste_confirm::PasteMode::Edit { .. }),
+                        );
                     let overlay_draw = overlay_rect.map(|rect| OverlayDraw {
                         spans: overlay_spans,
                         rect,
@@ -13170,11 +13231,25 @@ impl ApplicationHandler<UserEvent> for App {
                     // render with their normal foreground on the
                     // highlight rectangle.
                     after_panes_quads.extend(paste_modal_selection_quads);
+                    // Bell-flash fade intensity: 1.0 right at the BEL,
+                    // easing to 0 as `flash_until` approaches. The event
+                    // loop is ControlFlow::Poll with an unconditional
+                    // request_redraw per frame, so the fade gets smooth
+                    // intermediate frames.
                     let flash = self
                         .flash_until
-                        .map(|t| t > Instant::now())
-                        .unwrap_or(false);
-                    if !flash {
+                        .map(|t| {
+                            let now = Instant::now();
+                            if t > now {
+                                ((t - now).as_secs_f32()
+                                    / Duration::from_millis(BELL_FLASH_FADE_MS).as_secs_f32())
+                                .min(1.0)
+                            } else {
+                                0.0
+                            }
+                        })
+                        .unwrap_or(0.0);
+                    if flash <= 0.0 {
                         self.flash_until = None;
                     }
                     // DECSET ?2026 — Synchronized Output. While the
@@ -14433,17 +14508,36 @@ mod tests {
         // three channels by the SAME amount (neutral — no warm cast)
         // and keeps the alpha so a transparent window stays transparent.
         let base = wgpu::Color { r: 0.02, g: 0.03, b: 0.04, a: 0.8 };
-        let f = flash_clear_color(base);
+        let f = flash_clear_color(base, 1.0);
         let dr = f.r - base.r;
         let dg = f.g - base.g;
         let db = f.b - base.b;
         assert!(dr > 0.0, "flash brightens the screen");
         assert!((dr - dg).abs() < 1e-9 && (dg - db).abs() < 1e-9, "equal lift → no colour cast");
         assert_eq!(f.a, base.a, "configured opacity preserved during flash");
-        // Channels saturate at 1.0 — no overflow past white.
-        let bright = wgpu::Color { r: 0.99, g: 1.0, b: 0.985, a: 1.0 };
-        let fb = flash_clear_color(bright);
+        // Channels saturate at 1.0 — no overflow past white. Inputs sit
+        // within FLASH_LIFT of white so a full-intensity flash pushes
+        // every channel to exactly 1.0 regardless of the tuned lift.
+        let bright = wgpu::Color { r: 0.9995, g: 1.0, b: 0.9998, a: 1.0 };
+        let fb = flash_clear_color(bright, 1.0);
         assert_eq!((fb.r, fb.g, fb.b), (1.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn flash_clear_color_fades_with_intensity() {
+        // The fade is monotonic: lower intensity → smaller lift, and the
+        // tail eases (quadratic) so half-intensity is well under half the
+        // peak lift. Zero intensity must be a no-op (no residual tint).
+        let base = wgpu::Color { r: 0.1, g: 0.1, b: 0.1, a: 1.0 };
+        let full = flash_clear_color(base, 1.0).r - base.r;
+        let half = flash_clear_color(base, 0.5).r - base.r;
+        let zero = flash_clear_color(base, 0.0).r - base.r;
+        assert!(full > half && half > 0.0, "lift shrinks with intensity");
+        assert!(half < full * 0.5, "quadratic easing softens the tail");
+        assert_eq!(zero, 0.0, "intensity 0 leaves the base colour untouched");
+        // Out-of-range inputs clamp instead of over-lifting.
+        let over = flash_clear_color(base, 5.0).r - base.r;
+        assert!((over - full).abs() < 1e-9, "intensity clamps at 1.0");
     }
 
     #[test]

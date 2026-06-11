@@ -70,7 +70,14 @@ unicode-width = "0.2"
 # Rendering
 wgpu = "23"
 winit = "0.30"
-cosmic-text = "0.12"
+# `monospace_fallback` makes cosmic-text (a) prefer monospace faces when
+# picking a fallback font for symbols the primary family lacks, and
+# (b) actually honour `Buffer::set_monospace_width` by snapping fallback
+# glyph advances to whole-cell multiples. Without it both are no-ops and
+# icons (▸ ◉ ⌗, Nerd Font glyphs, …) shaped from a proportional fallback
+# drift the rest of the row off the cell grid — visible on Linux where
+# the common monospace families lack symbol coverage.
+cosmic-text = { version = "0.12", features = ["monospace_fallback"] }
 glyphon = "0.7"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }

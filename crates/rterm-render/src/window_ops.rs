@@ -13,12 +13,10 @@ impl App {
     /// `font_increase` / `font_decrease` built-in actions and from
     /// `Ctrl+wheel` zoom.
     pub(crate) fn adjust_font_size(&mut self, delta: f32) {
-        let cur = self
-            .state
-            .as_ref()
-            .map(|s| s.text.font_size())
-            .unwrap_or(self.font_size);
-        self.set_font_size_absolute(cur + delta);
+        // `self.font_size` is the logical-point source of truth; the
+        // TextLayer's size is physical (already scale-multiplied), so
+        // reading it back here would double-apply the HiDPI factor.
+        self.set_font_size_absolute(self.font_size + delta);
     }
 
     /// Bump opacity by `delta`, clamped to `0.0..=1.0`. Drives the
@@ -37,12 +35,25 @@ impl App {
         }
     }
 
-    /// Set the absolute font size. Forces a redraw + per-pane reflow
-    /// at the new cell metrics. Called from `adjust_font_size`, the
-    /// settings overlay, and plugin-side `rterm.set_font_size(N)`.
+    /// Set the absolute font size in LOGICAL points. Forces a redraw +
+    /// per-pane reflow at the new cell metrics. Called from
+    /// `adjust_font_size`, the settings overlay, and plugin-side
+    /// `rterm.set_font_size(N)`.
+    ///
+    /// The TextLayer rasterises in physical pixels (the wgpu surface is
+    /// physical-sized), so the logical size is multiplied by the
+    /// window's scale factor here — on a 2× HiDPI display a 13 pt font
+    /// shapes at 26 px. Without this the glyphs come out half-size and
+    /// visibly coarse on Retina screens.
     pub(crate) fn set_font_size_absolute(&mut self, size: f32) {
+        if !size.is_finite() {
+            return;
+        }
+        let size = size.clamp(6.0, 96.0);
+        self.font_size = size;
         if let Some(state) = self.state.as_mut() {
-            state.text.set_font_size(size);
+            let scale = (state.window.scale_factor() as f32).max(0.1);
+            state.text.set_font_size(size * scale);
             // Force a redraw and reflow every pane to the new cell metrics.
             state.window.request_redraw();
         }

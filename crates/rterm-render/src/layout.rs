@@ -119,13 +119,24 @@ impl App {
         p.scroll_offset.load(Ordering::Relaxed) > 0
     }
 
-    /// Help / settings overlay rect. Centered card, 520×(h-40) max,
-    /// returns None on windows too small to fit.
+    /// Help / settings overlay rect. Centered card; width scales with
+    /// the cell size so the settings rows (≈46 cells up to the
+    /// `[ reset ]` button, ≈64 with breathing room) fit on one visual
+    /// row at any font size / HiDPI scale — the settings click
+    /// hit-test assumes "1 logical line == 1 visual row". 520 px is
+    /// the floor so small fonts keep the familiar card size. Returns
+    /// None on windows too small to fit.
     pub(crate) fn help_rect(&self) -> Option<PaneRect> {
         let state = self.state.as_ref()?;
         let w = state.config.width as f32;
         let h = state.config.height as f32;
-        let max_w = 520.0_f32.min(w - 40.0).max(100.0);
+        let cell_w = state.text.cell_width();
+        let want_w = if cell_w > 0.0 {
+            (cell_w * 64.0).max(520.0)
+        } else {
+            520.0
+        };
+        let max_w = want_w.min(w - 40.0).max(100.0);
         let max_h = (h - 40.0).max(100.0);
         if w < max_w + 1.0 || h < max_h + 1.0 {
             return None;
