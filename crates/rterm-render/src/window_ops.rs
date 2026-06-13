@@ -231,13 +231,22 @@ impl App {
         if state.window.is_maximized() {
             state.window.set_maximized(false);
         }
+        // `initial_size` is in LOGICAL points — that's how the window
+        // was created (`with_inner_size(LogicalSize::new(...))`).
+        // Requesting it back as a PhysicalSize (the previous bug) gave
+        // a window half the intended linear size on a 2× HiDPI display.
         let (w, h) = self.initial_size;
-        let size = winit::dpi::PhysicalSize::new(w, h);
+        let size = winit::dpi::LogicalSize::new(w as f64, h as f64);
         if let Some(monitor) = state.window.current_monitor() {
+            // Monitor geometry is physical; convert the logical target
+            // size through the scale factor to centre correctly.
+            let scale = state.window.scale_factor();
+            let phys_w = (w as f64 * scale) as i32;
+            let phys_h = (h as f64 * scale) as i32;
             let mon_size = monitor.size();
             let mon_pos = monitor.position();
-            let cx = mon_pos.x + ((mon_size.width as i32 - w as i32) / 2).max(0);
-            let cy = mon_pos.y + ((mon_size.height as i32 - h as i32) / 2).max(0);
+            let cx = mon_pos.x + ((mon_size.width as i32 - phys_w) / 2).max(0);
+            let cy = mon_pos.y + ((mon_size.height as i32 - phys_h) / 2).max(0);
             state
                 .window
                 .set_outer_position(winit::dpi::PhysicalPosition::new(cx, cy));

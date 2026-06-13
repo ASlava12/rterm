@@ -3252,21 +3252,15 @@ impl PluginHost {
         rterm.set(
             "tab_count",
             lua.create_function(move |_, ()| {
+                // Use the authoritative tab list length — the same
+                // source `#rterm.tabs()` reports. Deriving it from
+                // `max(pane.tab)+1` disagreed whenever a tab was
+                // transiently pane-less in the snapshot or indices
+                // weren't dense.
                 let n = state_for_tab_count
                     .lock()
                     .ok()
-                    .map(|g| {
-                        // Count distinct tab indices in the pane list.
-                        let mut max_tab = 0u32;
-                        let mut any = false;
-                        for p in &g.panes {
-                            any = true;
-                            if (p.tab as u32) >= max_tab {
-                                max_tab = p.tab as u32;
-                            }
-                        }
-                        if any { max_tab + 1 } else { 0 }
-                    })
+                    .map(|g| g.tabs.len() as u32)
                     .unwrap_or(0);
                 Ok(n)
             })?,
@@ -4232,9 +4226,15 @@ impl PluginHost {
 
     /// Publish a new font size, reusing the same pending channel as
     /// `rterm.set_font_size(N)` so the config watcher can apply
-    /// `font.size` updates without restart. Non-finite values are
-    /// already filtered by the renderer's clamp.
+    /// `font.size` updates without restart. Drops non-finite values
+    /// for symmetry with `set_opacity_override` — the renderer GUARDS
+    /// (early-returns) rather than clamps a NaN, so a bogus value here
+    /// would just be a silent no-op there; rejecting it at the source
+    /// keeps the pending slot honest for any future consumer.
     pub fn set_font_size_override(&self, size: f32) {
+        if !size.is_finite() {
+            return;
+        }
         if let Ok(mut g) = self.pending_font_size.lock() {
             *g = Some(size);
         }

@@ -193,6 +193,15 @@ impl<L> Tree<L> {
             }
             return false;
         }
+        // Refuse a non-leaf target. The doc contract is "close the LEAF
+        // at path"; without this guard, handing an internal-split path
+        // would silently delete every leaf in that subtree (the
+        // sibling-hoist below would drop a whole branch). All current
+        // callers pass leaf paths, but the guard makes the invariant
+        // enforced rather than assumed.
+        if !matches!(self.slot_at(path), Some(Tree::Leaf(_))) {
+            return false;
+        }
         let (parent_path, last) = path.split_at(path.len() - 1);
         let close_right = last[0];
         let parent_slot = match self.slot_at_mut(parent_path) {
@@ -361,13 +370,25 @@ fn split_rect(rect: PaneRect, dir: SplitDir, ratio: f32, gap: f32) -> (PaneRect,
     let r = ratio.clamp(0.0, 1.0);
     match dir {
         SplitDir::Horizontal => {
-            let inner = (rect.width - gap).max(1.0);
-            let wa = (inner * r).max(1.0);
-            let wb = (inner - wa).max(1.0);
+            // Partition `inner` EXACTLY between the two children:
+            // `wa + wb == inner`, so `b.left + b.width` always lands on
+            // `rect.left + rect.width`. The old `.max(1.0)` on BOTH
+            // halves summed to more than `inner` for a sub-gap-wide
+            // parent (deep nesting), pushing the b-child past the
+            // parent's right edge into a neighbour. A degenerate
+            // zero-width child is fine — `sync_terminal_size` skips
+            // panes under half a pixel.
+            // Clamp the gap to the parent width too: a parent narrower
+            // than the gap (absurd nesting) would otherwise place the
+            // b-child's left past its own right edge.
+            let g = gap.min(rect.width.max(0.0));
+            let inner = (rect.width - g).max(0.0);
+            let wa = (inner * r).clamp(0.0, inner);
+            let wb = inner - wa;
             (
                 PaneRect { left: rect.left, top: rect.top, width: wa, height: rect.height },
                 PaneRect {
-                    left: rect.left + wa + gap,
+                    left: rect.left + wa + g,
                     top: rect.top,
                     width: wb,
                     height: rect.height,
@@ -375,14 +396,15 @@ fn split_rect(rect: PaneRect, dir: SplitDir, ratio: f32, gap: f32) -> (PaneRect,
             )
         }
         SplitDir::Vertical => {
-            let inner = (rect.height - gap).max(1.0);
-            let ha = (inner * r).max(1.0);
-            let hb = (inner - ha).max(1.0);
+            let g = gap.min(rect.height.max(0.0));
+            let inner = (rect.height - g).max(0.0);
+            let ha = (inner * r).clamp(0.0, inner);
+            let hb = inner - ha;
             (
                 PaneRect { left: rect.left, top: rect.top, width: rect.width, height: ha },
                 PaneRect {
                     left: rect.left,
-                    top: rect.top + ha + gap,
+                    top: rect.top + ha + g,
                     width: rect.width,
                     height: hb,
                 },
@@ -405,6 +427,43 @@ mod tests {
         assert_eq!(t.count_leaves(), 1);
         assert_eq!(t.leaves(), vec![&42]);
         assert_eq!(t.leaf_at(&[]).copied(), Some(42));
+    }
+
+    #[test]
+    fn close_leaf_refuses_non_leaf_path() {
+        // `[false]` addresses the internal split, not a leaf. Closing
+        // it must fail and leave the tree intact rather than deleting
+        // the whole sub-branch.
+        let mut t = Tree::new(1u32);
+        assert!(t.split_leaf(&[], 2, SplitDir::Horizontal, 0.5));
+        assert!(t.split_leaf(&[false], 3, SplitDir::Vertical, 0.5));
+        // Now `[false]` is a Split{1,3}; `[false,false]`=1, etc.
+        assert_eq!(t.count_leaves(), 3);
+        assert!(!t.close_leaf(&[false]), "non-leaf path must be rejected");
+        assert_eq!(t.count_leaves(), 3, "tree unchanged after refusal");
+        // A real leaf path still closes.
+        assert!(t.close_leaf(&[false, false]));
+        assert_eq!(t.count_leaves(), 2);
+    }
+
+    #[test]
+    fn split_rect_children_never_exceed_parent() {
+        // Even at a sub-gap-wide parent the b-child's right edge must
+        // not poke past the parent (which overlapped a neighbour).
+        for w in [1.0_f32, 2.0, 3.0, 4.0, 50.0] {
+            let (a, b) = split_rect(rect(w, 10.0), SplitDir::Horizontal, 0.5, 3.0);
+            let parent_right = w;
+            assert!(
+                b.left + b.width <= parent_right + 0.01,
+                "w={w}: b right {} > parent {parent_right}",
+                b.left + b.width
+            );
+            assert!(a.width >= 0.0 && b.width >= 0.0);
+        }
+        // Vertical mirror.
+        let (a, b) = split_rect(rect(10.0, 2.0), SplitDir::Vertical, 0.5, 3.0);
+        assert!(b.top + b.height <= 2.0 + 0.01);
+        assert!(a.height >= 0.0 && b.height >= 0.0);
     }
 
     #[test]

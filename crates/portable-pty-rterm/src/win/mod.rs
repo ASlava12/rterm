@@ -42,10 +42,15 @@ impl WinChild {
         let proc = self.proc.lock().unwrap().try_clone().unwrap();
         let res = unsafe { TerminateProcess(proc.as_raw_handle() as _, 1) };
         let err = IoError::last_os_error();
+        // `TerminateProcess` returns NONZERO on success, zero on
+        // failure — the upstream check was inverted (reported success
+        // as an error carrying a stale `last_os_error`). `kill()` masks
+        // it with `.ok()` today, but a future caller reading this
+        // result would misread the outcome.
         if res != 0 {
-            Err(err)
-        } else {
             Ok(())
+        } else {
+            Err(err)
         }
     }
 }
@@ -71,10 +76,12 @@ impl ChildKiller for WinChildKiller {
     fn kill(&mut self) -> IoResult<()> {
         let res = unsafe { TerminateProcess(self.proc.as_raw_handle() as _, 1) };
         let err = IoError::last_os_error();
+        // NONZERO = success (see `WinChild::do_kill`); the upstream
+        // check was inverted.
         if res != 0 {
-            Err(err)
-        } else {
             Ok(())
+        } else {
+            Err(err)
         }
     }
 

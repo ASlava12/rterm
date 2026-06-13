@@ -534,8 +534,13 @@ impl BgLayer {
                 let view_top = (total as f32) - p.scroll_offset as f32;
                 let thumb_top = (view_top / view_total).clamp(0.0, 1.0);
                 let thumb_h = (rows / view_total).clamp(0.05, 1.0);
-                let ty = track_y + thumb_top * track_h;
                 let th = (thumb_h * track_h).max(8.0).min(track_h);
+                // `ty` is derived from the un-enlarged proportion, but
+                // `th` was floored at 8 px — so near the bottom of the
+                // track `ty + th` could poke past `track_y + track_h`.
+                // Clamp the top so the whole thumb stays inside the
+                // track.
+                let ty = (track_y + thumb_top * track_h).min(track_y + track_h - th);
                 let thumb_color: [f32; 4] = if scrolled {
                     [0.85, 0.78, 0.42, 0.85]
                 } else {

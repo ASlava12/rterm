@@ -272,6 +272,11 @@ pub struct Terminal {
     /// FIFO order of hyperlink ids inserted into `hyperlinks` so we can
     /// evict the oldest entry when the map outgrows [`HYPERLINK_CAP`].
     hyperlink_order: VecDeque<u32>,
+    /// Running sum of all live hyperlink URI byte lengths, maintained
+    /// incrementally on insert / evict. Recomputing it per OSC 8 (the
+    /// previous approach) was O(N) — quadratic under a flood of unique
+    /// links right up to the cap.
+    hyperlink_bytes_total: usize,
     next_link_id: u32,
     current_hyperlink: u32,
     /// Raw base64 payload of the most recent OSC 52 clipboard-write request.
@@ -729,6 +734,7 @@ impl Terminal {
             hyperlinks: HashMap::new(),
             hyperlink_uri_to_id: HashMap::new(),
             hyperlink_order: VecDeque::new(),
+            hyperlink_bytes_total: 0,
             next_link_id: 1,
             current_hyperlink: 0,
             pending_clipboard: None,
@@ -1640,6 +1646,7 @@ impl Terminal {
             hyperlinks: &mut self.hyperlinks,
             hyperlink_uri_to_id: &mut self.hyperlink_uri_to_id,
             hyperlink_order: &mut self.hyperlink_order,
+            hyperlink_bytes_total: &mut self.hyperlink_bytes_total,
             next_link_id: &mut self.next_link_id,
             current_hyperlink: &mut self.current_hyperlink,
             pending_clipboard: &mut self.pending_clipboard,
@@ -2078,6 +2085,7 @@ impl Terminal {
             hyperlinks: &mut self.hyperlinks,
             hyperlink_uri_to_id: &mut self.hyperlink_uri_to_id,
             hyperlink_order: &mut self.hyperlink_order,
+            hyperlink_bytes_total: &mut self.hyperlink_bytes_total,
             next_link_id: &mut self.next_link_id,
             current_hyperlink: &mut self.current_hyperlink,
             pending_clipboard: &mut self.pending_clipboard,
@@ -2149,6 +2157,7 @@ struct TerminalPerform<'a> {
     hyperlinks: &'a mut HashMap<u32, String>,
     hyperlink_uri_to_id: &'a mut HashMap<String, u32>,
     hyperlink_order: &'a mut VecDeque<u32>,
+    hyperlink_bytes_total: &'a mut usize,
     next_link_id: &'a mut u32,
     current_hyperlink: &'a mut u32,
     pending_clipboard: &'a mut Option<String>,
@@ -2671,6 +2680,32 @@ impl<'a> TerminalPerform<'a> {
         let max_col = size.cols.saturating_sub(1) as i32;
         self.cursor.row = row.clamp(0, max_row) as u16;
         self.cursor.col = col.clamp(0, max_col) as u16;
+    }
+
+    /// Vertical cursor motion (CUU / CUD) that honours the scroll
+    /// region. Per DEC VT spec: when the cursor starts inside the
+    /// region, it stops at the region's top / bottom margin; when it
+    /// starts outside, it clamps to the screen edge. `delta` is signed
+    /// (negative = up). The column is unchanged.
+    fn move_cursor_vertical_in_region(&mut self, delta: i32) {
+        let size = self.size();
+        let max_row = size.rows.saturating_sub(1) as i32;
+        let cur = self.cursor.row as i32;
+        let top = self.region.top as i32;
+        let bottom = self.region.bottom as i32;
+        let target = cur + delta;
+        let clamped = if delta < 0 {
+            // Up: floor at the region top only if we started at or
+            // below it; otherwise floor at the screen top.
+            let floor = if cur >= top { top } else { 0 };
+            target.max(floor)
+        } else {
+            // Down: ceil at the region bottom only if we started at or
+            // above it; otherwise ceil at the screen bottom.
+            let ceil = if cur <= bottom { bottom } else { max_row };
+            target.min(ceil)
+        };
+        self.cursor.row = clamped.clamp(0, max_row) as u16;
     }
 
     fn erase_range(&mut self, start: Position, end: Position) {
@@ -3969,7 +4004,14 @@ impl<'a> Perform for TerminalPerform<'a> {
             //   ;B, ;C are accepted silently for now
             "133" if params.len() >= 2 => {
                 match params[1] {
-                    b"A" => {
+                    // Marks are absolute logical lines = `scrollback.len()
+                    // + cursor.row`, which only makes sense on the
+                    // PRIMARY screen. The alt screen has no scrollback;
+                    // recording there mixes the primary ring length with
+                    // an alt cursor row, producing a bogus line that
+                    // "jump to prompt" would land on. Skip mark capture
+                    // on alt (shell integration fires on primary anyway).
+                    b"A" if *self.active != ALT => {
                         let line = self.scrollback.len() + self.cursor.row as usize;
                         if self.prompt_marks.back().copied() != Some(line) {
                             if self.prompt_marks.len() >= PROMPT_MARKS_CAP {
@@ -3979,12 +4021,14 @@ impl<'a> Perform for TerminalPerform<'a> {
                         }
                     }
                     b"C" => {
-                        let line = self.scrollback.len() + self.cursor.row as usize;
-                        if self.command_marks.back().copied() != Some(line) {
-                            if self.command_marks.len() >= PROMPT_MARKS_CAP {
-                                self.command_marks.pop_front();
+                        if *self.active != ALT {
+                            let line = self.scrollback.len() + self.cursor.row as usize;
+                            if self.command_marks.back().copied() != Some(line) {
+                                if self.command_marks.len() >= PROMPT_MARKS_CAP {
+                                    self.command_marks.pop_front();
+                                }
+                                self.command_marks.push_back(line);
                             }
-                            self.command_marks.push_back(line);
                         }
                         // Stamp command-start time so the next `;D` can
                         // report the elapsed run duration.
@@ -4023,7 +4067,10 @@ impl<'a> Perform for TerminalPerform<'a> {
             // working directory.
             "633" if params.len() >= 2 => {
                 match params[1] {
-                    b"A" => {
+                    // Same primary-screen-only rule as OSC 133 above —
+                    // marks are absolute logical lines tied to the
+                    // primary scrollback.
+                    b"A" if *self.active != ALT => {
                         let line = self.scrollback.len() + self.cursor.row as usize;
                         if self.prompt_marks.back().copied() != Some(line) {
                             if self.prompt_marks.len() >= PROMPT_MARKS_CAP {
@@ -4033,12 +4080,14 @@ impl<'a> Perform for TerminalPerform<'a> {
                         }
                     }
                     b"C" => {
-                        let line = self.scrollback.len() + self.cursor.row as usize;
-                        if self.command_marks.back().copied() != Some(line) {
-                            if self.command_marks.len() >= PROMPT_MARKS_CAP {
-                                self.command_marks.pop_front();
+                        if *self.active != ALT {
+                            let line = self.scrollback.len() + self.cursor.row as usize;
+                            if self.command_marks.back().copied() != Some(line) {
+                                if self.command_marks.len() >= PROMPT_MARKS_CAP {
+                                    self.command_marks.pop_front();
+                                }
+                                self.command_marks.push_back(line);
                             }
-                            self.command_marks.push_back(line);
                         }
                         *self.last_command_start = Some(std::time::Instant::now());
                     }
@@ -4281,20 +4330,20 @@ impl<'a> Perform for TerminalPerform<'a> {
                     // byte total — eviction loops drop the oldest URI
                     // until each cap is satisfied. Cells referring to
                     // evicted ids degrade to "no link" rather than a
-                    // stale URI. `bytes_used` is incrementally tracked
-                    // via the inverted index sums; recomputing the sum
-                    // every dispatch was O(N).
-                    let mut bytes_used: usize =
-                        self.hyperlink_uri_to_id.keys().map(String::len).sum();
+                    // stale URI. `*self.hyperlink_bytes_total` is the
+                    // running sum maintained incrementally here — no
+                    // per-dispatch O(N) recompute.
                     while self.hyperlinks.len() >= HYPERLINK_CAP
-                        || bytes_used + new_len > HYPERLINK_TOTAL_BYTES_CAP
+                        || *self.hyperlink_bytes_total + new_len > HYPERLINK_TOTAL_BYTES_CAP
                     {
                         let Some(old) = self.hyperlink_order.pop_front() else { break };
                         if let Some(removed) = self.hyperlinks.remove(&old) {
+                            *self.hyperlink_bytes_total =
+                                self.hyperlink_bytes_total.saturating_sub(removed.len());
                             self.hyperlink_uri_to_id.remove(&removed);
-                            bytes_used = bytes_used.saturating_sub(removed.len());
                         }
                     }
+                    *self.hyperlink_bytes_total += new_len;
                     self.hyperlink_uri_to_id.insert(uri.clone(), id);
                     self.hyperlinks.insert(id, uri);
                     self.hyperlink_order.push_back(id);
@@ -4513,11 +4562,11 @@ impl<'a> Perform for TerminalPerform<'a> {
         match c {
             'A' => {
                 let n = first_param_or(params, 1) as i32;
-                self.move_cursor_clamped(self.cursor.row as i32 - n, self.cursor.col as i32);
+                self.move_cursor_vertical_in_region(-n);
             }
             'B' | 'e' => {
                 let n = first_param_or(params, 1) as i32;
-                self.move_cursor_clamped(self.cursor.row as i32 + n, self.cursor.col as i32);
+                self.move_cursor_vertical_in_region(n);
             }
             'C' | 'a' => {
                 let n = first_param_or(params, 1) as i32;
@@ -4822,6 +4871,7 @@ impl<'a> Perform for TerminalPerform<'a> {
                 self.hyperlinks.clear();
                 self.hyperlink_uri_to_id.clear();
                 self.hyperlink_order.clear();
+                *self.hyperlink_bytes_total = 0;
                 *self.charset_g0 = Charset::Ascii;
                 *self.charset_g1 = Charset::Ascii;
                 *self.active_charset = 0;
@@ -5122,6 +5172,56 @@ mod tests {
         t.advance(b"\x1b[4HZZ\r\nYY");
         assert_eq!(row_text(&t, 0), "AB");
         assert_eq!(row_text(&t, 1), "CD");
+    }
+
+    #[test]
+    fn osc133_marks_skipped_on_alt_screen() {
+        // A prompt mark recorded on the primary screen is fine; one
+        // emitted on the alt screen would mix the primary scrollback
+        // length with an alt cursor row → a bogus line. Verify alt
+        // emission is ignored and primary still works.
+        let mut t = term(4, 4);
+        t.advance(b"\x1b]133;A\x07");
+        let primary_marks = t.prompt_marks().len();
+        assert_eq!(primary_marks, 1, "primary-screen mark recorded");
+        // Enter alt screen (DECSET ?1049) and emit another ;A.
+        t.advance(b"\x1b[?1049h");
+        assert!(t.is_on_alt_screen());
+        t.advance(b"\x1b]133;A\x07");
+        assert_eq!(
+            t.prompt_marks().len(),
+            primary_marks,
+            "alt-screen OSC 133;A must not add a mark"
+        );
+    }
+
+    #[test]
+    fn cuu_cud_respect_scroll_region_margins() {
+        // Region rows 2..=4 (1-based DECSTBM `2;4r` → 0-based top=1,
+        // bottom=3) on a 6-row screen. Per DEC spec, CUU from inside
+        // the region stops at the top margin, CUD at the bottom margin
+        // — not the screen edge.
+        let mut t = term(2, 6);
+        t.advance(b"\x1b[2;4r");
+        // Cursor to region middle (row 3, 1-based) then CUU 10 — must
+        // floor at the region top (row 2 1-based = row index 1).
+        t.advance(b"\x1b[3;1H");
+        t.advance(b"\x1b[10A");
+        assert_eq!(t.cursor().row, 1, "CUU floored at region top");
+        // CUD 10 from the top margin — must ceil at the region bottom
+        // (row 4 1-based = row index 3).
+        t.advance(b"\x1b[10B");
+        assert_eq!(t.cursor().row, 3, "CUD ceiled at region bottom");
+        // A cursor ABOVE the region (row 1) clamps to the screen top,
+        // not the region top — CUU can't push below 0 regardless.
+        t.advance(b"\x1b[1;1H");
+        t.advance(b"\x1b[5A");
+        assert_eq!(t.cursor().row, 0, "CUU above region clamps to screen top");
+        // A cursor BELOW the region (row 6) moving down clamps to the
+        // screen bottom (row index 5), not the region bottom.
+        t.advance(b"\x1b[6;1H");
+        t.advance(b"\x1b[5B");
+        assert_eq!(t.cursor().row, 5, "CUD below region clamps to screen bottom");
     }
 
     #[test]

@@ -200,6 +200,7 @@ fn build_spans(
     selection: Option<&NormSelection>,
 ) -> Vec<(String, StyleKey)> {
     let rows = terminal.size().rows;
+    let cols = terminal.size().cols;
     let reverse_screen = terminal.is_reverse_screen();
     let blink_state = blink_on || !terminal.cursor_should_blink();
     let cursor_active = focused
@@ -208,6 +209,13 @@ fn build_spans(
         && blink_state
         && matches!(terminal.cursor_shape(), rterm_core::CursorShape::Block);
     let cursor = terminal.cursor();
+    // Clamp the cursor column the SAME way the bg-quad pass does
+    // (`cursor.col.min(cols-1)`). After printing into the last column
+    // with autowrap pending, `cursor.col == cols` (one past the grid);
+    // the bg pass paints the block on the last cell, but an unclamped
+    // `== c` test here matched no cell, leaving that glyph un-inverted
+    // (invisible against the block). Clamping inverts the right cell.
+    let cursor_col = (cursor.col).min(cols.saturating_sub(1));
     let mut spans: Vec<(String, StyleKey)> = Vec::with_capacity(rows as usize);
     for r in 0..rows {
         let Some(row) = terminal.visible_row(offset, r) else { continue };
@@ -220,7 +228,7 @@ fn build_spans(
                 continue;
             }
             let is_cursor =
-                cursor_active && cursor.row == r && cursor.col as usize == c;
+                cursor_active && cursor.row == r && cursor_col as usize == c;
             let is_selected = selection
                 .map(|s| s.contains(r, c as u16))
                 .unwrap_or(false);
@@ -1756,12 +1764,16 @@ impl GpuState {
             alpha_modes = ?caps.alpha_modes,
             "surface capabilities",
         );
-        let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| f.is_srgb())
-            .unwrap_or(caps.formats[0]);
+        // Prefer an sRGB format; fall back to the first advertised one.
+        // `caps.formats[0]` would panic on the (pathological) empty
+        // list, so go through `first()` with a clear error instead.
+        let format = match caps.formats.iter().copied().find(|f| f.is_srgb()) {
+            Some(f) => f,
+            None => *caps
+                .formats
+                .first()
+                .ok_or_else(|| anyhow!("surface advertises no texture formats"))?,
+        };
         // Pick an alpha-supporting composite mode when the user wants
         // transparency; otherwise stick with the platform default.
         let alpha_mode = pick_alpha_mode(opacity, &caps.alpha_modes);
@@ -2049,6 +2061,16 @@ impl GpuState {
             };
             let grid_rows = p.terminal.size().rows as i64;
             for pl in placements {
+                // Keep the texture (and any `failed` marker) cached for
+                // EVERY placement that still exists, not just the ones
+                // currently on screen. Registering the key before the
+                // viewport cull means scrolling an image one row out of
+                // view no longer frees its GPU texture and forces a
+                // full re-decode (tens of ms) when it scrolls back —
+                // and a permanently-corrupt payload isn't re-decoded
+                // every time it re-enters view.
+                let key = (p.pane_uid, pl.image_id);
+                live_keys.insert(key);
                 // Project absolute row into the viewport.
                 let viewport_row =
                     pl.abs_row + p.scroll_offset as i64 - sb_len as i64;
@@ -2063,8 +2085,6 @@ impl GpuState {
                     p.rect.top + viewport_row as f32 * line_h,
                 ];
                 let size = [pl.cols as f32 * cell_w, pl.rows as f32 * line_h];
-                let key = (p.pane_uid, pl.image_id);
-                live_keys.insert(key);
                 // One-shot trace per image so we can verify
                 // projection math (abs_row → viewport_row, then
                 // → pixel coords) is sane without spamming a
@@ -7607,7 +7627,7 @@ impl App {
             ScrollNav::Home => max,
             ScrollNav::End => 0,
         };
-        pane.scroll_offset.store(next as u16, Ordering::Relaxed);
+        pane.scroll_offset.store(clamp_scroll_offset(next as i64), Ordering::Relaxed);
     }
 
     fn open_palette(&mut self) {
@@ -9206,7 +9226,7 @@ impl App {
         let mut offset = (sb_len as i64) - (line_idx as i64) + target_r;
         offset = offset.clamp(0, sb_len as i64);
         drop(term);
-        pane.scroll_offset.store(offset as u16, Ordering::Relaxed);
+        pane.scroll_offset.store(clamp_scroll_offset(offset), Ordering::Relaxed);
     }
 
     fn search_step(&mut self, delta: isize) {
@@ -9394,7 +9414,7 @@ impl App {
         }
         let cur = pane.scroll_offset.load(Ordering::Relaxed) as i32;
         let next = (cur + step).clamp(0, max_offset);
-        pane.scroll_offset.store(next as u16, Ordering::Relaxed);
+        pane.scroll_offset.store(clamp_scroll_offset(next as i64), Ordering::Relaxed);
         self.events.emit("scroll", &next.to_string());
     }
 
@@ -10539,6 +10559,18 @@ fn half_page_rows(page: i32) -> i32 {
     }
 }
 
+/// Saturate a computed scrollback offset into the `u16` the per-pane
+/// `scroll_offset` atomic holds. Scrollback can exceed 65 535 lines
+/// (the limit is plugin-settable up to 1M), so a bare `as u16` would
+/// WRAP — flinging the viewport to a wrong, far-off line and making
+/// search-jump land on unrelated content. Clamping pins it at the
+/// representable maximum instead. (The tail past 65 535 stays
+/// unreachable until the atomic is widened — a separate, larger
+/// change; this only kills the wrap bug.)
+fn clamp_scroll_offset(value: i64) -> u16 {
+    value.clamp(0, u16::MAX as i64) as u16
+}
+
 /// Format the payload for the OSC 9;4 `progress` event:
 /// `<tab+1>:<pane+1>\t<state>\t<percent>`. State 0 means "clear"
 /// (percent ignored). Kept here so a future schema extension
@@ -11328,7 +11360,7 @@ impl ApplicationHandler<UserEvent> for App {
                             // dir=-1 means cursor above top → scroll INTO history (offset++).
                             // dir=+1 means cursor below bottom → scroll toward live (offset--).
                             let next = (cur - dir).clamp(0, max_off);
-                            pane.scroll_offset.store(next as u16, Ordering::Relaxed);
+                            pane.scroll_offset.store(clamp_scroll_offset(next as i64), Ordering::Relaxed);
                             let edge_sp = if dir < 0 {
                                 SelectionPoint { row: 0, col: 0 }
                             } else {
@@ -12066,7 +12098,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     .unwrap_or(0);
                                 let cur = pane.scroll_offset.load(Ordering::Relaxed) as i32;
                                 let next = cur.saturating_add(delta).clamp(0, max_off);
-                                pane.scroll_offset.store(next as u16, Ordering::Relaxed);
+                                pane.scroll_offset.store(clamp_scroll_offset(next as i64), Ordering::Relaxed);
                                 self.events.emit("scroll", &next.to_string());
                             }
                         }
@@ -14675,6 +14707,18 @@ mod tests {
         assert!(alpha_mode_is_transparent(PreMultiplied));
         // Full opacity → platform default (first), never overridden.
         assert_eq!(pick_alpha_mode(1.0, &[Opaque, PreMultiplied]), Opaque);
+    }
+
+    #[test]
+    fn clamp_scroll_offset_saturates_past_u16() {
+        // Scrollback can exceed 65 535 lines; a bare `as u16` wrapped
+        // (100_000 → 34_464), flinging the viewport to a wrong line.
+        assert_eq!(clamp_scroll_offset(0), 0);
+        assert_eq!(clamp_scroll_offset(500), 500);
+        assert_eq!(clamp_scroll_offset(u16::MAX as i64), u16::MAX);
+        assert_eq!(clamp_scroll_offset(100_000), u16::MAX);
+        // Negatives (shouldn't occur, but the math is signed) clamp to 0.
+        assert_eq!(clamp_scroll_offset(-5), 0);
     }
 
     #[test]
