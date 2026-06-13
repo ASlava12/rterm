@@ -187,6 +187,16 @@ pub trait EventSink: Send + Sync {
     }
     /// Update plugin-visible terminal state snapshot (cwd, title, size).
     fn set_terminal_state(&self, _snap: TerminalSnapshot) {}
+    /// Whether anything actually consumes the per-frame terminal state
+    /// snapshot. The renderer builds the snapshot's expensive parts
+    /// (every pane's full visible-grid text + scrollback tail) each
+    /// frame; when no plugin handler / action / match rule is
+    /// registered, nothing reads them and the string-building is pure
+    /// waste. Default `true` preserves behavior for any sink that
+    /// doesn't override it.
+    fn wants_terminal_state(&self) -> bool {
+        true
+    }
     /// `(rule_name, capture_groups)` for every rule that fired against
     /// `line`. For substring rules the capture list is empty; for regex
     /// rules it's the numbered groups (1..) of the first regex match. The

@@ -12282,6 +12282,13 @@ impl ApplicationHandler<UserEvent> for App {
                 // Push a fresh terminal snapshot to plugins (so `rterm.cwd()`
                 // etc. return current values).
                 let mut all_panes: Vec<PaneSnapshotInfo> = Vec::new();
+                // Whether anything reads the snapshot's text fields this
+                // frame. When no plugin is loaded, skip the per-pane
+                // grid + scrollback string building (the expensive part)
+                // — the cheap metadata and side effects (foreground-
+                // process caching for tab titles, silence events) still
+                // run unconditionally.
+                let want_text = self.events.wants_terminal_state();
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
@@ -12507,19 +12514,20 @@ impl ApplicationHandler<UserEvent> for App {
                         // earlier scope tightly typed. Skipping the lock
                         // on contention is fine because the renderer
                         // re-snapshots every frame.
-                        let pane_text = pane
-                            .terminal
-                            .lock()
-                            .ok()
-                            .map(|t| grid_text_snapshot(&t))
-                            .unwrap_or_default();
+                        let pane_text = if want_text {
+                            pane.terminal
+                                .lock()
+                                .ok()
+                                .map(|t| grid_text_snapshot(&t))
+                                .unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
                         // Per-pane scrollback tail (capped). Skipped on
                         // alt screen — the ring belongs to the suspended
                         // primary screen and surfacing it would mix in
                         // stale content the user isn't looking at.
-                        let pane_tail = if alt {
-                            String::new()
-                        } else {
+                        let pane_tail = if want_text && !alt {
                             pane.terminal
                                 .lock()
                                 .ok()
@@ -12527,6 +12535,8 @@ impl ApplicationHandler<UserEvent> for App {
                                     scrollback_text_snapshot_capped(&t, SCROLLBACK_TAIL_MAX)
                                 })
                                 .unwrap_or_default()
+                        } else {
+                            String::new()
                         };
                         all_panes.push(PaneSnapshotInfo {
                             tab: tab_idx,
@@ -12707,7 +12717,11 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(pane) = self.focused_pane() {
                     let snap = if let Ok(t) = pane.terminal.lock() {
                         let rows = t.size().rows;
-                        let text = grid_text_snapshot(&t);
+                        let text = if want_text {
+                            grid_text_snapshot(&t)
+                        } else {
+                            String::new()
+                        };
                         // Logical points — the same unit plugins pass to
                         // `rterm.set_font_size`. The TextLayer's value is
                         // physical (scale-multiplied) and would read 2×
@@ -12740,10 +12754,10 @@ impl ApplicationHandler<UserEvent> for App {
                         // belongs to the suspended primary screen and
                         // exposing it would surface stale content
                         // unrelated to what the user is looking at.
-                        let scrollback_text = if t.is_on_alt_screen() {
-                            String::new()
-                        } else {
+                        let scrollback_text = if want_text && !t.is_on_alt_screen() {
                             scrollback_text_snapshot(&t)
+                        } else {
+                            String::new()
                         };
                         drop(t);
                         let selection_text = self.selection_text();

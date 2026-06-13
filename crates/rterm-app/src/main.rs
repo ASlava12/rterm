@@ -635,6 +635,13 @@ impl EventSink for PluginBridge {
         self.0.lock().ok().and_then(|h| h.take_pending_slow_command_ms())
     }
 
+    fn wants_terminal_state(&self) -> bool {
+        // Skip the renderer's expensive per-frame snapshot when no
+        // plugin could read it. Poisoned lock → keep feeding (fail
+        // safe), matching `has_state_consumers`'s own policy.
+        self.0.lock().map(|h| h.has_state_consumers()).unwrap_or(true)
+    }
+
     fn set_terminal_state(&self, snap: rterm_render::TerminalSnapshot) {
         if let Ok(host) = self.0.lock() {
             let panes = snap

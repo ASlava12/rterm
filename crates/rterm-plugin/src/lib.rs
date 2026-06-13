@@ -4016,6 +4016,20 @@ impl PluginHost {
             .unwrap_or_default()
     }
 
+    /// True when any plugin code could observe terminal state — i.e.
+    /// there's at least one event handler, palette action, or output
+    /// match rule registered. The App uses this to skip building the
+    /// expensive per-frame state snapshot (full grid + scrollback
+    /// text) when no plugin is loaded. A poisoned lock counts as
+    /// "active" (fail safe — keep feeding state) rather than silently
+    /// starving a live plugin.
+    pub fn has_state_consumers(&self) -> bool {
+        let handlers = self.handlers.lock().map(|m| !m.is_empty()).unwrap_or(true);
+        let actions = self.actions.lock().map(|m| !m.is_empty()).unwrap_or(true);
+        let rules = self.match_rules.lock().map(|r| !r.is_empty()).unwrap_or(true);
+        handlers || actions || rules
+    }
+
     /// Take the latest `rterm.bell()` request (clears it).
     pub fn take_pending_bell(&self) -> bool {
         self.pending_bell
@@ -4611,6 +4625,37 @@ mod tests {
             .exec()
             .unwrap();
         assert_eq!(host.drain_pending_routed_input().len(), 1);
+    }
+
+    #[test]
+    fn has_state_consumers_tracks_registrations() {
+        // Drives the renderer's snapshot-skip optimization: a fresh
+        // host with no user Lua loaded has no consumers, so the App
+        // can skip building per-frame grid/scrollback text.
+        let host = PluginHost::new().expect("host inits");
+        assert!(!host.has_state_consumers(), "empty host has no consumers");
+        // A single event handler flips it on.
+        host.lua
+            .load(r#"rterm.on("bell", function() end)"#)
+            .exec()
+            .unwrap();
+        assert!(host.has_state_consumers(), "a handler is a consumer");
+        // A hot-reload reset clears it back to idle.
+        host.reset_handlers();
+        assert!(!host.has_state_consumers(), "reset returns to idle");
+        // A palette action alone also counts.
+        host.lua
+            .load(r#"rterm.register_action("a", function() end)"#)
+            .exec()
+            .unwrap();
+        assert!(host.has_state_consumers(), "an action is a consumer");
+        host.reset_handlers();
+        // As does a lone match rule.
+        host.lua
+            .load(r#"rterm.add_match("m", "x")"#)
+            .exec()
+            .unwrap();
+        assert!(host.has_state_consumers(), "a match rule is a consumer");
     }
 
     #[test]
