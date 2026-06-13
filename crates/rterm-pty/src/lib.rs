@@ -4,24 +4,47 @@
 
 use std::io::Write;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 
 use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use rterm_core::Size;
 
 type SharedMaster = Arc<Mutex<Box<dyn MasterPty + Send>>>;
-type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 /// Shared, waitable handle to the spawned child. Cloned out via
 /// [`Pty::child_handle`] so an exit-watcher thread can `try_wait` it
 /// independently of the owning `Pty` (needed on Windows, where ConPTY
 /// often never EOFs the master reader when the shell exits).
 pub type SharedChild = Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>;
 
+/// Upper bound on bytes accepted by [`PtyControl::write_input`] but not
+/// yet written into the kernel PTY buffer by the writer thread. The
+/// kernel side is only ~4–64 KiB; if the foreground child stops reading
+/// stdin (Ctrl-S flow control, SIGSTOP, a non-interactive job), a large
+/// paste would otherwise queue without limit. Past this cap writes are
+/// rejected with `WouldBlock` and the caller drops the bytes with a
+/// warning — bounded memory, never a frozen UI.
+const WRITE_PENDING_CAP: usize = 2 * 1024 * 1024;
+
+/// Decide whether a write of `len` bytes fits the writer-thread budget,
+/// reserving the bytes when it does. Pure helper so the accounting is
+/// unit-testable: reserves via `fetch_add` and rolls back on rejection,
+/// which keeps concurrent callers correct (worst case both roll back).
+fn budget_admit(pending: &AtomicUsize, len: usize, cap: usize) -> bool {
+    let prev = pending.fetch_add(len, Ordering::AcqRel);
+    if prev.saturating_add(len) > cap {
+        pending.fetch_sub(len, Ordering::AcqRel);
+        return false;
+    }
+    true
+}
+
 pub struct Pty {
     master: SharedMaster,
     child: SharedChild,
-    writer: SharedWriter,
+    write_tx: mpsc::Sender<Vec<u8>>,
+    write_pending: Arc<AtomicUsize>,
     pid: Option<u32>,
 }
 
@@ -29,7 +52,8 @@ pub struct Pty {
 #[derive(Clone)]
 pub struct PtyControl {
     master: SharedMaster,
-    writer: SharedWriter,
+    write_tx: mpsc::Sender<Vec<u8>>,
+    write_pending: Arc<AtomicUsize>,
     pid: Option<u32>,
 }
 
@@ -86,15 +110,48 @@ impl Pty {
 
         let child = pair.slave.spawn_command(cmd).context("spawn_command failed")?;
         let pid = child.process_id();
-        let writer = pair.master.take_writer().context("take writer")?;
+        let mut writer = pair.master.take_writer().context("take writer")?;
 
         // Drop the slave so reads on master receive EOF when the child exits.
         drop(pair.slave);
 
+        // Dedicated writer thread. PTY writes block once the kernel
+        // input queue fills (~4 KiB on Linux) and the child stops
+        // reading — doing `write_all` inline used to park the CALLER
+        // (the UI event loop) until the child drained. The thread owns
+        // the writer; callers enqueue through a channel bounded by
+        // `WRITE_PENDING_CAP` and never block. The thread exits when
+        // every sender is gone (Pty + all PtyControl clones dropped)
+        // or on the first write error (child side closed), and the
+        // writer Box — whose Unix `Drop` injects `\n`+VEOF into the
+        // PTY — is dropped HERE, off the UI thread.
+        let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>();
+        let write_pending = Arc::new(AtomicUsize::new(0));
+        {
+            let pending = Arc::clone(&write_pending);
+            std::thread::Builder::new()
+                .name("rterm-pty-writer".to_string())
+                .spawn(move || {
+                    for chunk in write_rx {
+                        let res = writer.write_all(&chunk).and_then(|_| writer.flush());
+                        pending.fetch_sub(chunk.len(), Ordering::AcqRel);
+                        if let Err(e) = res {
+                            tracing::debug!("pty writer thread exiting: {e}");
+                            // Dropping the receiver makes every later
+                            // `write_input` fail fast with BrokenPipe
+                            // instead of queueing into the void.
+                            break;
+                        }
+                    }
+                })
+                .context("spawn pty writer thread")?;
+        }
+
         Ok(Self {
             master: Arc::new(Mutex::new(pair.master)),
             child: Arc::new(Mutex::new(child)),
-            writer: Arc::new(Mutex::new(writer)),
+            write_tx,
+            write_pending,
             pid,
         })
     }
@@ -102,7 +159,8 @@ impl Pty {
     pub fn control(&self) -> PtyControl {
         PtyControl {
             master: Arc::clone(&self.master),
-            writer: Arc::clone(&self.writer),
+            write_tx: self.write_tx.clone(),
+            write_pending: Arc::clone(&self.write_pending),
             pid: self.pid,
         }
     }
@@ -114,21 +172,24 @@ impl Pty {
     }
 
     pub fn try_clone_reader(&self) -> Result<Box<dyn std::io::Read + Send>> {
-        // Use the same `expect("...poisoned")` label as `write_input` /
-        // `resize` for consistent panic messages — caller is the App's
-        // pane-spawn path, where a poisoned master mutex means the PTY
-        // is unusable anyway.
-        let master = self.master.lock().expect("pty master mutex poisoned");
+        // Poisoned lock → take the inner value anyway. The master is
+        // plain fd plumbing; a panic elsewhere doesn't invalidate it,
+        // and panicking HERE would cascade one pane's bug into killing
+        // the whole app (the caller is the UI thread).
+        let master = self
+            .master
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         master.try_clone_reader().context("clone reader")
     }
 
     pub fn try_wait(&mut self) -> Result<Option<portable_pty::ExitStatus>> {
-        let mut child = self.child.lock().expect("pty child mutex poisoned");
+        let mut child = self.child.lock().unwrap_or_else(|e| e.into_inner());
         Ok(child.try_wait()?)
     }
 
     pub fn kill(&mut self) -> Result<()> {
-        let mut child = self.child.lock().expect("pty child mutex poisoned");
+        let mut child = self.child.lock().unwrap_or_else(|e| e.into_inner());
         child.kill().context("pty kill")
     }
 
@@ -141,6 +202,42 @@ impl Pty {
     }
 }
 
+impl Drop for Pty {
+    /// Closing a pane must terminate the program running in it. Dropping
+    /// the fds alone is NOT enough: the reader thread holds a dup of the
+    /// master, so the kernel never closes the PTY and never delivers the
+    /// session SIGHUP — a raw-mode child (vim, htop, `yes`) kept running
+    /// invisibly, its reader thread parsing output into an orphaned
+    /// Terminal forever. The vendored `ChildKiller` escalates SIGHUP →
+    /// ~200 ms grace → SIGKILL, which can block, so the kill runs on a
+    /// short-lived detached thread instead of the UI thread.
+    fn drop(&mut self) {
+        let child = Arc::clone(&self.child);
+        let spawned = std::thread::Builder::new()
+            .name("rterm-pty-kill".to_string())
+            .spawn(move || {
+                let mut c = child.lock().unwrap_or_else(|e| e.into_inner());
+                // Already exited and reaped (normal shell exit, smoke's
+                // explicit kill)? Then DON'T signal: the pid may have
+                // been recycled by an unrelated process.
+                if matches!(c.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+                if let Err(e) = c.kill() {
+                    tracing::debug!("pty kill on drop: {e}");
+                }
+            });
+        if spawned.is_err() {
+            // Thread spawn failed (fd/thread exhaustion) — better a
+            // possibly-blocking inline kill than an orphaned child.
+            let mut c = self.child.lock().unwrap_or_else(|e| e.into_inner());
+            if !matches!(c.try_wait(), Ok(Some(_))) {
+                let _ = c.kill();
+            }
+        }
+    }
+}
+
 impl PtyControl {
     /// Same value as `Pty::process_id`. Cached at spawn so the control
     /// handle stays cheap to use across threads.
@@ -148,14 +245,37 @@ impl PtyControl {
         self.pid
     }
 
+    /// Queue `bytes` for the writer thread. Never blocks: when the
+    /// pending backlog exceeds [`WRITE_PENDING_CAP`] (the child stopped
+    /// reading stdin and a large paste piled up), returns `WouldBlock`
+    /// and the caller drops the payload with a warning. A direct
+    /// `write_all` here used to park the UI thread until the child
+    /// drained the kernel PTY buffer.
     pub fn write_input(&self, bytes: &[u8]) -> std::io::Result<()> {
-        let mut w = self.writer.lock().expect("pty writer mutex poisoned");
-        w.write_all(bytes)?;
-        w.flush()
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if !budget_admit(&self.write_pending, bytes.len(), WRITE_PENDING_CAP) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "pty write backlog full (child not reading stdin) — dropping input",
+            ));
+        }
+        if self.write_tx.send(bytes.to_vec()).is_err() {
+            // Writer thread exited (child side closed). Roll the
+            // reservation back so the counter stays truthful.
+            self.write_pending
+                .fetch_sub(bytes.len(), Ordering::AcqRel);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "pty writer thread gone",
+            ));
+        }
+        Ok(())
     }
 
     pub fn resize(&self, size: Size) -> Result<()> {
-        let master = self.master.lock().expect("pty master mutex poisoned");
+        let master = self.master.lock().unwrap_or_else(|e| e.into_inner());
         master
             .resize(PtySize {
                 cols: size.cols.max(1),
@@ -227,6 +347,59 @@ fn default_env() -> Vec<(&'static str, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn budget_admit_reserves_and_rolls_back() {
+        let pending = AtomicUsize::new(0);
+        // Fits: reserved.
+        assert!(budget_admit(&pending, 100, 1024));
+        assert_eq!(pending.load(Ordering::Acquire), 100);
+        // Exactly at the cap still fits.
+        assert!(budget_admit(&pending, 924, 1024));
+        assert_eq!(pending.load(Ordering::Acquire), 1024);
+        // Over the cap: rejected AND rolled back (counter unchanged).
+        assert!(!budget_admit(&pending, 1, 1024));
+        assert_eq!(pending.load(Ordering::Acquire), 1024);
+        // Oversized single write against an empty budget: rejected,
+        // counter returns to zero (no saturation residue).
+        let fresh = AtomicUsize::new(0);
+        assert!(!budget_admit(&fresh, usize::MAX, 1024));
+        assert_eq!(fresh.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dropping_pty_kills_a_child_that_ignores_eof() {
+        // Regression for the pane-close leak: `sleep` never reads
+        // stdin, so the legacy "\n + VEOF on writer drop" shutdown
+        // does nothing — only the explicit kill-on-drop terminates it.
+        let pty = Pty::spawn(
+            "/bin/sh",
+            &["-c".to_string(), "exec sleep 300".to_string()],
+            Size { cols: 80, rows: 24 },
+            None,
+        )
+        .expect("spawn sleep");
+        let child = pty.child_handle();
+        drop(pty);
+        // The kill escalates SIGHUP → ~200 ms grace → SIGKILL on a
+        // detached thread; poll try_wait (which also reaps) until the
+        // child is gone, with a generous CI-safe deadline.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let mut c = child.lock().unwrap_or_else(|e| e.into_inner());
+                if matches!(c.try_wait(), Ok(Some(_))) {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child still alive 5 s after Pty drop"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
 
     #[test]
     fn read_proc_comm_returns_some_for_self_on_linux() {
