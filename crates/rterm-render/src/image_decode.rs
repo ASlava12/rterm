@@ -86,15 +86,42 @@ pub fn decode(image: &Image) -> Option<DecodedImage> {
             })
         }
         ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Gif => {
-            // `image::load_from_memory` auto-detects the format
-            // from the magic bytes, so we don't need to dispatch
-            // by `image.format`. The redundant tag is still
-            // useful for the renderer-side cache (e.g. to gate
-            // on enabled formats), but here we just decode.
-            let dyn_img = match image::load_from_memory(&image.data) {
+            // Decode through `ImageReader` with explicit limits — a
+            // decompression bomb (a few-KB PNG declaring 50000×50000)
+            // would otherwise make the decoder allocate w*h*4 bytes
+            // on the CPU before we ever see the dimensions. 8192² at
+            // RGBA8 is exactly the 256 MiB alloc ceiling, and larger
+            // textures wouldn't fit common GPU limits anyway (the
+            // upload path re-checks the actual device maximum).
+            const MAX_DECODE_DIM: u32 = 8192;
+            const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
+            let mut limits = image::Limits::default();
+            limits.max_image_width = Some(MAX_DECODE_DIM);
+            limits.max_image_height = Some(MAX_DECODE_DIM);
+            limits.max_alloc = Some(MAX_DECODE_ALLOC);
+            // Format auto-detected from the magic bytes, so no
+            // dispatch on `image.format` is needed. The redundant
+            // tag is still useful for the renderer-side cache.
+            let mut reader = match image::ImageReader::new(std::io::Cursor::new(
+                image.data.as_slice(),
+            ))
+            .with_guessed_format()
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        format = ?image.format,
+                        data_len = image.data.len(),
+                        "image format sniff failed: {e}",
+                    );
+                    return None;
+                }
+            };
+            reader.limits(limits);
+            let dyn_img = match reader.decode() {
                 Ok(d) => d,
                 Err(e) => {
-                    // Bumped to WARN: default log levels filter out
+                    // WARN, not debug: default log levels filter out
                     // `debug`, so a real decode failure would be
                     // invisible to a user trying to figure out why
                     // their inline image isn't drawing.
@@ -161,5 +188,53 @@ mod tests {
         // Random bytes that aren't a real PNG.
         let data = vec![0x89, b'P', b'N', b'G', 0x00, 0x00, 0x00, 0x00];
         assert!(decode(&img(ImageFormat::Png, 1, 1, data)).is_none());
+    }
+
+    /// CRC-32 (IEEE, reflected, poly 0xEDB88320) — just enough to
+    /// hand-craft a PNG chunk the decoder will accept as well-formed.
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc: u32 = 0xFFFF_FFFF;
+        for &b in data {
+            crc ^= b as u32;
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
+        }
+        !crc
+    }
+
+    #[test]
+    fn png_bomb_dimensions_are_rejected_by_decode_limits() {
+        // A few dozen bytes declaring a 50000×50000 image. Without
+        // decoder limits, `load_from_memory` would try to allocate
+        // ~10 GB for the pixel buffer before failing — a remote
+        // shell can print this. The limits must reject it at header
+        // parse, cheaply.
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(b"IHDR");
+        ihdr.extend_from_slice(&50_000u32.to_be_bytes()); // width
+        ihdr.extend_from_slice(&50_000u32.to_be_bytes()); // height
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit RGBA, no interlace
+        let mut png = Vec::new();
+        png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(&ihdr);
+        png.extend_from_slice(&crc32(&ihdr).to_be_bytes());
+        assert!(decode(&img(ImageFormat::Png, 50_000, 50_000, png)).is_none());
+    }
+
+    #[test]
+    fn small_valid_png_still_decodes_through_the_limited_reader() {
+        // Positive control for the limits change: an ordinary PNG
+        // passes through `ImageReader` + `Limits` unharmed.
+        let mut buf = Vec::new();
+        let px = image::RgbaImage::from_pixel(2, 2, image::Rgba([10, 20, 30, 255]));
+        px.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .expect("encode test png");
+        let d = decode(&img(ImageFormat::Png, 2, 2, buf)).expect("valid PNG decodes");
+        assert_eq!((d.width, d.height), (2, 2));
+        assert_eq!(d.rgba.len(), 2 * 2 * 4);
+        assert_eq!(&d.rgba[..4], &[10, 20, 30, 255]);
     }
 }

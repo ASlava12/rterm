@@ -11,11 +11,91 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use mlua::{Function, Lua, RegistryKey, Table, Value};
 use regex::Regex;
+
+/// Cap applied to every Lua→App pending queue. A handler that loops
+/// `rterm.send_to_pane(...)` a few million times between frames would
+/// otherwise grow the queue without bound (the App drains once per
+/// frame). 1024 entries comfortably covers legitimate burst usage.
+const PLUGIN_QUEUE_CAP: usize = 1024;
+
+/// Per-dispatch execution budget for event handlers and palette
+/// actions. Handlers run synchronously on the render thread — without
+/// a budget, `while true do end` in any handler freezes the terminal
+/// forever with no log and no escape short of `kill`.
+const HANDLER_EXEC_BUDGET: Duration = Duration::from_secs(2);
+
+/// Execution budget for whole-script loads (init.lua / plugins/*.lua
+/// top level). More generous than the per-handler budget: startup
+/// scripts legitimately do file IO and table building.
+const SCRIPT_EXEC_BUDGET: Duration = Duration::from_secs(10);
+
+/// Watchdog state shared with the Lua instruction hook. `arm` stores a
+/// monotonic deadline before user code runs; the hook (fired every N
+/// VM instructions) aborts the chunk with a Lua error once the
+/// deadline passes. Stored as millis-since-`epoch` in an atomic so the
+/// hook never takes a lock.
+struct ExecDeadline {
+    epoch: Instant,
+    /// Deadline in ms since `epoch`; 0 = disarmed.
+    deadline_ms: AtomicU64,
+}
+
+impl ExecDeadline {
+    fn new() -> Self {
+        Self { epoch: Instant::now(), deadline_ms: AtomicU64::new(0) }
+    }
+    fn arm(&self, budget: Duration) {
+        let dl = self
+            .epoch
+            .elapsed()
+            .saturating_add(budget)
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        // `.max(1)` keeps an armed zero-budget distinguishable from
+        // the disarmed sentinel.
+        self.deadline_ms.store(dl.max(1), Ordering::Release);
+    }
+    fn disarm(&self) {
+        self.deadline_ms.store(0, Ordering::Release);
+    }
+    fn expired(&self) -> bool {
+        let dl = self.deadline_ms.load(Ordering::Acquire);
+        dl != 0 && self.epoch.elapsed().as_millis() as u64 > dl
+    }
+}
+
+/// Push to a bounded Lua→App queue, dropping the OLDEST entry past the
+/// cap. Right semantics for last-write-wins payloads (titles): the
+/// newest value is the one the plugin wants applied.
+fn push_capped_drop_oldest<T>(q: &Mutex<VecDeque<T>>, item: T) {
+    if let Ok(mut q) = q.lock() {
+        if q.len() >= PLUGIN_QUEUE_CAP {
+            q.pop_front();
+        }
+        q.push_back(item);
+    }
+}
+
+/// Push to a bounded Lua→App queue, rejecting the NEW entry when full.
+/// Right semantics for routed-input streams: silently dropping a chunk
+/// from the MIDDLE of queued input corrupts whatever the plugin was
+/// typing into the pane — better to refuse the tail and say so.
+fn push_capped_reject<T>(q: &Mutex<VecDeque<T>>, item: T) -> bool {
+    match q.lock() {
+        Ok(mut q) if q.len() < PLUGIN_QUEUE_CAP => {
+            q.push_back(item);
+            true
+        }
+        _ => false,
+    }
+}
 
 /// A snapshot of the focused pane's terminal that the App pushes into the
 /// plugin host so Lua callbacks can read it via `rterm.cwd()` etc.
@@ -438,6 +518,10 @@ pub struct PluginHost {
     /// The App calls `match_output_line` for each completed line and emits
     /// a `match` event for every hit.
     match_rules: Arc<Mutex<Vec<MatchRule>>>,
+    /// Watchdog deadline checked by the Lua instruction hook — see
+    /// `with_exec_budget`. Keeps a runaway handler (`while true do
+    /// end`) from freezing the render thread forever.
+    exec_deadline: Arc<ExecDeadline>,
 }
 
 /// Parse `#RRGGBB`, `#RGB`, or the same forms without the leading `#`
@@ -638,6 +722,30 @@ impl PluginHost {
     /// side-effects on host state.
     pub fn new() -> Result<Self> {
         let lua = Lua::new();
+        // Execution watchdog: an instruction-count hook that aborts the
+        // running chunk once the armed deadline passes. Disarmed (the
+        // common case) it costs one atomic load per 100k VM
+        // instructions. This is the only line of defense against a
+        // buggy `while true do end` handler — plugins run synchronously
+        // on the render thread.
+        let exec_deadline = Arc::new(ExecDeadline::new());
+        {
+            let dl = Arc::clone(&exec_deadline);
+            lua.set_hook(
+                mlua::HookTriggers::new().every_nth_instruction(100_000),
+                move |_lua, _debug| {
+                    if dl.expired() {
+                        Err(mlua::Error::RuntimeError(
+                            "rterm: plugin code exceeded its execution budget \
+                             (infinite loop in a handler?) — aborted"
+                                .to_string(),
+                        ))
+                    } else {
+                        Ok(mlua::VmState::Continue)
+                    }
+                },
+            );
+        }
         let handlers: Arc<Mutex<HashMap<String, Vec<RegistryKey>>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
@@ -781,7 +889,7 @@ impl PluginHost {
         rterm.set(
             "set_tab_title",
             lua.create_function(move |_, name: String| {
-                titles_for_set.lock().unwrap().push_back((None, name));
+                push_capped_drop_oldest(&titles_for_set, (None, name));
                 Ok(())
             })?,
         )?;
@@ -794,10 +902,7 @@ impl PluginHost {
             "set_tab_title_by_index",
             lua.create_function(move |_, (idx, name): (u32, String)| {
                 let idx0 = idx.saturating_sub(1) as usize;
-                titles_for_set_idx
-                    .lock()
-                    .unwrap()
-                    .push_back((Some(idx0), name));
+                push_capped_drop_oldest(&titles_for_set_idx, (Some(idx0), name));
                 Ok(())
             })?,
         )?;
@@ -825,7 +930,7 @@ impl PluginHost {
             lua.create_function(move |_, (tab, pane, title): (u32, u32, String)| {
                 let t = tab.saturating_sub(1) as usize;
                 let p = pane.saturating_sub(1) as usize;
-                pane_titles_for_set.lock().unwrap().push_back((t, p, title));
+                push_capped_drop_oldest(&pane_titles_for_set, (t, p, title));
                 Ok(())
             })?,
         )?;
@@ -840,10 +945,7 @@ impl PluginHost {
         rterm.set(
             "set_pane_title_by_uid",
             lua.create_function(move |_, (uid, title): (u64, String)| {
-                pane_titles_by_uid_for_set
-                    .lock()
-                    .unwrap()
-                    .push_back((uid, title));
+                push_capped_drop_oldest(&pane_titles_by_uid_for_set, (uid, title));
                 Ok(())
             })?,
         )?;
@@ -961,15 +1063,7 @@ impl PluginHost {
             lua.create_function(move |_, (tab, pane, muted): (u32, u32, bool)| {
                 let tab_idx = (tab.saturating_sub(1)) as usize;
                 let pane_idx = (pane.saturating_sub(1)) as usize;
-                if let Ok(mut q) = mute_for_set.lock() {
-                    // Bound the queue so a runaway plugin can't grow it
-                    // unbounded between frames. Same cap as other
-                    // per-pane queues (paste/routed_input).
-                    if q.len() >= 1024 {
-                        q.pop_front();
-                    }
-                    q.push_back((tab_idx, pane_idx, muted));
-                }
+                push_capped_drop_oldest(&mute_for_set, (tab_idx, pane_idx, muted));
                 Ok(())
             })?,
         )?;
@@ -983,12 +1077,7 @@ impl PluginHost {
         rterm.set(
             "set_pane_bell_muted_by_uid",
             lua.create_function(move |_, (uid, muted): (u64, bool)| {
-                if let Ok(mut q) = mute_by_uid_for_set.lock() {
-                    if q.len() >= 1024 {
-                        q.pop_front();
-                    }
-                    q.push_back((uid, muted));
-                }
+                push_capped_drop_oldest(&mute_by_uid_for_set, (uid, muted));
                 Ok(())
             })?,
         )?;
@@ -1159,10 +1248,15 @@ impl PluginHost {
                     // call from underflowing if the caller passes 0.
                     let tab_idx = (tab.saturating_sub(1)) as usize;
                     let pane_idx = (pane.saturating_sub(1)) as usize;
-                    routed_for_send
-                        .lock()
-                        .unwrap()
-                        .push_back(((tab_idx, pane_idx), payload.into_bytes()));
+                    if !push_capped_reject(
+                        &routed_for_send,
+                        ((tab_idx, pane_idx), payload.into_bytes()),
+                    ) {
+                        tracing::warn!(
+                            target: "rterm::plugin",
+                            "send_to_pane queue full ({PLUGIN_QUEUE_CAP}) — dropping payload"
+                        );
+                    }
                     Ok(())
                 },
             )?,
@@ -1179,10 +1273,12 @@ impl PluginHost {
         rterm.set(
             "send_to_pane_by_uid",
             lua.create_function(move |_, (uid, payload): (u64, String)| {
-                routed_by_uid_for_send
-                    .lock()
-                    .unwrap()
-                    .push_back((uid, payload.into_bytes()));
+                if !push_capped_reject(&routed_by_uid_for_send, (uid, payload.into_bytes())) {
+                    tracing::warn!(
+                        target: "rterm::plugin",
+                        "send_to_pane_by_uid queue full ({PLUGIN_QUEUE_CAP}) — dropping payload"
+                    );
+                }
                 Ok(())
             })?,
         )?;
@@ -3863,7 +3959,20 @@ impl PluginHost {
             pending_theme,
             state,
             match_rules,
+            exec_deadline,
         })
+    }
+
+    /// Run `f` (which invokes Lua user code) under the instruction-hook
+    /// watchdog: arm the deadline, call, disarm. Once the budget is
+    /// exceeded the hook aborts the chunk with a Lua RuntimeError,
+    /// which surfaces through the normal per-handler error logging —
+    /// the host and every other handler keep working.
+    fn with_exec_budget<R>(&self, budget: Duration, f: impl FnOnce() -> R) -> R {
+        self.exec_deadline.arm(budget);
+        let out = f();
+        self.exec_deadline.disarm();
+        out
     }
 
     /// Test `line` against every registered match rule. Returns
@@ -4335,7 +4444,7 @@ impl PluginHost {
             };
             self.lua.registry_value(key)?
         };
-        if let Err(e) = f.call::<Value>(()) {
+        if let Err(e) = self.with_exec_budget(HANDLER_EXEC_BUDGET, || f.call::<Value>(())) {
             tracing::warn!(target: "rterm::plugin", "action '{name}' failed: {e}");
         }
         Ok(())
@@ -4345,7 +4454,8 @@ impl PluginHost {
         let src = std::fs::read_to_string(path)
             .with_context(|| format!("reading plugin {}", path.display()))?;
         let chunk = self.lua.load(&src).set_name(path.to_string_lossy());
-        chunk.exec().with_context(|| format!("evaluating {}", path.display()))?;
+        self.with_exec_budget(SCRIPT_EXEC_BUDGET, || chunk.exec())
+            .with_context(|| format!("evaluating {}", path.display()))?;
         Ok(())
     }
 
@@ -4382,21 +4492,41 @@ impl PluginHost {
         paths.sort();
         let mut count = 0;
         for path in paths {
-            self.load_script(&path)?;
-            count += 1;
+            // Per-file recovery: one plugin with a syntax error must
+            // not silently disable every alphabetically-later plugin.
+            // With hot-reload this used to fire on every mid-edit save
+            // of an early-sorting file. The failure is logged loudly;
+            // the count reports successful loads only.
+            match self.load_script(&path) {
+                Ok(()) => count += 1,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "rterm::plugin",
+                        "skipping plugin {}: {e:#}",
+                        path.display(),
+                    );
+                }
+            }
         }
         Ok(count)
     }
 
-    /// Clear every registered handler AND palette action. Used before
-    /// re-running init.lua and plugins on hot-reload so registrations
-    /// don't compound.
+    /// Clear every registered handler, palette action AND output-match
+    /// rule. Used before re-running init.lua and plugins on hot-reload
+    /// so registrations don't compound. Match rules are included —
+    /// re-exec re-registers the ones still in the source, exactly like
+    /// handlers; leaving them made a DELETED `rterm.add_match` rule
+    /// keep firing (and keep holding one of the 64 slots) until
+    /// restart.
     pub fn reset_handlers(&self) {
         if let Ok(mut map) = self.handlers.lock() {
             map.clear();
         }
         if let Ok(mut map) = self.actions.lock() {
             map.clear();
+        }
+        if let Ok(mut rules) = self.match_rules.lock() {
+            rules.clear();
         }
     }
 
@@ -4422,7 +4552,11 @@ impl PluginHost {
                 .collect::<mlua::Result<_>>()?
         };
         for f in functions {
-            if let Err(e) = f.call::<Value>(payload.clone()) {
+            // Budget armed PER HANDLER so one slow handler can't eat
+            // the others' time slice.
+            let res =
+                self.with_exec_budget(HANDLER_EXEC_BUDGET, || f.call::<Value>(payload.clone()));
+            if let Err(e) = res {
                 tracing::warn!(target: "rterm::plugin", "handler for {event} failed: {e}");
             }
         }
@@ -4433,6 +4567,93 @@ impl PluginHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exec_budget_aborts_runaway_lua_and_host_survives() {
+        // The instruction hook must turn `while true do end` into a
+        // Lua error once the armed deadline passes — without it a
+        // buggy handler froze the render thread forever. Uses a tiny
+        // budget directly so the test doesn't sit through the real
+        // 2-second handler budget.
+        let host = PluginHost::new().expect("host inits");
+        let res = host.with_exec_budget(Duration::from_millis(50), || {
+            host.lua.load("while true do end").exec()
+        });
+        let err = res.expect_err("infinite loop must be aborted");
+        assert!(
+            err.to_string().contains("execution budget"),
+            "unexpected error: {err}"
+        );
+        // The watchdog disarmed and the VM is healthy: ordinary code
+        // (including loops that finish) runs fine afterwards.
+        host.lua
+            .load("local s = 0; for i = 1, 100000 do s = s + i end; _G.sum = s")
+            .exec()
+            .expect("normal code still runs after an abort");
+        let sum: u64 = host.lua.globals().get("sum").unwrap();
+        assert_eq!(sum, 5_000_050_000);
+    }
+
+    #[test]
+    fn routed_input_queue_is_capped() {
+        // A single Lua chunk pushing far past the cap must not grow
+        // the queue without bound; overflow is rejected (newest
+        // dropped) so the queued stream stays contiguous.
+        let host = PluginHost::new().expect("host inits");
+        host.lua
+            .load(r#"for i = 1, 5000 do rterm.send_to_pane(1, 1, "x") end"#)
+            .exec()
+            .unwrap();
+        let drained = host.drain_pending_routed_input();
+        assert_eq!(drained.len(), PLUGIN_QUEUE_CAP);
+        // After a drain there is room again.
+        host.lua
+            .load(r#"rterm.send_to_pane(1, 1, "y")"#)
+            .exec()
+            .unwrap();
+        assert_eq!(host.drain_pending_routed_input().len(), 1);
+    }
+
+    #[test]
+    fn reset_handlers_clears_match_rules_too() {
+        // Hot-reload re-executes every script; rules still in the
+        // source re-register. Leaving old ones in place made a rule
+        // DELETED from the source keep firing (and keep holding one
+        // of the 64 slots) until restart.
+        let host = PluginHost::new().expect("host inits");
+        host.lua
+            .load(r#"rterm.add_match("ghost", "needle")"#)
+            .exec()
+            .unwrap();
+        assert_eq!(host.match_rule_names(), vec!["ghost".to_string()]);
+        host.reset_handlers();
+        assert!(
+            host.match_rule_names().is_empty(),
+            "match rules must not survive a hot-reload reset"
+        );
+    }
+
+    #[test]
+    fn load_dir_recovers_past_a_broken_plugin() {
+        // `aaa.lua` has a syntax error; `bbb.lua` must still load. The
+        // old `?` propagation aborted the loop on the first failure,
+        // silently disabling every later plugin after a mid-edit save.
+        let dir = std::env::temp_dir().join(format!(
+            "rterm-test-load-dir-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aaa.lua"), "this is not lua ((").unwrap();
+        std::fs::write(dir.join("bbb.lua"), "_G.loaded_ok = true").unwrap();
+
+        let host = PluginHost::new().expect("host inits");
+        let count = host.load_dir(&dir).expect("dir read works");
+        assert_eq!(count, 1, "only the good plugin counts as loaded");
+        let ok: bool = host.lua.globals().get("loaded_ok").unwrap();
+        assert!(ok, "the good plugin actually executed");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn rterm_run_action_can_re_register_during_callback() {

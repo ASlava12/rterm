@@ -1185,6 +1185,14 @@ impl Terminal {
     }
 
     pub fn set_scrollback_limit(&mut self, limit: usize) {
+        // Hard ceiling: this is the single choke point for both the
+        // `terminal.scrollback` config key and `rterm.set_scrollback`
+        // from Lua, neither of which validates. Memory is roughly
+        // `lines × cols × 16 bytes` (a 9e18 TOML value would accept an
+        // unbounded ring and OOM under heavy output). One million
+        // lines ≈ 1.6 GB at 100 cols — already generous.
+        const SCROLLBACK_LIMIT_CEILING: usize = 1_000_000;
+        let limit = limit.min(SCROLLBACK_LIMIT_CEILING);
         self.scrollback_limit = limit;
         // Shifting the scrollback under the user's feet has to drag the
         // OSC-133 marks along — otherwise "jump to last prompt" lands
@@ -4996,6 +5004,20 @@ mod tests {
             t.advance(b"xx\r\n");
         }
         assert!(t.scrollback_len() <= 3);
+    }
+
+    #[test]
+    fn set_scrollback_limit_enforces_ceiling() {
+        // This setter is the single choke point for both the
+        // `terminal.scrollback` config key and `rterm.set_scrollback`
+        // from Lua — neither validates, so a `scrollback = 9e18` TOML
+        // value used to arm an unbounded ring (OOM under heavy
+        // output). Values at or under the ceiling pass through.
+        let mut t = term(4, 1);
+        t.set_scrollback_limit(usize::MAX);
+        assert_eq!(t.scrollback_limit(), 1_000_000);
+        t.set_scrollback_limit(5_000);
+        assert_eq!(t.scrollback_limit(), 5_000);
     }
 
     #[test]

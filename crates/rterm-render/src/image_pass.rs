@@ -367,6 +367,24 @@ impl ImageLayer {
             self.failed.insert(key);
             return false;
         }
+        // Refuse textures past the adapter's limit — `create_texture`
+        // with an oversize extent trips a wgpu validation error in
+        // the render path (uncaptured-error panic / device loss)
+        // instead of a graceful skip. Conservative iGPUs advertise
+        // as little as 2048-4096 while the decoder allows up to 8192.
+        let max_dim = device.limits().max_texture_dimension_2d;
+        if decoded.width > max_dim || decoded.height > max_dim {
+            tracing::warn!(
+                pane_uid = key.0,
+                image_id = key.1,
+                width = decoded.width,
+                height = decoded.height,
+                max_dim,
+                "image_pass: decoded image exceeds the device texture limit, refusing upload",
+            );
+            self.failed.insert(key);
+            return false;
+        }
         tracing::info!(
             pane_uid = key.0,
             image_id = key.1,
