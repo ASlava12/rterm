@@ -1127,6 +1127,13 @@ impl TextLayer {
                 Metrics::new(self.font_size, self.line_height),
             );
             b.set_monospace_width(&mut self.font_system, Some(self.cell_width));
+            // Pane content is a pre-wrapped cell grid — the Terminal
+            // already broke lines at `cols`. cosmic-text's default
+            // word wrap would re-flow any row that rounds a hair
+            // wider than the rect (fallback glyphs, grid floors) onto
+            // a phantom second visual row, shifting every row below
+            // it off the bg-quad/cursor/selection grid.
+            b.set_wrap(&mut self.font_system, Wrap::None);
             self.buffers.push(b);
         }
         // Shrink if we have too many buffers — release atlas-bound memory.
@@ -2504,6 +2511,39 @@ impl Tab {
             .iter()
             .position(|p| std::ptr::eq(*p, target))
     }
+
+    /// Re-point `focus_path` after `close_leaf(removed_path)` reshaped
+    /// the tree. `close_leaf` hoists the surviving sibling subtree one
+    /// level up, so EVERY path inside that sibling loses one element —
+    /// not just paths under the removed leaf. Re-locating the focused
+    /// pane by its stable `uid` handles both cases; when the focused
+    /// pane itself was the one removed (uid no longer present), focus
+    /// falls to the leftmost survivor under the removed leaf's parent.
+    pub(crate) fn repair_focus_after_close(
+        &mut self,
+        removed_path: &[bool],
+        focused_uid: Option<u64>,
+    ) {
+        let by_uid = focused_uid.and_then(|fuid| {
+            self.tree.leaf_paths().into_iter().find(|p| {
+                self.tree
+                    .leaf_at(p)
+                    .map(|leaf| leaf.uid == fuid)
+                    .unwrap_or(false)
+            })
+        });
+        self.focus_path = match by_uid {
+            Some(p) => p,
+            None => {
+                let parent = if removed_path.is_empty() {
+                    Vec::new()
+                } else {
+                    removed_path[..removed_path.len() - 1].to_vec()
+                };
+                descend_leftmost(&self.tree, &parent)
+            }
+        };
+    }
 }
 
 const PAD: f32 = 4.0;
@@ -3855,6 +3895,15 @@ impl App {
     /// `WINDOW_CONTROL_GAP_CELLS` of empty strip between adjacent
     /// chips so the buttons read as three distinct targets.
     fn window_control_at(&self, x: f64, y: f64) -> Option<WindowControl> {
+        // With OS decorations the native title bar owns min/max/close
+        // and we draw no in-header buttons (`header_right_spans` /
+        // `tab_bar_quads` gate on the same flag) — but this hit-test
+        // used to keep reporting hits, so a click on the rightmost
+        // cells of the tab strip triggered an INVISIBLE control;
+        // worst case the phantom Close exited the app.
+        if self.os_decorations {
+            return None;
+        }
         let rect = self.header_rect()?;
         let yf = y as f32;
         if yf < rect.top || yf >= rect.top + rect.height {
@@ -5212,7 +5261,15 @@ impl App {
             // shells from receiving `cols=1` and writing every
             // character onto its own line — which becomes permanent
             // scrollback "s\nl\na\nv\na\n..." garbage.
-            const MIN_COLS: u16 = 80;
+            //
+            // The floor MUST stay tiny. It was once bumped to 80,
+            // which silently lied to the shell for every pane
+            // narrower than 80 cells (any side-by-side split, large
+            // fonts, HiDPI): output formatted for 80 columns wrapped
+            // past the visible pane edge, glyph rows soft-wrapped
+            // onto phantom lines, and mouse hit-tests addressed
+            // columns that don't exist on screen.
+            const MIN_COLS: u16 = 10;
             const MIN_ROWS: u16 = 3;
             let cols = ((rect.width / cell_w).max(1.0) as u16).max(MIN_COLS);
             let rows = ((rect.height / line_h).max(1.0) as u16).max(MIN_ROWS);
@@ -5803,16 +5860,16 @@ impl App {
                     })
                     .unwrap_or((None, 0));
                 exited.push((tab_idx, dead_idx, exit_code, uid));
+                // Capture the focused pane's identity BEFORE the tree
+                // mutates, then let `repair_focus_after_close` re-find
+                // it by uid. The old prefix check only repaired focus
+                // when it pointed INTO the dead subtree; focus inside
+                // the hoisted sibling kept a stale extra branch bit,
+                // `focused_pane()` returned `None`, and keyboard input
+                // silently died until the user clicked.
+                let focused_uid = tab.focused_pane().map(|p| p.uid);
                 let _ = tab.tree.close_leaf(&path);
-                // Reset focus if it pointed into the removed subtree.
-                if tab.focus_path.len() >= path.len() && tab.focus_path[..path.len()] == path[..] {
-                    let parent = if path.is_empty() {
-                        Vec::new()
-                    } else {
-                        path[..path.len() - 1].to_vec()
-                    };
-                    tab.focus_path = descend_leftmost(&tab.tree, &parent);
-                }
+                tab.repair_focus_after_close(&path, focused_uid);
             }
         }
         // Track which tab indices disappear so plugins still see tab.close.
@@ -6585,17 +6642,23 @@ impl App {
             Some(f) => f.dir,
             None => return,
         };
+        // `f32::clamp` panics when min > max. Deep nested splits can
+        // shrink `usable` below 40 px (split_rect floors children at
+        // 1 px), so the upper bound must never drop under the lower
+        // one — otherwise a divider drag inside a tiny rect crashes
+        // the whole window.
+        let clamp_a = |v: f32, usable: f32| v.clamp(20.0, (usable - 20.0).max(20.0));
         let new_ratio = match dir {
             SplitDir::Horizontal => {
                 let usable = (containing.width - SPLIT_GAP).max(1.0);
-                let new_a = ((x - containing.left as f64) as f32 - SPLIT_GAP * 0.5)
-                    .clamp(20.0, usable - 20.0);
+                let new_a =
+                    clamp_a((x - containing.left as f64) as f32 - SPLIT_GAP * 0.5, usable);
                 (new_a / usable).clamp(0.05, 0.95)
             }
             SplitDir::Vertical => {
                 let usable = (containing.height - SPLIT_GAP).max(1.0);
-                let new_a = ((y - containing.top as f64) as f32 - SPLIT_GAP * 0.5)
-                    .clamp(20.0, usable - 20.0);
+                let new_a =
+                    clamp_a((y - containing.top as f64) as f32 - SPLIT_GAP * 0.5, usable);
                 (new_a / usable).clamp(0.05, 0.95)
             }
         };
@@ -8091,20 +8154,20 @@ impl App {
                     Key::Character(c) if ctrl && c.eq_ignore_ascii_case("a") => {
                         modal.select_all();
                     }
+                    // Copy/cut route through `clipboard_set`, NOT a
+                    // throwaway `arboard::Clipboard` — on X11/Wayland
+                    // selection ownership dies with the connection, so
+                    // a clipboard dropped at the end of this arm lost
+                    // the copy the moment the handler returned (see
+                    // clipboard.rs for the owner-thread rationale).
                     Key::Character(c) if ctrl && c.eq_ignore_ascii_case("c") => {
                         if let Some(sel) = modal.selected_text() {
-                            let s = sel.to_string();
-                            if let Ok(mut cb) = arboard::Clipboard::new() {
-                                let _ = cb.set_text(s);
-                            }
+                            clipboard_set(sel);
                         }
                     }
                     Key::Character(c) if ctrl && c.eq_ignore_ascii_case("x") => {
                         if let Some(sel) = modal.selected_text() {
-                            let s = sel.to_string();
-                            if let Ok(mut cb) = arboard::Clipboard::new() {
-                                let _ = cb.set_text(s);
-                            }
+                            clipboard_set(sel);
                             modal.delete_selection();
                         }
                     }
@@ -9629,11 +9692,13 @@ impl App {
                 match c.as_str().to_ascii_lowercase().as_str() {
                     "w" => {
                         if let Some(p) = self.palette.as_mut() {
-                            let trimmed = p.query.trim_end();
-                            let drop_from = trimmed
-                                .rfind(char::is_whitespace)
-                                .map(|i| i + 1)
-                                .unwrap_or(0);
+                            // `word_back_delete_index` returns a char-
+                            // boundary-safe byte index. The previous
+                            // inline `rfind(..).map(|i| i + 1)` copy
+                            // panicked in `truncate` on multi-byte
+                            // whitespace (NBSP / U+3000) — the same bug
+                            // the search overlay already fixed.
+                            let drop_from = word_back_delete_index(&p.query);
                             p.query.truncate(drop_from);
                         }
                         self.refresh_palette();
@@ -14691,6 +14756,77 @@ mod tests {
         // the static fallback (the shell program name from spawn).
         let pane = test_pane("zsh");
         assert_eq!(pane.display_title(), "zsh");
+    }
+
+    fn test_tab(tree: tree::Tree<Pane>, focus_path: tree::TreePath) -> Tab {
+        Tab {
+            tree,
+            focus_path,
+            zoomed: false,
+            custom_title: None,
+            unread: false,
+            silence_armed: false,
+            last_any_alt: AtomicBool::new(false),
+            last_progress: Mutex::new(None),
+        }
+    }
+
+    #[test]
+    fn focus_repair_survives_sibling_subtree_hoist() {
+        // Regression: topology Split{ Split{p1, p2}, p3 }, focus on p2
+        // (path [false,true]), p3 dies. close_leaf hoists Split{p1,p2}
+        // to the root, shortening p2's true path to [true] — the old
+        // prefix-based repair left focus_path as [false,true], which
+        // addresses PAST a leaf, so focused_pane() returned None and
+        // the keyboard went dead until a click.
+        let p1 = test_pane("p1");
+        let p2 = test_pane("p2");
+        let p3 = test_pane("p3");
+        let p2_uid = p2.uid;
+        let mut tree = tree::Tree::new(p1);
+        assert!(tree.split_leaf(&[], p3, SplitDir::Horizontal, 0.5));
+        assert!(tree.split_leaf(&[false], p2, SplitDir::Vertical, 0.5));
+        let mut tab = test_tab(tree, vec![false, true]);
+        assert_eq!(tab.focused_pane().map(|p| p.uid), Some(p2_uid));
+
+        // p3 (path [true]) dies and is pruned.
+        let focused_uid = tab.focused_pane().map(|p| p.uid);
+        assert!(tab.tree.close_leaf(&[true]));
+        tab.repair_focus_after_close(&[true], focused_uid);
+
+        assert_eq!(
+            tab.focused_pane().map(|p| p.uid),
+            Some(p2_uid),
+            "focus must follow p2 through the subtree hoist"
+        );
+        assert_eq!(tab.focus_path, vec![true], "p2's path lost one element");
+    }
+
+    #[test]
+    fn focus_repair_falls_back_when_focused_pane_was_removed() {
+        // Same topology, but the FOCUSED pane (p3) is the one that
+        // died — its uid is gone from the tree, so focus falls to the
+        // leftmost survivor under the removed leaf's parent.
+        let p1 = test_pane("p1");
+        let p2 = test_pane("p2");
+        let p3 = test_pane("p3");
+        let p1_uid = p1.uid;
+        let p3_uid = p3.uid;
+        let mut tree = tree::Tree::new(p1);
+        assert!(tree.split_leaf(&[], p3, SplitDir::Horizontal, 0.5));
+        assert!(tree.split_leaf(&[false], p2, SplitDir::Vertical, 0.5));
+        let mut tab = test_tab(tree, vec![true]);
+        assert_eq!(tab.focused_pane().map(|p| p.uid), Some(p3_uid));
+
+        let focused_uid = tab.focused_pane().map(|p| p.uid);
+        assert!(tab.tree.close_leaf(&[true]));
+        tab.repair_focus_after_close(&[true], focused_uid);
+
+        assert_eq!(
+            tab.focused_pane().map(|p| p.uid),
+            Some(p1_uid),
+            "focus falls to the leftmost survivor"
+        );
     }
 
     #[test]

@@ -99,6 +99,11 @@ impl History {
         // for shell-history-grade data.
         conn.pragma_update(None, "journal_mode", "WAL").ok();
         conn.pragma_update(None, "synchronous", "NORMAL").ok();
+        // Two rterm instances (or the GUI plus `rterm --history …`)
+        // share this file. Without a busy timeout a write collision
+        // returns SQLITE_BUSY immediately and the command record is
+        // silently dropped; a short retry window absorbs the overlap.
+        conn.busy_timeout(std::time::Duration::from_millis(250)).ok();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS commands (
                  text       TEXT PRIMARY KEY NOT NULL,
@@ -154,6 +159,12 @@ impl History {
     /// recency breaks ties, alphabetical breaks the rest so the list
     /// is stable across queries.
     pub fn suggest(&self, prefix: &str, limit: usize) -> Result<Vec<Suggestion>> {
+        // Cap the limit before it is used as an allocation hint and as
+        // an SQL parameter: `Vec::with_capacity(usize::MAX)` aborts
+        // with "capacity overflow", and `usize::MAX as i64` wraps to
+        // -1, which SQLite reads as "no limit". Reachable from the
+        // unvalidated `--history list --limit N` CLI flag.
+        let limit = limit.min(10_000);
         // SQLite's LIKE pattern with `\` escape: replace any LIKE-
         // special bytes in the prefix with their escaped form so a
         // user typing `git_` doesn't suddenly match `git-status` /
@@ -285,6 +296,20 @@ mod tests {
         assert_eq!(entry.count, 1);
         // last_used is non-zero (we just set it).
         assert!(entry.last_used > 0);
+    }
+
+    #[test]
+    fn suggest_with_huge_limit_does_not_panic() {
+        // Regression: `--history list --limit 18446744073709551615`
+        // aborted on `Vec::with_capacity(usize::MAX)` and the
+        // `as i64` wrap turned the LIMIT into -1 (unbounded).
+        let h = open_mem();
+        h.record("ls").unwrap();
+        h.record("ls -la").unwrap();
+        let out = h.suggest("ls", usize::MAX).expect("suggest");
+        assert_eq!(out.len(), 2);
+        // Zero limit stays zero rows, not "no limit".
+        assert!(h.suggest("ls", 0).expect("suggest").is_empty());
     }
 
     #[test]

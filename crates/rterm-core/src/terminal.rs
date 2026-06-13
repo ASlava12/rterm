@@ -45,6 +45,21 @@ fn encode_hex_ascii(s: &str) -> String {
     out
 }
 
+/// First `max` bytes of `s`, backed off to a char boundary. For log
+/// previews of attacker-controlled text (OSC payloads): a naive
+/// `&s[..max]` panics when byte `max` lands inside a multi-byte UTF-8
+/// sequence, and the payload bytes come straight from the PTY stream.
+fn utf8_prefix(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Drop every mark whose logical line index lived inside the first
 /// `dropped` lines of scrollback, then shift the survivors down by the
 /// same amount. Used whenever the scrollback ring shrinks (manual
@@ -2238,7 +2253,7 @@ impl<'a> TerminalPerform<'a> {
     fn dispatch_iterm2_file(&mut self, body: &str) {
         tracing::debug!(
             body_len = body.len(),
-            body_head = &body[..body.len().min(64)],
+            body_head = utf8_prefix(body, 64),
             "iterm2 OSC 1337 File= dispatched"
         );
         // `File=k=v;k=v:<base64>`. Base64 alphabet has no `:`, so
@@ -4101,7 +4116,7 @@ impl<'a> Perform for TerminalPerform<'a> {
                 }
                 tracing::debug!(
                     raw_len = raw.len(),
-                    raw_head = &raw[..raw.len().min(64)],
+                    raw_head = utf8_prefix(&raw, 64),
                     "OSC 1337 received"
                 );
                 if let Some(path) = raw.strip_prefix("CurrentDir=") {
@@ -4154,7 +4169,7 @@ impl<'a> Perform for TerminalPerform<'a> {
                     }
                     tracing::debug!(
                         params_len = params.len(),
-                        params_head = &params[..params.len().min(96)],
+                        params_head = utf8_prefix(params, 96),
                         "iterm2: MultipartFile begin"
                     );
                     *self.iterm2_multipart = Some(Iterm2MultipartState {
@@ -6123,6 +6138,25 @@ mod tests {
         // A real mailto with non-ASCII local part still passes — the
         // scheme is pure ASCII so the slice stays UTF-8 safe.
         assert!(is_safe_url("MAILTO:user@xn--n3h.example"));
+    }
+
+    #[test]
+    fn utf8_prefix_backs_off_to_char_boundary() {
+        // Regression: OSC 1337 debug logs previewed payloads with a
+        // raw `&body[..min(64)]` byte slice — a multi-byte char
+        // straddling the cut panicked the parser under RUST_LOG=debug
+        // on attacker-controlled input.
+        assert_eq!(utf8_prefix("hello", 64), "hello");
+        assert_eq!(utf8_prefix("hello", 3), "hel");
+        // 'ы' is 2 bytes; cutting at byte 3 lands mid-char → back off.
+        assert_eq!(utf8_prefix("мы", 3), "м");
+        // Cut exactly on a boundary keeps the full char.
+        assert_eq!(utf8_prefix("мы", 4), "мы");
+        // Degenerate cases.
+        assert_eq!(utf8_prefix("日本語", 0), "");
+        assert_eq!(utf8_prefix("", 64), "");
+        // All-multibyte string cut inside the first char → empty.
+        assert_eq!(utf8_prefix("日本語", 2), "");
     }
 
     #[test]

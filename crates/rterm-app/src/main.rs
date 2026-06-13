@@ -1925,103 +1925,127 @@ fn run_gui(
     })
 }
 
-/// Rewrite the user's `config.toml` so that `[appearance].theme = "<name>"`
-/// matches `name`. Uses `toml_edit` for in-place updates so the user's
-/// hand-written comments / section ordering / blank-line layout survive
-/// the rewrite (the previous `toml::to_string_pretty(&cfg)` round-trip
-/// wiped them).
-///
-/// Creates parent directories as needed. Falls back to a full serialise
-/// only when the file doesn't exist or fails to parse as a TOML document.
-/// Rewrite `[image].auto_detect` in the user's `config.toml`,
-/// preserving comments / section ordering / whitespace via
-/// `toml_edit`. Mirrors [`persist_theme_to_config`]'s shape — the
-/// only differences are the section name (`image` not `appearance`)
-/// and the key (`auto_detect` not `theme`). No-ops when the value
-/// already matches so the file watcher doesn't see a self-trigger
-/// reload.
-fn persist_image_auto_detect_to_config(
-    path: &std::path::Path,
-    enabled: bool,
-) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    if path.exists() {
-        if let Ok(body) = std::fs::read_to_string(path) {
-            if let Ok(mut doc) = body.parse::<toml_edit::DocumentMut>() {
-                let current = doc
-                    .get("image")
-                    .and_then(|i| i.get("auto_detect"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                if current == enabled {
-                    return Ok(());
-                }
-                let image = doc
-                    .entry("image")
-                    .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
-                if let Some(tbl) = image.as_table_mut() {
-                    tbl["auto_detect"] = toml_edit::value(enabled);
-                }
-                std::fs::write(path, doc.to_string()).with_context(|| {
-                    format!("write {} for image.auto_detect persist", path.display())
-                })?;
-                return Ok(());
-            }
-        }
-    }
-    let mut cfg = Config::default();
-    cfg.image.auto_detect = enabled;
-    let serialized = toml::to_string_pretty(&cfg).context("serialize config")?;
-    std::fs::write(path, serialized).with_context(|| {
-        format!("write {} for image.auto_detect persist", path.display())
+/// Atomically replace `path` with `content`: write a sibling temp file,
+/// then `rename` over the target (atomic on POSIX and NTFS). A crash or
+/// power loss mid-write leaves either the old file or the new one —
+/// never a truncated half. This matters for `config.toml`: the plain
+/// `fs::write` it replaces truncates first, so a badly-timed crash
+/// destroyed the user's hand-written config.
+fn write_atomic(path: &std::path::Path, content: &str) -> Result<()> {
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let tmp = match dir {
+        Some(d) => d.join(format!(
+            ".{}.tmp-{}",
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "config".to_string()),
+            std::process::id(),
+        )),
+        None => std::path::PathBuf::from(format!(".rterm-persist.tmp-{}", std::process::id())),
+    };
+    std::fs::write(&tmp, content)
+        .with_context(|| format!("write temp file {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| {
+        // Don't leave the temp file behind on a failed rename.
+        let _ = std::fs::remove_file(&tmp);
+        format!("rename {} -> {}", tmp.display(), path.display())
     })?;
     Ok(())
 }
 
-fn persist_theme_to_config(path: &std::path::Path, name: &str) -> Result<()> {
+/// Set one `[section].key` value inside the user's `config.toml`,
+/// preserving comments / section ordering / whitespace via `toml_edit`,
+/// writing atomically, and no-oping when the value already matches (so
+/// the file watcher doesn't see a self-triggered reload).
+///
+/// SAFETY RAIL: when the file exists but does not parse, this returns
+/// an error and leaves the file byte-for-byte untouched. A previous
+/// version fell through to a full `Config::default()` serialise in
+/// that case — one syntax error plus one theme click destroyed the
+/// user's entire hand-written config. The full serialise now happens
+/// ONLY when the file does not exist at all.
+fn persist_config_value(
+    path: &std::path::Path,
+    section: &str,
+    key: &str,
+    value: toml_edit::Value,
+    fallback: impl FnOnce() -> Result<String>,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    // Existing config: parse via toml_edit, replace just the one value,
-    // serialise back. Comments / whitespace preserved.
-    if path.exists() {
-        if let Ok(body) = std::fs::read_to_string(path) {
-            if let Ok(mut doc) = body.parse::<toml_edit::DocumentMut>() {
-                // Skip the write when the value is already correct —
-                // avoids touching mtime (the file watcher would
-                // otherwise see our own save and trigger a reload).
-                let current = doc.get("appearance")
-                    .and_then(|a| a.get("theme"))
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("");
-                if current == name {
-                    return Ok(());
-                }
-                // Ensure `[appearance]` table exists, then set `theme`.
-                let appearance = doc
-                    .entry("appearance")
-                    .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
-                if let Some(tbl) = appearance.as_table_mut() {
-                    tbl["theme"] = toml_edit::value(name);
-                }
-                std::fs::write(path, doc.to_string()).with_context(|| {
-                    format!("write {} for theme persistence", path.display())
-                })?;
-                return Ok(());
-            }
-        }
+    if !path.exists() {
+        return write_atomic(path, &fallback()?);
     }
-    // Path missing or unparseable — fall back to a minimal full
-    // serialise. The previous code path would have done the same.
-    let mut cfg = Config::default();
-    cfg.appearance.theme = name.to_string();
-    let serialized = toml::to_string_pretty(&cfg).context("serialize config")?;
-    std::fs::write(path, serialized).with_context(|| {
-        format!("write {} for theme persistence", path.display())
+    let body = std::fs::read_to_string(path)
+        .with_context(|| format!("read {} for persist", path.display()))?;
+    let mut doc = body.parse::<toml_edit::DocumentMut>().with_context(|| {
+        format!(
+            "{} does not parse as TOML — refusing to overwrite it; \
+             fix the syntax error to persist [{section}].{key}",
+            path.display(),
+        )
     })?;
-    Ok(())
+    let current = doc.get(section).and_then(|s| s.get(key));
+    let unchanged = match (&value, current.and_then(|v| v.as_value())) {
+        (a, Some(b)) => a.to_string().trim() == b.to_string().trim(),
+        _ => false,
+    };
+    if unchanged {
+        return Ok(());
+    }
+    let item = doc
+        .entry(section)
+        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+    let Some(tbl) = item.as_table_mut() else {
+        // `section = 5`-style scalar where a table is expected: writing
+        // through it is impossible and rewriting the file anyway would
+        // bump mtime for nothing (and trigger a watcher reload).
+        anyhow::bail!(
+            "config key `{section}` in {} is not a table — cannot persist {section}.{key}",
+            path.display(),
+        );
+    };
+    tbl[key] = toml_edit::Item::Value(value);
+    write_atomic(path, &doc.to_string())
+        .with_context(|| format!("persist [{section}].{key} to {}", path.display()))
+}
+
+/// Rewrite `[image].auto_detect` in the user's `config.toml` via
+/// [`persist_config_value`] (comment-preserving, atomic, refuses to
+/// clobber an unparseable file).
+fn persist_image_auto_detect_to_config(
+    path: &std::path::Path,
+    enabled: bool,
+) -> Result<()> {
+    persist_config_value(
+        path,
+        "image",
+        "auto_detect",
+        toml_edit::Value::from(enabled),
+        || {
+            let mut cfg = Config::default();
+            cfg.image.auto_detect = enabled;
+            toml::to_string_pretty(&cfg).context("serialize config")
+        },
+    )
+}
+
+/// Rewrite `[appearance].theme` in the user's `config.toml` via
+/// [`persist_config_value`] (comment-preserving, atomic, refuses to
+/// clobber an unparseable file).
+fn persist_theme_to_config(path: &std::path::Path, name: &str) -> Result<()> {
+    persist_config_value(
+        path,
+        "appearance",
+        "theme",
+        toml_edit::Value::from(name),
+        || {
+            let mut cfg = Config::default();
+            cfg.appearance.theme = name.to_string();
+            toml::to_string_pretty(&cfg).context("serialize config")
+        },
+    )
 }
 
 /// Parse a saved-session TOML file into `(tabs, active_index?)`. Returns
@@ -3196,6 +3220,63 @@ scrollback = 50000
         // The value MUST be updated.
         let cfg = Config::load_from(&path).unwrap();
         assert_eq!(cfg.appearance.theme, "nord");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn persist_refuses_to_clobber_unparseable_config() {
+        // Regression: a config with a syntax error used to fall through
+        // to the "file missing" branch and get REPLACED with a full
+        // `Config::default()` serialise — one typo plus one theme click
+        // destroyed the user's hand-written config. The persist must
+        // now fail loudly and leave the file byte-for-byte untouched.
+        let dir = std::env::temp_dir().join("rterm-test-persist-noclobber");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let broken = "# my precious config\n[font\nfamily = \"Fira Code\"\n";
+        std::fs::write(&path, broken).unwrap();
+
+        assert!(super::persist_theme_to_config(&path, "nord").is_err());
+        assert!(super::persist_image_auto_detect_to_config(&path, true).is_err());
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, broken, "unparseable config must not be rewritten");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn persist_refuses_when_section_is_not_a_table() {
+        // `appearance = 5` can't hold a `theme` key. The old code
+        // silently skipped the assignment but still rewrote the file
+        // (mtime bump → watcher reload for nothing). Now: error, file
+        // untouched.
+        let dir = std::env::temp_dir().join("rterm-test-persist-nontable");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let original = "appearance = 5\n";
+        std::fs::write(&path, original).unwrap();
+
+        assert!(super::persist_theme_to_config(&path, "nord").is_err());
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, original);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn write_atomic_replaces_content_and_leaves_no_temp_files() {
+        let dir = std::env::temp_dir().join("rterm-test-write-atomic");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("target.toml");
+        std::fs::write(&path, "old").unwrap();
+
+        super::write_atomic(&path, "new contents").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new contents");
+        // No `.target.toml.tmp-*` siblings left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
         std::fs::remove_file(&path).ok();
     }
 }

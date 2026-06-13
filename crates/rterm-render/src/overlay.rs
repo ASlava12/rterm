@@ -230,12 +230,13 @@ impl App {
             .map(abbreviate_home)
             .unwrap_or_else(|| "~".to_string());
         let pane_count = tab.pane_count();
+        let pane_idx = tab.focused_index().map(|i| i + 1).unwrap_or(1);
         let tab_count = self.tabs.len();
         let shell = pane.display_title();
         // Layout: " ▸ <shell>   ◉ <cwd>   ⌗ <pane>/<panes>   ▤ <tab>/<tabs> "
         storage.push(format!(" ▸ {}", shell));
         storage.push(format!("   ◉ {}", cwd_str));
-        storage.push(format!("   ⌗ {}/{}", 1, pane_count));
+        storage.push(format!("   ⌗ {}/{}", pane_idx, pane_count));
         storage.push(format!("   ▤ {}/{}", self.active_tab + 1, tab_count));
         let fg = palette::default_fg();
         let dim = fg.map(|c| c.saturating_sub(60));
