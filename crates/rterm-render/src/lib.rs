@@ -2443,6 +2443,13 @@ pub trait PaneSpawner: Send + Sync {
     /// that directory; `None` falls back to the implementation default
     /// (typically the parent process's current dir).
     fn spawn_pane(&self, cwd: Option<&str>) -> Result<Pane>;
+
+    /// Hand the spawner a [`Waker`] so the PTY reader threads it
+    /// creates can ask the (otherwise idle) event loop to repaint when
+    /// the shell produces output. Called once after the event loop
+    /// starts, before the first pane is spawned. Default no-op for
+    /// test spawners that don't run readers.
+    fn set_waker(&self, _waker: Waker) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3027,6 +3034,41 @@ pub enum UserEvent {
     /// The main thread responds by calling `toggle_guake` and forcing
     /// the window to the foreground if it was unfocused.
     GuakeGlobalHotkey,
+    /// A background thread (a PTY reader) produced output and the
+    /// window needs to repaint. The event loop is otherwise idle
+    /// (`ControlFlow::Wait`); this wakes it. Coalesced via the
+    /// [`Waker`]'s pending flag so a flood of reads queues at most one
+    /// outstanding event.
+    Wake,
+}
+
+/// Cheap, clonable handle background threads use to ask the render
+/// loop for a repaint. Wraps the winit [`EventLoopProxy`] plus a
+/// shared "already pending" flag so a burst of PTY reads between
+/// frames sends at most ONE `UserEvent::Wake` — without it a
+/// `cat /dev/urandom` flood would queue thousands of proxy events.
+#[derive(Clone)]
+pub struct Waker {
+    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    pending: Arc<AtomicBool>,
+}
+
+impl Waker {
+    /// Request a repaint. No-op (beyond an atomic swap) when a wake is
+    /// already queued and not yet handled.
+    pub fn wake(&self) {
+        if !self.pending.swap(true, Ordering::AcqRel) {
+            // Loop is exiting (proxy closed) — nothing to wake.
+            let _ = self.proxy.send_event(UserEvent::Wake);
+        }
+    }
+
+    /// Clear the pending flag. Called by the render loop at the start
+    /// of handling a frame so output produced DURING/AFTER the frame
+    /// re-arms a fresh wake instead of being swallowed.
+    fn mark_handled(&self) {
+        self.pending.store(false, Ordering::Release);
+    }
 }
 
 /// Popup tuning carried inside [`RunConfig`]. Mirrors
@@ -3497,6 +3539,11 @@ pub struct App {
     /// `None` when not currently coalescing. Bounds the hold so a
     /// continuously-streaming pane still renders.
     coalesce_started_at: Option<Instant>,
+    /// Wake handle shared with the PTY reader threads so they can kick
+    /// the event loop out of `ControlFlow::Wait` when output arrives.
+    /// `None` until the loop installs it in `resumed`. Also used to
+    /// clear the pending-wake flag at the start of each frame.
+    waker: Option<Waker>,
 }
 
 const CURSOR_BLINK_PERIOD_MS: u128 = 1000;
@@ -3519,6 +3566,17 @@ impl App {
             return;
         }
         self.global_hotkey = Some(global_hotkey::install_global_hotkey(spec, proxy));
+    }
+
+    /// Build the [`Waker`] the event loop hands to PTY reader threads
+    /// (via the spawner) so they can request a repaint when the
+    /// otherwise-idle loop is parked in `ControlFlow::Wait`. Stored on
+    /// the App so the per-frame handler can clear the pending flag.
+    pub fn set_event_proxy(&mut self, proxy: winit::event_loop::EventLoopProxy<UserEvent>) {
+        self.waker = Some(Waker {
+            proxy,
+            pending: Arc::new(AtomicBool::new(false)),
+        });
     }
 
     pub fn new(cfg: RunConfig) -> Self {
@@ -3658,6 +3716,7 @@ impl App {
             first_frame_done: false,
             render_test_only,
             last_frame_tick: None,
+            waker: None,
             last_atlas_trim: None,
             tab_silence_ms,
             slow_command_ms,
@@ -3771,6 +3830,84 @@ impl App {
 
     fn reset_cursor_blink(&mut self) {
         self.cursor_blink_anchor = Instant::now();
+    }
+
+    /// Whether the focused pane currently shows a BLINKING cursor (so
+    /// the event loop must keep waking at the blink period instead of
+    /// sleeping). False when blink is globally off, no pane is focused,
+    /// the cursor is hidden, the pane is scrolled back, or the shell
+    /// asked for a steady cursor.
+    fn focused_cursor_blinks(&self) -> bool {
+        if !self.cursor_blink {
+            return false;
+        }
+        // An unfocused window shows a steady (hollow/dim) cursor — no
+        // blink — so a background terminal idles fully instead of
+        // waking twice a second forever.
+        if !self.window_focused {
+            return false;
+        }
+        let Some(tab) = self.active_tab() else { return false };
+        let Some(pane) = tab.focused_pane() else { return false };
+        if pane.scroll_offset.load(Ordering::Relaxed) != 0 {
+            return false;
+        }
+        pane.terminal
+            .lock()
+            .map(|t| t.cursor_visible() && t.cursor_should_blink())
+            .unwrap_or(false)
+    }
+
+    /// True while a short visual animation needs the very next frame:
+    /// the bell-flash fade, a tab switch/swap slide, or a deferred
+    /// (sync-output / coalesce) present. These run continuously for
+    /// ≤200 ms; the loop renders back-to-back until they end.
+    fn animation_active(&self) -> bool {
+        let now = Instant::now();
+        let flash = self.flash_until.map(|t| t > now).unwrap_or(false);
+        flash || self.tab_switch_anim.is_some() || self.tab_swap_anim.is_some()
+    }
+
+    /// Decide the event-loop control flow after rendering a frame.
+    /// Continuous (immediate redraw) while an animation runs; a timed
+    /// wake for cursor blink / pending PTY-resize debounce / the 1 Hz
+    /// plugin heartbeat; otherwise full idle `Wait` (PTY output and
+    /// input wake it via the [`Waker`] / window events). This is what
+    /// turns the old unconditional per-frame redraw into a quiet loop.
+    fn schedule_after_frame(&self, event_loop: &ActiveEventLoop) {
+        if self.animation_active() {
+            if let Some(state) = self.state.as_ref() {
+                state.window.request_redraw();
+            }
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+        let now = Instant::now();
+        let mut next: Option<Instant> = None;
+        let mut consider = |t: Instant| {
+            next = Some(next.map_or(t, |c: Instant| c.min(t)));
+        };
+        // Cursor blink: wake at the next half-period boundary.
+        if self.focused_cursor_blinks() {
+            let half = (CURSOR_BLINK_PERIOD_MS / 2) as u64;
+            let into = (self.cursor_blink_anchor.elapsed().as_millis() as u64) % half;
+            consider(now + Duration::from_millis(half - into));
+        }
+        // Pending PTY-resize debounce — fire the deferred SIGWINCH.
+        if let Some(at) = self.pending_pty_resize_at {
+            consider(at + Duration::from_millis(RESIZE_DEBOUNCE_MS as u64));
+        }
+        // 1 Hz plugin heartbeat (`frame.tick`) + silence/idle detection —
+        // only when a plugin could consume it, so a plugin-less session
+        // idles at zero wakes.
+        if self.events.wants_terminal_state() {
+            let last = self.last_frame_tick.unwrap_or(now);
+            consider(last + Duration::from_secs(1));
+        }
+        match next {
+            Some(t) => event_loop.set_control_flow(ControlFlow::WaitUntil(t)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
+        }
     }
 
     /// Push the current `image_auto_detect` value into every live
@@ -10918,6 +11055,13 @@ impl ApplicationHandler<UserEvent> for App {
         )) {
             Ok(state) => {
                 self.state = Some(state);
+                // Hand the spawner the wake handle BEFORE the first
+                // pane is spawned, so every PTY reader thread (incl.
+                // the initial one) can kick the idle event loop when
+                // its shell produces output.
+                if let Some(w) = self.waker.clone() {
+                    self.spawner.set_waker(w);
+                }
                 if !self.session_restore.is_empty() {
                     let entries = std::mem::take(&mut self.session_restore);
                     for entry in entries {
@@ -10988,6 +11132,19 @@ impl ApplicationHandler<UserEvent> for App {
     /// Side-channel event from a background thread (see [`UserEvent`]).
     /// Dispatches in the same scope as a window event so plugin
     /// handlers fire identically to the in-app keybind path.
+    /// Timer wake-ups (`ControlFlow::WaitUntil` reached) don't emit a
+    /// `RedrawRequested` on their own — request one so the scheduled
+    /// cursor-blink toggle / PTY-resize flush / plugin heartbeat
+    /// actually paints. Cheap and idempotent; the redraw arm decides
+    /// the next wake.
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: winit::event::StartCause) {
+        if matches!(cause, winit::event::StartCause::ResumeTimeReached { .. }) {
+            if let Some(state) = self.state.as_ref() {
+                state.window.request_redraw();
+            }
+        }
+    }
+
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::GuakeGlobalHotkey => {
@@ -11002,6 +11159,14 @@ impl ApplicationHandler<UserEvent> for App {
                     state.window.focus_window();
                 }
                 self.toggle_guake();
+            }
+            UserEvent::Wake => {
+                // A PTY reader produced output while the loop was idle.
+                // Repaint to show it; `schedule_after_frame` then picks
+                // the next wake.
+                if let Some(state) = self.state.as_ref() {
+                    state.window.request_redraw();
+                }
             }
         }
     }
@@ -11031,6 +11196,14 @@ impl ApplicationHandler<UserEvent> for App {
         _id: WindowId,
         event: WindowEvent,
     ) {
+        // Under `ControlFlow::Wait` the loop only renders when asked.
+        // Every window event other than the redraw itself may have
+        // changed visible state (input, resize, focus, hover), so
+        // request a repaint after handling it — the catch-all means a
+        // handler that forgets its own `request_redraw` can't strand a
+        // stale frame. The redraw arm schedules its OWN next wake via
+        // `schedule_after_frame`, so exclude it here.
+        let needs_repaint = !matches!(event, WindowEvent::RedrawRequested);
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
@@ -11248,6 +11421,13 @@ impl ApplicationHandler<UserEvent> for App {
                             "first RedrawRequested received",
                         );
                     });
+                }
+                // Clear the pending-wake flag up front: any PTY output
+                // that lands DURING this frame re-arms a fresh wake
+                // (rather than being coalesced into the one we're
+                // already servicing and then lost).
+                if let Some(w) = self.waker.as_ref() {
+                    w.mark_handled();
                 }
                 // Re-arm / refresh / dismiss the suggestion popup
                 // every frame. Cheap when nothing has changed
@@ -13552,10 +13732,20 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     drop(draws);
                     drop(guards);
-                    state.window.request_redraw();
                 }
+                // Decide what wakes the loop next: continuous redraw
+                // while an animation runs, a timed wake for blink /
+                // resize / plugin heartbeat, or full idle Wait. This
+                // replaces the old unconditional per-frame redraw that
+                // spun the CPU at the present rate even when idle.
+                self.schedule_after_frame(event_loop);
             }
             _ => {}
+        }
+        if needs_repaint {
+            if let Some(state) = self.state.as_ref() {
+                state.window.request_redraw();
+            }
         }
     }
 }
@@ -13569,7 +13759,12 @@ pub fn run(cfg: RunConfig) -> Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .context("EventLoop::with_user_event")?;
-    event_loop.set_control_flow(ControlFlow::Poll);
+    // Event-driven by default: the loop sleeps until a window event,
+    // a `UserEvent::Wake` (PTY output), or a scheduled timer wake
+    // (cursor blink / resize debounce / plugin heartbeat). Each frame's
+    // `schedule_after_frame` re-arms the right wake. This replaces the
+    // old `Poll` busy-loop that rendered at the present rate forever.
+    event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
     let global_hotkey_spec = cfg
         .guake
@@ -13577,6 +13772,9 @@ pub fn run(cfg: RunConfig) -> Result<()> {
         .map(|g| g.global_hotkey.clone())
         .unwrap_or_default();
     let mut app = App::new(cfg);
+    // Wake handle for the PTY reader threads (installed into the
+    // spawner in `resumed`).
+    app.set_event_proxy(proxy.clone());
     // Spawn the global-hotkey worker AFTER `App::new` so the worker
     // never fires before the App is in a state ready to handle it.
     // The handle is owned by the App so its `Drop` unregisters

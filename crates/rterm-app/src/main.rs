@@ -63,9 +63,19 @@ struct GuiSpawner {
     /// records into one SQLite file. `None` when history is disabled
     /// (open-failure or `--smoke`).
     history: Option<Arc<Mutex<rterm_history::History>>>,
+    /// Wake handle the renderer installs once the event loop is up.
+    /// Each PTY reader thread gets a clone so it can repaint the
+    /// (event-driven, normally idle) loop when its shell emits output.
+    waker: Mutex<Option<rterm_render::Waker>>,
 }
 
 impl PaneSpawner for GuiSpawner {
+    fn set_waker(&self, waker: rterm_render::Waker) {
+        if let Ok(mut slot) = self.waker.lock() {
+            *slot = Some(waker);
+        }
+    }
+
     fn spawn_pane(&self, cwd: Option<&str>) -> Result<Pane> {
         // Start with a generous default; the renderer will resize to fit on
         // first sync_terminal_size pass.
@@ -137,12 +147,14 @@ impl PaneSpawner for GuiSpawner {
         let alive = Arc::new(AtomicBool::new(true));
         let activity = Arc::new(AtomicBool::new(false));
         let last_output_ms = Arc::new(AtomicU64::new(now_ms()));
+        let waker = self.waker.lock().ok().and_then(|g| g.clone());
         let join = spawn_reader_thread(
             reader,
             Arc::clone(&terminal),
             Arc::clone(&alive),
             Arc::clone(&activity),
             Arc::clone(&last_output_ms),
+            waker,
         );
         // Watch the child for exit independently of the reader's EOF.
         // On Windows, ConPTY frequently leaves the master reader blocked
@@ -1825,6 +1837,7 @@ fn run_gui(
     let spawner: Arc<dyn PaneSpawner> = Arc::new(GuiSpawner {
         config: config.clone(),
         history: history.clone(),
+        waker: Mutex::new(None),
     });
     let events: Arc<dyn EventSink> = Arc::new(PluginBridge(plugins));
     let session_path = cache_dir().map(|d| d.join("session.toml"));
@@ -2171,6 +2184,7 @@ fn spawn_reader_thread(
     alive: Arc<AtomicBool>,
     activity: Arc<AtomicBool>,
     last_output_ms: Arc<AtomicU64>,
+    waker: Option<rterm_render::Waker>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut buf = [0u8; 8192];
@@ -2216,8 +2230,17 @@ fn spawn_reader_thread(
                         }
                     };
                     t.advance(&buf[..n]);
+                    // Drop the lock before waking so the render thread
+                    // doesn't immediately block on a still-held mutex.
+                    drop(t);
                     activity.store(true, Ordering::Relaxed);
                     last_output_ms.store(now_ms(), Ordering::Relaxed);
+                    // Kick the event loop out of `Wait` to paint the
+                    // new output. Coalesced — a burst of reads queues
+                    // at most one outstanding wake.
+                    if let Some(w) = waker.as_ref() {
+                        w.wake();
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("pty read error: {e}");
