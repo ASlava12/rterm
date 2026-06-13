@@ -4935,6 +4935,15 @@ impl App {
     /// contents based on what's under the click: a tab, the header bar,
     /// or a pane.
     fn open_context_menu(&mut self, x: f64, y: f64) {
+        // A blocking modal (paste confirmation / tab rename) owns input
+        // and renders ABOVE the context menu, so a menu opened here
+        // would be invisible yet still swallow the next left-click
+        // (possibly firing "Close pane" etc.). Keyboard already routes
+        // to the modal first; ignore the right-click to keep mouse and
+        // keyboard consistent.
+        if self.paste_confirmation.is_some() || self.rename_tab.is_some() {
+            return;
+        }
         // Close any other modal — a single overlay at a time keeps the
         // input routing simple. show_app_menu cleared too so the
         // hamburger glyph isn't highlighted while a different menu is
@@ -8112,8 +8121,9 @@ impl App {
                     Key::Named(NamedKey::Enter) if ctrl => {
                         // Ctrl+Enter applies the edited buffer.
                         let text = modal.text.clone();
+                        let uid = modal.pane_uid;
                         self.paste_confirmation = None;
-                        self.commit_paste_now(&text);
+                        self.commit_paste_now(&text, Some(uid));
                     }
                     Key::Named(NamedKey::Enter) => {
                         modal.edit_insert('\n');
@@ -8555,7 +8565,7 @@ impl App {
         match btn {
             PasteButton::Paste => {
                 if let Some(modal) = self.paste_confirmation.take() {
-                    self.commit_paste_now(&modal.text);
+                    self.commit_paste_now(&modal.text, Some(modal.pane_uid));
                 }
             }
             PasteButton::Edit => {
@@ -9345,15 +9355,24 @@ impl App {
                 return;
             }
         }
-        let Some(pane) = self.focused_pane() else { return };
+        // Scroll the pane UNDER THE CURSOR, not the focused one — that's
+        // what every other terminal/editor does and it keeps wheel
+        // mouse-reporting coordinates inside the pane the cursor is
+        // actually over (otherwise `pixel_to_cell` clamps an
+        // out-of-rect position to edge cells and sends bogus coords to
+        // the TUI). Falls back to the focused pane when the cursor is
+        // over a gap / chrome rather than any pane.
+        let target_idx = self
+            .pane_at(self.cursor_pos.x, self.cursor_pos.y)
+            .or_else(|| self.active_tab().and_then(|t| t.focused_index()))
+            .unwrap_or(0);
+        let Some(pane) = self.active_tab().and_then(|t| t.pane_at(target_idx)) else {
+            return;
+        };
         // If the shell wants mouse events, forward wheel as button 64 / 65.
         if let Some((_mode, sgr)) = mouse_mode_for(pane) {
-            let focused_idx = self
-                .active_tab()
-                .and_then(|t| t.focused_index())
-                .unwrap_or(0);
             let p = self
-                .pixel_to_cell(focused_idx, self.cursor_pos.x, self.cursor_pos.y)
+                .pixel_to_cell(target_idx, self.cursor_pos.x, self.cursor_pos.y)
                 .unwrap_or(SelectionPoint { row: 0, col: 0 });
             let button = if step > 0 { 64 } else { 65 };
             for _ in 0..step.unsigned_abs() {
@@ -9431,7 +9450,10 @@ impl App {
             }
             return;
         }
-        self.commit_paste_now(text);
+        // No modal: synchronous paste to the currently focused pane —
+        // focus can't change between here and the write, so `None`
+        // (focused) is correct.
+        self.commit_paste_now(text, None);
     }
 
     /// Send `text` to the focused pane's PTY without going through
@@ -9439,8 +9461,27 @@ impl App {
     /// line-ending normalisation + strips embedded markers. Used by
     /// both the unconfirmed paste path and the modal's "Paste" /
     /// "Apply" actions.
-    fn commit_paste_now(&mut self, text: &str) {
-        let Some(pane) = self.focused_pane() else { return };
+    /// Commit a paste to a pane. `target_uid = Some(uid)` sends to that
+    /// specific pane (the confirmation modal records the uid of the
+    /// pane it was opened for, so a focus change while the modal was up
+    /// — pane death + refocus, a plugin `focus_pane`, etc. — can't
+    /// redirect the paste into the wrong shell). `None` uses the
+    /// currently focused pane (direct, non-modal paste). A target uid
+    /// that no longer resolves drops the paste.
+    fn commit_paste_now(&mut self, text: &str, target_uid: Option<u64>) {
+        let pane = match target_uid {
+            Some(uid) => match self.find_pane_by_uid(uid) {
+                Some(p) => p,
+                None => {
+                    tracing::warn!(uid, "paste target pane is gone — dropping paste");
+                    return;
+                }
+            },
+            None => match self.focused_pane() {
+                Some(p) => p,
+                None => return,
+            },
+        };
         // Strip embedded bracketed-paste markers first so a malicious
         // clipboard payload can't include a literal `\x1b[201~` to "close"
         // our paste early and have the following bytes interpreted as
@@ -9554,8 +9595,20 @@ impl App {
         // Enter so a popup-driven nav doesn't accidentally also
         // walk the cursor in the shell. Returns `true` when the
         // popup handled the key (no further forwarding); falls
-        // through otherwise.
-        if self.suggestion_popup.is_some() && self.handle_suggestion_popup_key(event) {
+        // through otherwise. GATED on no modal overlay being up: the
+        // popup has the LOWEST render precedence (any overlay hides
+        // it), so without this guard an invisible popup would steal
+        // Esc / Tab from the visible palette / search / help / menu.
+        let modal_overlay_up = self.rename_tab.is_some()
+            || self.context_menu.is_some()
+            || self.palette.is_some()
+            || self.show_help
+            || self.show_settings
+            || self.search.is_some();
+        if !modal_overlay_up
+            && self.suggestion_popup.is_some()
+            && self.handle_suggestion_popup_key(event)
+        {
             return false;
         }
         // Rename tab overlay owns the keyboard while editing.
