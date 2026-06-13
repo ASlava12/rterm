@@ -37,14 +37,10 @@ rterm-history = { path = "crates/rterm-history" }
 
 # Error handling
 anyhow = "1.0"
-thiserror = "1.0"
 
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "tracing-log"] }
-
-# Async
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "time"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -57,7 +53,7 @@ toml = "0.8"
 toml_edit = "0.22"
 
 # Lua plugins
-mlua = { version = "0.10", features = ["lua54", "vendored", "send", "async"] }
+mlua = { version = "0.10", features = ["lua54", "vendored", "send"] }
 
 # Terminal emulation
 vte = "0.13"

@@ -22,7 +22,6 @@ impl App {
     /// so caller indices by pane index still line up — only the
     /// focused pane gets the full inner rect.
     pub(crate) fn layout_active_tab(&self) -> Vec<PaneRect> {
-        let _ = self.state.as_ref().is_some(); // bail-early guard via outer_rect below
         let Some(tab) = self.active_tab() else { return vec![] };
         if tab.pane_count() == 0 {
             return vec![];

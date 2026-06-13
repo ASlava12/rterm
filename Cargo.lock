@@ -1434,7 +1434,6 @@ checksum = "c1f5f8fbebc7db5f671671134b9321c4b9aa9adeafccfd9a8c020ae45c6a35d0"
 dependencies = [
  "bstr",
  "either",
- "futures-util",
  "mlua-sys",
  "num-traits",
  "parking_lot",
@@ -2320,7 +2319,6 @@ dependencies = [
  "rterm-render",
  "serde",
  "serde_json",
- "tokio",
  "toml 0.8.23",
  "toml_edit 0.22.27",
  "tracing",
@@ -2336,9 +2334,7 @@ version = "0.0.11"
 dependencies = [
  "anyhow",
  "serde",
- "thiserror 1.0.69",
  "toml 0.8.23",
- "tracing",
 ]
 
 [[package]]
@@ -2347,7 +2343,6 @@ version = "0.0.11"
 dependencies = [
  "base64",
  "bitflags 2.11.1",
- "thiserror 1.0.69",
  "tracing",
  "unicode-width 0.2.2",
  "vte",
@@ -2370,7 +2365,6 @@ dependencies = [
  "mlua",
  "regex",
  "rterm-core",
- "thiserror 1.0.69",
  "tracing",
 ]
 
@@ -2381,7 +2375,6 @@ dependencies = [
  "anyhow",
  "portable-pty",
  "rterm-core",
- "thiserror 1.0.69",
  "tracing",
 ]
 
@@ -2401,7 +2394,6 @@ dependencies = [
  "regex",
  "rterm-core",
  "rterm-history",
- "thiserror 1.0.69",
  "tracing",
  "unicode-width 0.2.2",
  "wgpu",
@@ -3010,28 +3002,6 @@ name = "tinyvec_macros"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
-
-[[package]]
-name = "tokio"
-version = "1.52.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
-dependencies = [
- "bytes",
- "pin-project-lite",
- "tokio-macros",
-]
-
-[[package]]
-name = "tokio-macros"
-version = "2.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "385a6cb71ab9ab790c5fe8d67f1645e6c450a7ce006a33de03daa956cf70a496"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
 
 [[package]]
 name = "toml"

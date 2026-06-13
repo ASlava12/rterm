@@ -982,15 +982,6 @@ impl TextLayer {
         (self.line_height * 1.6 + 6.0).max(self.line_height + 4.0)
     }
 
-    /// Reserved height of the status / search bar painted at the
-    /// bottom of the window. Zero when nothing is showing there;
-    /// `line_height + 6` when the search overlay is open so the
-    /// prompt has breathing room. The App passes the "is search
-    /// active" hint via `bottom_bar_active`.
-    pub fn status_bar_height(&self) -> f32 {
-        0.0
-    }
-
     /// Height the bottom bar should reserve right now, given whether
     /// any of its consumers (currently: the search prompt) is asking
     /// for visible space. Computed dynamically each frame so the pane
@@ -1997,8 +1988,6 @@ impl GpuState {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,

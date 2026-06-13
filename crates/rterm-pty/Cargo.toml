@@ -10,6 +10,5 @@ description = "Cross-platform PTY spawning and I/O for rterm"
 [dependencies]
 portable-pty = { workspace = true }
 anyhow = { workspace = true }
-thiserror = { workspace = true }
 tracing = { workspace = true }
 rterm-core = { workspace = true }

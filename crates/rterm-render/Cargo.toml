@@ -20,7 +20,6 @@ base64 = { workspace = true }
 regex = { workspace = true }
 unicode-width = { workspace = true }
 anyhow = { workspace = true }
-thiserror = { workspace = true }
 tracing = { workspace = true }
 rterm-core = { workspace = true }
 rterm-history = { workspace = true }

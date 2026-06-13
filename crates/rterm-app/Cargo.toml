@@ -28,7 +28,6 @@ toml = { workspace = true }
 toml_edit = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-tokio = { workspace = true }
 
 # Update-check feature talks to the GitHub releases REST API. Pulled
 # in here so the runtime binary depends on it; ureq is sync, blocking,

@@ -22,8 +22,6 @@
 //! span list based on `PasteConfirmation::mode` and routes keys /
 //! mouse through `handle_key` / `handle_press`.
 
-use std::sync::atomic::Ordering;
-
 /// Owned modal state. `App` holds it in an `Option`.
 #[derive(Debug, Clone)]
 pub(crate) struct PasteConfirmation {
@@ -118,15 +116,6 @@ pub(crate) fn render_button_label(b: PasteButton, selected: PasteButton) -> Stri
 }
 
 impl PasteButton {
-    #[allow(dead_code)] // exposed for future test scaffolding
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            PasteButton::Paste => "Paste",
-            PasteButton::Edit => "Edit",
-            PasteButton::Cancel => "Cancel",
-        }
-    }
-
     pub(crate) fn next(self) -> Self {
         match self {
             PasteButton::Paste => PasteButton::Edit,
@@ -666,13 +655,6 @@ pub(crate) fn should_confirm(text: &str, cfg: &crate::PasteConfirmConfig) -> boo
         return false;
     }
     text.len() >= cfg.min_bytes as usize
-}
-
-// Touch a never-used Ordering import in tests below so the linter
-// is happy on builds where the tests are excluded.
-#[allow(dead_code)]
-fn _dont_warn_about_ordering() {
-    let _ = Ordering::Relaxed;
 }
 
 #[cfg(test)]

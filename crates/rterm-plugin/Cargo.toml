@@ -10,7 +10,6 @@ description = "Lua plugin host for rterm (built on mlua, Lua 5.4)"
 [dependencies]
 mlua = { workspace = true }
 anyhow = { workspace = true }
-thiserror = { workspace = true }
 tracing = { workspace = true }
 rterm-core = { workspace = true }
 regex = { workspace = true }

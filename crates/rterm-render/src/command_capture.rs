@@ -160,7 +160,6 @@ impl CommandBuffer {
     /// half-typed prefix. Returns the bytes interpreted as UTF-8;
     /// non-UTF-8 trailing bytes (e.g. mid-character on a paste) are
     /// dropped so the renderer never sees a partial codepoint.
-    #[allow(dead_code)] // wired up in the popup integration commit
     pub(crate) fn current_input(&self) -> String {
         // `from_utf8_lossy` substitutes a U+FFFD for each invalid
         // sequence; that's fine for a *display* of the prefix but
@@ -270,7 +269,6 @@ impl CommandCapture {
 
     /// Snapshot the current half-typed command. Empty string when
     /// the buffer is empty (no prefix → popup typically hides).
-    #[allow(dead_code)] // wired up in the popup integration commit
     pub(crate) fn current_input(&self) -> String {
         self.buffer
             .lock()
@@ -282,7 +280,6 @@ impl CommandCapture {
     /// Monotonic generation. The popup refresh-debouncer uses
     /// `generation` deltas to detect input changes without holding
     /// the buffer mutex across frames.
-    #[allow(dead_code)] // wired up in the popup integration commit
     pub(crate) fn generation(&self) -> u64 {
         self.generation.load(std::sync::atomic::Ordering::Relaxed)
     }

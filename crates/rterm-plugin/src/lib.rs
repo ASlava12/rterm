@@ -4324,7 +4324,6 @@ impl PluginHost {
     /// is atomic across all fields, and the renderer applies whatever it
     /// drains at the next frame.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub fn apply_config_snapshot(
         &self,
         scrollback: usize,
