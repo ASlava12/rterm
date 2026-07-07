@@ -19,6 +19,7 @@ pub fn validates_as_image(bytes: &[u8]) -> bool {
     image::load_from_memory(bytes).is_ok()
 }
 pub mod palette;
+pub mod highlight;
 pub(crate) mod tree;
 pub mod action;
 pub use action::AppAction;
@@ -216,9 +217,31 @@ fn build_spans(
     // `== c` test here matched no cell, leaving that glyph un-inverted
     // (invisible against the block). Clamping inverts the right cell.
     let cursor_col = (cursor.col).min(cols.saturating_sub(1));
+    // Client-side syntax highlighting (WindTerm-style). Nothing runs
+    // when no rules are configured.
+    let hl = highlight::active();
+    let hl_active = hl.is_active();
     let mut spans: Vec<(String, StyleKey)> = Vec::with_capacity(rows as usize);
     for r in 0..rows {
         let Some(row) = terminal.visible_row(offset, r) else { continue };
+        // Per-column highlight overrides for this row. Built by running
+        // the rules over the row's logical text (spacers excluded), then
+        // applied below ONLY to default-fg, non-inverted cells so the
+        // shell's own colours / selection / cursor always win.
+        let mut hl_overrides: Vec<Option<highlight::HStyle>> = Vec::new();
+        if hl_active {
+            hl_overrides = vec![None; row.len()];
+            let mut text = String::new();
+            let mut char_cols: Vec<u16> = Vec::with_capacity(row.len());
+            for (c, cell_ref) in row.iter().enumerate() {
+                if cell_ref.attrs.contains(CellAttrs::WIDE_SPACER) {
+                    continue;
+                }
+                text.push(cell_ref.ch);
+                char_cols.push(c as u16);
+            }
+            hl.overlay(&text, &char_cols, &mut hl_overrides);
+        }
         let mut current_text = String::new();
         let mut current_key: Option<StyleKey> = None;
         for (c, cell_ref) in row.iter().enumerate() {
@@ -232,7 +255,24 @@ fn build_spans(
             let is_selected = selection
                 .map(|s| s.contains(r, c as u16))
                 .unwrap_or(false);
-            let key = StyleKey::from_cell(&cell, is_cursor, is_selected, reverse_screen);
+            let mut key = StyleKey::from_cell(&cell, is_cursor, is_selected, reverse_screen);
+            // Overlay a highlight colour only on plain cells: default
+            // foreground, no SGR reverse, not under the cursor, not
+            // selected, and not on a reverse-screen. That keeps
+            // highlighting purely additive over `ls`/`bat`/`git` output
+            // and never disturbs a selection or the cursor block.
+            if hl_active
+                && matches!(cell.fg, TermColor::Default)
+                && !is_cursor
+                && !is_selected
+                && !reverse_screen
+                && !cell.attrs.contains(CellAttrs::REVERSE)
+            {
+                if let Some(hs) = hl_overrides.get(c).copied().flatten() {
+                    key.fg = hs.fg;
+                    key.bold = key.bold || hs.bold;
+                }
+            }
             if current_key == Some(key) {
                 current_text.push(cell.ch);
             } else {
@@ -14991,6 +15031,42 @@ mod tests {
         let substring = fuzzy_score("next tab", "tab").unwrap();
         let fuzzy = fuzzy_score("toggle a button", "tab").unwrap();
         assert!(substring > fuzzy, "substring={substring} fuzzy={fuzzy}");
+    }
+
+    #[test]
+    fn build_spans_highlights_only_default_fg_cells() {
+        // Install a rule that colours "ERROR" red, then render a grid
+        // where the word appears once in plain (default fg) text and
+        // once already coloured green by SGR. The plain one must pick
+        // up the highlight; the SGR-coloured one must stay green.
+        highlight::set_rules(
+            true,
+            false,
+            vec![highlight::HighlightRuleInput {
+                pattern: r"ERROR".to_string(),
+                fg: [200, 40, 40],
+                bold: false,
+            }],
+        );
+        let mut term = Terminal::new(rterm_core::Size { cols: 24, rows: 2 });
+        // Row 0: plain "ERROR". Row 1: SGR green "ERROR" (\x1b[32m).
+        term.advance(b"ERROR\r\n\x1b[32mERROR\x1b[0m");
+        let spans = build_spans(&term, 0, false, false, None);
+        // Concatenate the text and find which style each "ERROR" got.
+        // The plain-row span carrying "ERROR" should be the rule red;
+        // the SGR row's should be green (~ [152,195,121]-ish is the
+        // palette green; just assert it's NOT the rule red).
+        let red = [200, 40, 40];
+        let plain_red = spans
+            .iter()
+            .any(|(t, k)| t.contains("ERROR") && k.fg == red);
+        let sgr_kept = spans
+            .iter()
+            .any(|(t, k)| t.contains("ERROR") && k.fg != red);
+        assert!(plain_red, "plain default-fg ERROR should be highlighted red");
+        assert!(sgr_kept, "SGR-coloured ERROR must NOT be overridden");
+        // Clean up the global so other tests see no rules.
+        highlight::set_rules(false, false, vec![]);
     }
 
     fn test_pane(title: &str) -> Pane {

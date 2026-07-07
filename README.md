@@ -41,6 +41,11 @@ GPU renderer → window. Tabs and BSP-split panes are wired. Lua plugins observe
 - **Selection**: drag / double-click word / triple-click line, clipboard
   copy via `Ctrl+Shift+C` (no auto-copy).
 - **Search overlay**: literal + regex, forward / backward, `Esc` exits.
+- **Syntax highlighting**: WindTerm-style client-side regex rules recolour
+  terminal output (URLs, IPs, UUIDs, hex, `ERROR`/`WARN`/`INFO`, quoted
+  strings, numbers) — applied only to default-coloured text, so it never
+  fights `ls --color` / `bat` / TUIs. Built-ins + custom rules via
+  `[highlight]` in `config.toml`; hot-reloadable.
 - **Scrollback**: bounded ring per pane, viewport navigation with
   `Shift+PgUp/PgDn/Home/End`, single-line and half-page actions, programmatic
   scroll-to-line via plugins, scrollback save.

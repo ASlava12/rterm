@@ -26,6 +26,7 @@ pub struct Config {
     pub history: HistoryConfig,
     pub paste: PasteConfig,
     pub image: ImageConfig,
+    pub highlight: HighlightConfig,
 }
 
 /// Inline-image protocol toggles. When `enabled = false`, both
@@ -313,6 +314,41 @@ pub struct ColorsConfig {
     pub bright_magenta: Option<[u8; 3]>,
     pub bright_cyan: Option<[u8; 3]>,
     pub bright_white: Option<[u8; 3]>,
+}
+
+/// WindTerm-style client-side syntax highlighting of terminal output.
+/// A set of regex rules recolours matched text; the renderer applies
+/// the colour only to cells that still carry the DEFAULT foreground, so
+/// highlighting is purely additive over output a program already
+/// coloured (`ls --color`, `bat`, `git`, TUIs).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HighlightConfig {
+    /// Master switch. `false` disables highlighting entirely.
+    pub enabled: bool,
+    /// Include the built-in rule set (URLs, IPv4, UUID, hex, log
+    /// levels, quoted strings, numbers). Set `false` to start from a
+    /// clean slate and define everything via `rules`.
+    pub builtins: bool,
+    /// User rules, evaluated BEFORE the built-ins (first-match-wins per
+    /// column), so a rule here overrides a built-in on the same text.
+    pub rules: Vec<HighlightRule>,
+}
+
+impl Default for HighlightConfig {
+    fn default() -> Self {
+        Self { enabled: true, builtins: true, rules: Vec::new() }
+    }
+}
+
+/// One highlight rule: a regex `pattern`, a foreground colour (`fg`, as
+/// `#RRGGBB` / `#RGB` / a colour name), and optional `bold`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HighlightRule {
+    pub pattern: String,
+    pub fg: String,
+    pub bold: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

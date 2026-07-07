@@ -348,3 +348,26 @@ auto_detect = false
 # [[keybindings]]
 # keys   = "F2"
 # action = "search"
+
+# --- Syntax highlighting -----------------------------------------------------
+# WindTerm-style client-side highlighting of terminal output. Matched text is
+# recoloured, but ONLY where the program left the default foreground — so it
+# enhances plain logs / command output and never fights `ls --color`, `bat`,
+# `git`, or a full-screen TUI.
+[highlight]
+# enabled  = true    # master switch
+# builtins = true    # ship the default rules (URLs, IPv4, UUID, hex,
+#                    # ERROR/WARN/INFO, quoted strings, numbers). Set false to
+#                    # start clean and define everything below.
+
+# Custom rules run BEFORE the built-ins (first match on a character wins), so a
+# rule here overrides a built-in on the same text. `fg` accepts #RRGGBB, #RGB,
+# or a colour name (red green yellow orange blue magenta cyan white gray).
+# [[highlight.rules]]
+# pattern = "\\bTODO\\b"
+# fg      = "orange"
+# bold    = true
+
+# [[highlight.rules]]
+# pattern = "\\b[A-Z]{2,}_[A-Z_]+\\b"   # SCREAMING_SNAKE constants
+# fg      = "magenta"

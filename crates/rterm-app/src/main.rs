@@ -1684,6 +1684,9 @@ fn spawn_watcher(plugins: Arc<Mutex<PluginHost>>, config_dir: PathBuf, config_to
                         }
                         rterm_render::palette::init_palette(build_palette_over(&cfg.colors));
                         rterm_render::palette::set_bold_is_bright(cfg.font.bold_is_bright);
+                        // Re-install highlight rules so pattern / colour
+                        // edits take effect without a restart.
+                        apply_highlight_config(&cfg.highlight);
                         if let Ok(host) = plugins.lock() {
                             // Single batched call — `apply_config_snapshot`
                             // owns the field list, so adding a new hot-
@@ -1776,6 +1779,8 @@ fn run_gui(
     // Apply `[colors]` overrides on top of whatever theme is now live.
     rterm_render::palette::init_palette(build_palette_over(&config.colors));
     rterm_render::palette::set_bold_is_bright(config.font.bold_is_bright);
+    // Install the syntax-highlight rule set (built-ins + user rules).
+    apply_highlight_config(&config.highlight);
 
     // Log the resolved font family so a user chasing "uneven character
     // widths" can confirm which face actually got picked (matches the
@@ -2119,6 +2124,33 @@ fn read_session(
 #[cfg(test)]
 fn build_palette(c: &rterm_config::ColorsConfig) -> Palette {
     overlay_palette(Palette::default(), c)
+}
+
+/// Translate `[highlight]` config into the renderer's global rule set.
+/// User rules whose colour string doesn't parse are dropped with a
+/// warning (invalid regexes are handled inside `set_rules`).
+fn apply_highlight_config(cfg: &rterm_config::HighlightConfig) {
+    let custom: Vec<rterm_render::highlight::HighlightRuleInput> = cfg
+        .rules
+        .iter()
+        .filter(|r| !r.pattern.is_empty())
+        .filter_map(|r| match rterm_render::highlight::parse_color(&r.fg) {
+            Some(fg) => Some(rterm_render::highlight::HighlightRuleInput {
+                pattern: r.pattern.clone(),
+                fg,
+                bold: r.bold,
+            }),
+            None => {
+                tracing::warn!(
+                    pattern = %r.pattern,
+                    fg = %r.fg,
+                    "highlight rule skipped — unrecognised colour"
+                );
+                None
+            }
+        })
+        .collect();
+    rterm_render::highlight::set_rules(cfg.enabled, cfg.builtins, custom);
 }
 
 /// Same as `build_palette`, but starts from the currently-installed
