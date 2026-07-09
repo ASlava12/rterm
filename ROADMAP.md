@@ -61,13 +61,21 @@
 
 ## P1 — Средние (несколько дней каждая)
 
-- [ ] **IME (ввод CJK / dead keys / long-press macOS).** ⭐ первым
-  Сейчас `winit::event::Ime` не обрабатывается вовсе — composed-ввод
-  не работает. Нужно: `Window::set_ime_allowed(true)`, обработка
-  `Ime::Commit` (в PTY через `send_input`) и `Ime::Preedit`
-  (отрисовка у курсора), `set_ime_cursor_area` при движении курсора.
-  DoD: ввод «日本語» через IME на macOS попадает в шелл; preedit
-  виден; Backspace в preedit не уходит в PTY.
+- [x] **IME: ввод CJK / dead keys / long-press macOS.** (2026-07)
+  `set_ime_allowed(true)` при создании окна; `WindowEvent::Ime` arm —
+  `Ime::Commit` уходит в фокусную панель через `send_input` (日本語
+  попадает в шелл), кандидатное окно позиционируется у курсора через
+  `set_ime_cursor_area` (`update_ime_cursor_area` + чистая
+  `ime_cursor_rect` с тестом). Composing показывает ОС-попап; Backspace
+  во время композиции правит preedit (перехвачен ОС, не уходит в PTY).
+
+- [ ] **IME: инлайн-рендер preedit у курсора.** (follow-up к IME)
+  Сейчас composing показывает ОС-кандидатное окно. Дорисовать
+  composing-текст подчёркнутым inline в позиции курсора (нужен
+  preedit-буфер в `TextLayer` + staging в `prepare`, по образцу
+  удалённого `title_bar`). `Ime::Preedit(text, range)` уже приходит —
+  сохранить `text` в App и отрисовать.
+  DoD: composing-текст виден inline под курсором; курсор не съезжает.
 
 - [ ] **Kitty keyboard protocol (CSI u, progressive enhancement).**
   Ждут neovim / helix / fish. Минимум: `CSI > flags u` push/pop stack,

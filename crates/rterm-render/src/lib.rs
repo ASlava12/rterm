@@ -5829,6 +5829,29 @@ impl App {
         rects.get(idx).copied()
     }
 
+    /// Anchor the OS IME candidate / composition window to the focused
+    /// pane's terminal cursor so composition renders where the text
+    /// will land. Called on every `WindowEvent::Ime`. No-op before the
+    /// GPU state exists or when nothing is focused.
+    fn update_ime_cursor_area(&self) {
+        let Some(state) = self.state.as_ref() else { return };
+        let Some(rect) = self.focused_pane_rect() else { return };
+        let cell_w = state.text.cell_width();
+        let line_h = state.text.line_height();
+        let (col, row) = match self
+            .focused_pane()
+            .and_then(|p| p.terminal.lock().ok().map(|t| t.cursor()))
+        {
+            Some(c) => (c.col, c.row),
+            None => return,
+        };
+        let (x, y, w, h) = ime_cursor_rect(rect, col, row, cell_w, line_h);
+        state.window.set_ime_cursor_area(
+            winit::dpi::PhysicalPosition::new(x, y),
+            winit::dpi::PhysicalSize::new(w, h),
+        );
+    }
+
     fn split_active_pane(&mut self, dir: SplitDir) {
         let cwd = self.focused_cwd();
         self.split_active_pane_in(dir, cwd.as_deref());
@@ -10738,6 +10761,23 @@ fn half_page_rows(page: i32) -> i32 {
     }
 }
 
+/// Pixel rect (x, y, w, h) of the terminal cursor cell within a pane,
+/// used to anchor the OS IME candidate window. Coordinates are physical
+/// px (the pane rect and cell metrics are already physical). The rect
+/// is one cell wide/tall; width/height are floored at 1 so winit never
+/// gets a degenerate size.
+fn ime_cursor_rect(
+    pane: PaneRect,
+    col: u16,
+    row: u16,
+    cell_w: f32,
+    line_h: f32,
+) -> (f32, f32, f32, f32) {
+    let x = pane.left + col as f32 * cell_w;
+    let y = pane.top + row as f32 * line_h;
+    (x, y, cell_w.max(1.0), line_h.max(1.0))
+}
+
 /// Saturate a computed scrollback offset into the `u16` the per-pane
 /// `scroll_offset` atomic holds. Scrollback can exceed 65 535 lines
 /// (the limit is plugin-settable up to 1M), so a bare `as u16` would
@@ -11151,6 +11191,11 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(state) = self.state.as_ref() {
                     state.window.set_cursor(CursorIcon::Text);
                     self.last_cursor_icon = CursorIcon::Text;
+                    // Enable IME so composed input (CJK, dead keys,
+                    // macOS long-press accents) reaches the terminal via
+                    // `WindowEvent::Ime`. Without this winit never emits
+                    // Ime events and those keystrokes are lost.
+                    state.window.set_ime_allowed(true);
                 }
                 // Kick the redraw chain. On Wayland the surface is not
                 // mapped (visible) until the client submits its first
@@ -11336,6 +11381,24 @@ impl ApplicationHandler<UserEvent> for App {
                 event_loop.exit();
             }
             WindowEvent::KeyboardInput { .. } => {}
+            WindowEvent::Ime(ime) => {
+                use winit::event::Ime;
+                // Final composed text (CJK, dead keys, macOS long-press
+                // accents) — send it to the focused pane's shell exactly
+                // like typed input. Preedit / Enabled / Disabled / empty
+                // Commit need nothing here: the OS candidate window shows
+                // composition, kept anchored by the cursor-area update.
+                if let Ime::Commit(text) = &ime {
+                    if !text.is_empty() {
+                        if let Some(pane) = self.focused_pane() {
+                            pane.send_input(text.as_bytes());
+                        }
+                    }
+                }
+                // Re-anchor the IME candidate window to the terminal
+                // cursor so composition renders where the text lands.
+                self.update_ime_cursor_area();
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 // Paste-confirmation modal grabs wheel events while
                 // up. In edit mode the wheel scrolls the cursor
@@ -15039,6 +15102,19 @@ mod tests {
         let substring = fuzzy_score("next tab", "tab").unwrap();
         let fuzzy = fuzzy_score("toggle a button", "tab").unwrap();
         assert!(substring > fuzzy, "substring={substring} fuzzy={fuzzy}");
+    }
+
+    #[test]
+    fn ime_cursor_rect_maps_cell_to_pixels() {
+        let pane = PaneRect { left: 10.0, top: 20.0, width: 800.0, height: 400.0 };
+        // Cursor at col 3, row 2, 8px cells / 16px lines.
+        let (x, y, w, h) = ime_cursor_rect(pane, 3, 2, 8.0, 16.0);
+        assert_eq!((x, y), (10.0 + 3.0 * 8.0, 20.0 + 2.0 * 16.0));
+        assert_eq!((w, h), (8.0, 16.0));
+        // Degenerate metrics floor at 1×1 so winit never gets a zero
+        // size for the candidate window.
+        let (_, _, w0, h0) = ime_cursor_rect(pane, 0, 0, 0.0, 0.0);
+        assert_eq!((w0, h0), (1.0, 1.0));
     }
 
     #[test]
