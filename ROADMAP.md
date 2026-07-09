@@ -50,15 +50,14 @@
   Integration-тест (`tests/smoke_isolation.rs`) через `CARGO_BIN_EXE`:
   init.lua с сентинелом не исполняется под `--smoke`.
 
-- [ ] **Гигиена документации.**
-  Удалить/реализовать мёртвый `title_bar`-плюмбинг
-  (`lib.rs: let title_bar: AnchoredSpans = None` + параметр через
-  `GpuState::render`); поправить стейл-комментарии «lands in the next
-  commit» у Kitty APC (`terminal.rs:~381, ~1309`); удалить
-  неиспользуемые индексы `idx_commands_count/last_used` в
-  rterm-history (план LIKE-запроса их не использует — только налог на
-  запись) и поправить доку «O(log N)».
-  DoD: grep-чисто, тесты зелёные.
+- [x] **Гигиена документации.** (2026-07)
+  Полностью удалён мёртвый `title_bar`-плюмбинг (структура
+  `TitleBarDraw`, поле `title_bar_buffer` + инициализация + обновления
+  шрифта, always-None binding, параметр через `prepare`/`render`).
+  Стейл-комментарии «next commit» у Kitty APC поправлены. Индексы
+  `idx_commands_count/last_used` удалены (`DROP INDEX IF EXISTS` чистит
+  старые БД; план LIKE-запроса их не использовал) + поправлена дока
+  «O(log N)». Всё зелёное, GUI рендерит.
 
 ## P1 — Средние (несколько дней каждая)
 

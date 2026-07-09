@@ -680,10 +680,6 @@ pub struct TextLayer {
     /// to land exactly on top of the ghost chip, closing the visual
     /// gap. Empty buffer when no drag is active.
     header_tabs_ghost_buffer: Buffer,
-    /// Window-title text in the centre of the top-row title bar
-    /// (VSCode pattern). Separate from `header_buffer` so its position
-    /// can be derived independently of the tab strip's width.
-    title_bar_buffer: Buffer,
     /// Bottom-of-window status bar text — shell name, cwd, pane count.
     status_bar_buffer: Buffer,
     overlay_buffer: Buffer,
@@ -775,14 +771,6 @@ pub struct HeaderTabsGhostDraw<'a> {
 /// passed separately so positioning never depends on the variable-width
 /// text in the main header buffer.
 pub struct HeaderRightDraw<'a> {
-    pub spans: SpanList<'a>,
-    pub rect: PaneRect,
-}
-
-/// Centered window-title text in the top row of the VSCode-style
-/// header. Lives in its own buffer to position independently of the
-/// tab strip.
-pub struct TitleBarDraw<'a> {
     pub spans: SpanList<'a>,
     pub rect: PaneRect,
 }
@@ -1009,8 +997,6 @@ impl TextLayer {
         let mut header_tabs_ghost_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_height));
         header_tabs_ghost_buffer.set_monospace_width(&mut font_system, Some(cell_width));
         header_tabs_ghost_buffer.set_wrap(&mut font_system, Wrap::None);
-        let mut title_bar_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_height));
-        title_bar_buffer.set_monospace_width(&mut font_system, Some(cell_width));
         let mut status_bar_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_height));
         status_bar_buffer.set_monospace_width(&mut font_system, Some(cell_width));
         let mut overlay_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_height));
@@ -1029,7 +1015,6 @@ impl TextLayer {
             header_right_buffer,
             header_tabs_buffer,
             header_tabs_ghost_buffer,
-            title_bar_buffer,
             status_bar_buffer,
             overlay_buffer,
             font_size,
@@ -1113,7 +1098,6 @@ impl TextLayer {
             &mut self.header_buffer,
             &mut self.header_right_buffer,
             &mut self.header_tabs_buffer,
-            &mut self.title_bar_buffer,
             &mut self.status_bar_buffer,
             &mut self.overlay_buffer,
         ] {
@@ -1172,7 +1156,6 @@ impl TextLayer {
             &mut self.header_buffer,
             &mut self.header_right_buffer,
             &mut self.header_tabs_buffer,
-            &mut self.title_bar_buffer,
             &mut self.status_bar_buffer,
             &mut self.overlay_buffer,
         ] {
@@ -1250,7 +1233,6 @@ impl TextLayer {
         header_right: Option<&HeaderRightDraw<'_>>,
         header_tabs: Option<&HeaderTabsDraw<'_>>,
         header_tabs_ghost: Option<&HeaderTabsGhostDraw<'_>>,
-        title_bar: Option<&TitleBarDraw<'_>>,
         status_bar: Option<&StatusBarDraw<'_>>,
         overlay: Option<&OverlayDraw<'_>>,
         viewport_size: (u32, u32),
@@ -1477,42 +1459,6 @@ impl TextLayer {
             let text_offset = ((h.rect.height - self.line_height) * 0.5).max(0.0);
             main_areas.push(TextArea {
                 buffer: &self.header_right_buffer,
-                left: h.rect.left,
-                top: h.rect.top + text_offset,
-                scale: 1.0,
-                bounds: TextBounds {
-                    left: h.rect.left as i32,
-                    top: h.rect.top as i32,
-                    right: (h.rect.left + h.rect.width) as i32,
-                    bottom: (h.rect.top + h.rect.height) as i32,
-                },
-                default_color: GlyphColor::rgb(220, 220, 220),
-                custom_glyphs: &[],
-            });
-        }
-        // Title-bar text — centered in the top header row.
-        if let Some(h) = title_bar {
-            self.title_bar_buffer.set_size(
-                &mut self.font_system,
-                Some(h.rect.width),
-                Some(h.rect.height),
-            );
-            self.title_bar_buffer.set_rich_text(
-                &mut self.font_system,
-                h.spans.iter().map(|(s, fg, bold)| {
-                    let mut a = default_attrs.color(GlyphColor::rgb(fg[0], fg[1], fg[2]));
-                    if *bold {
-                        a = a.weight(Weight::BOLD);
-                    }
-                    (*s, a)
-                }),
-                default_attrs,
-                Shaping::Advanced,
-            );
-            self.title_bar_buffer.shape_until_scroll(&mut self.font_system, false);
-            let text_offset = ((h.rect.height - self.line_height) * 0.5).max(0.0);
-            main_areas.push(TextArea {
-                buffer: &self.title_bar_buffer,
                 left: h.rect.left,
                 top: h.rect.top + text_offset,
                 scale: 1.0,
@@ -2072,7 +2018,6 @@ impl GpuState {
         header_right: Option<&HeaderRightDraw<'_>>,
         header_tabs: Option<&HeaderTabsDraw<'_>>,
         header_tabs_ghost: Option<&HeaderTabsGhostDraw<'_>>,
-        title_bar: Option<&TitleBarDraw<'_>>,
         status_bar: Option<&StatusBarDraw<'_>>,
         overlay: Option<&OverlayDraw<'_>>,
         flash: f32,
@@ -2216,7 +2161,6 @@ impl GpuState {
             header_right,
             header_tabs,
             header_tabs_ghost,
-            title_bar,
             status_bar,
             overlay,
             (self.config.width, self.config.height),
@@ -13256,11 +13200,9 @@ impl ApplicationHandler<UserEvent> for App {
                     self.header_tabs_ghost_spans(&mut tabs_ghost_storage);
                 let mut header_right_storage: Vec<String> = Vec::new();
                 let header_right = self.header_right_spans(&mut header_right_storage);
-                // Title bar text is folded back into the single-row
-                // header design (window controls live next to tabs,
-                // there's no separate title row to render). Keep the
-                // status bar at the bottom unchanged.
-                let title_bar: AnchoredSpans = None;
+                // No separate title-bar row — the window title is folded
+                // into the single-row header (controls live next to
+                // tabs). The status bar at the bottom is unchanged.
                 let mut status_bar_storage: Vec<String> = Vec::new();
                 // Bottom-bar dispatch: search prompt wins over the
                 // scrollback indicator (rare case: user opens search
@@ -13586,8 +13528,6 @@ impl ApplicationHandler<UserEvent> for App {
                     };
                     let header_right_draw =
                         header_right.map(|(spans, rect)| HeaderRightDraw { spans, rect });
-                    let title_bar_draw =
-                        title_bar.map(|(spans, rect)| TitleBarDraw { spans, rect });
                     let status_bar_draw =
                         status_bar.map(|(spans, rect)| StatusBarDraw { spans, rect });
                     // Paste-confirmation modal in Edit mode wants
@@ -13809,7 +13749,6 @@ impl ApplicationHandler<UserEvent> for App {
                         header_right_draw.as_ref(),
                         header_tabs_draw.as_ref(),
                         header_tabs_ghost_draw.as_ref(),
-                        title_bar_draw.as_ref(),
                         status_bar_draw.as_ref(),
                         overlay_draw.as_ref(),
                         flash,

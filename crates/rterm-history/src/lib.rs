@@ -27,18 +27,18 @@
 //!     first_used INTEGER NOT NULL,   -- unix seconds
 //!     context    TEXT NOT NULL DEFAULT '*'  -- per-host bucket (future)
 //! );
-//! CREATE INDEX idx_commands_count     ON commands(count DESC);
-//! CREATE INDEX idx_commands_last_used ON commands(last_used DESC);
 //! ```
 //!
 //! ## Operations
 //!
 //! All public methods are blocking — the renderer calls them from the
-//! UI thread. Each is `O(log N)` for the underlying B-tree lookup
-//! plus `O(M)` for an `M`-row LIMIT scan of the matching prefix.
-//! Practical workloads (≤100k rows, prefix scans returning ≤50)
-//! complete in well under 1ms; the renderer's per-frame budget
-//! accommodates them without measurable cost.
+//! UI thread. `suggest` filters on `text LIKE ?1 ESCAPE '\\'`, which
+//! SQLite serves with a full-table scan + sort — the `ESCAPE` clause
+//! defeats the prefix-index optimisation, so no secondary index helps
+//! (an earlier `count`/`last_used` index pair only taxed every write
+//! and is gone). Practical workloads (≤100k rows, prefix scans
+//! returning ≤50) still complete in well under 1 ms; the renderer's
+//! per-frame budget accommodates them without measurable cost.
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -105,6 +105,11 @@ impl History {
         // silently dropped; a short retry window absorbs the overlap.
         conn.busy_timeout(std::time::Duration::from_millis(250)).ok();
         conn.execute_batch(
+            // No secondary indexes: the only query (`text LIKE ?
+            // ESCAPE '\\'`) can't use them (see the module doc), so the
+            // former `count`/`last_used` index pair only taxed every
+            // write. `DROP INDEX IF EXISTS` cleans them off DBs created
+            // by older versions.
             "CREATE TABLE IF NOT EXISTS commands (
                  text       TEXT PRIMARY KEY NOT NULL,
                  count      INTEGER NOT NULL DEFAULT 1,
@@ -112,10 +117,8 @@ impl History {
                  first_used INTEGER NOT NULL,
                  context    TEXT NOT NULL DEFAULT '*'
              );
-             CREATE INDEX IF NOT EXISTS idx_commands_count
-                 ON commands(count DESC);
-             CREATE INDEX IF NOT EXISTS idx_commands_last_used
-                 ON commands(last_used DESC);",
+             DROP INDEX IF EXISTS idx_commands_count;
+             DROP INDEX IF EXISTS idx_commands_last_used;",
         )
         .context("init history schema")?;
         Ok(Self { conn })

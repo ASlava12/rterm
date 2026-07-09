@@ -376,9 +376,8 @@ pub struct Terminal {
     /// no `apc_dispatch` callback to hook. We pre-scan the input
     /// stream for APC and divert the body to `dispatch_apc` here,
     /// while non-APC bytes still flow through to the vte parser
-    /// untouched. Required for the Kitty graphics protocol
-    /// (`APC G ...`); will be expanded with the actual handler in
-    /// the next commit.
+    /// untouched. Drives the Kitty graphics protocol (`APC G ...`),
+    /// decoded in `dispatch_apc` / `commit_kitty_image`.
     apc_state: ApcState,
     /// Accumulated payload bytes inside an active APC string.
     /// Capped by [`APC_BUF_CAP`] so a malformed shell can't grow
@@ -1306,8 +1305,7 @@ impl Terminal {
         // exact order they arrived (interleaved 1:1 with the APC
         // dispatches so the cursor is at the right grid position when
         // an image lands). Used by the Kitty graphics protocol; the
-        // actual `G ...` decoder lands in the next commit and lives
-        // behind `Terminal::dispatch_apc`.
+        // `G ...` decoder lives behind `Terminal::dispatch_apc`.
         let mut vte_buf: Vec<u8> = Vec::with_capacity(bytes.len());
         for &b in bytes {
             // While the auto-detect state machine is mid-body
