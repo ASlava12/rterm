@@ -5802,6 +5802,14 @@ impl App {
         let next = (((self.active_tab as isize + delta) % n + n) % n) as usize;
         if next != self.active_tab {
             self.previous_tab = Some(self.active_tab);
+            // Animate the accent-stripe slide, same as `select_tab` /
+            // `toggle_last_tab` — Ctrl+Shift+←/→ shouldn't jump while
+            // click / Ctrl+Shift+N slides.
+            self.tab_switch_anim = Some(TabSwitchAnim {
+                from_idx: self.active_tab,
+                to_idx: next,
+                started_at: Instant::now(),
+            });
         }
         self.active_tab = next;
         self.reset_cursor_blink();
@@ -11482,12 +11490,19 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             }
-            WindowEvent::KeyboardInput { event: key_event, .. }
-                if self.handle_key(&key_event) =>
-            {
-                event_loop.exit();
+            // `handle_key` does the real work (PTY writes, clipboard,
+            // tab mutation) and returns `true` only for the Quit path.
+            // Deliberately NOT a match guard: guards are expected to be
+            // pure, and hiding these side effects in a condition means a
+            // future arm inserted before this one could change dispatch
+            // subtly. `collapsible_match` wants the guard form; we keep
+            // the explicit body.
+            #[allow(clippy::collapsible_match)]
+            WindowEvent::KeyboardInput { event: key_event, .. } => {
+                if self.handle_key(&key_event) {
+                    event_loop.exit();
+                }
             }
-            WindowEvent::KeyboardInput { .. } => {}
             WindowEvent::Ime(ime) => {
                 use winit::event::Ime;
                 match ime {
@@ -11600,27 +11615,11 @@ impl ApplicationHandler<UserEvent> for App {
                 // historical "paste from PRIMARY selection".
                 let (x, y) = (self.cursor_pos.x, self.cursor_pos.y);
                 if let Some(t) = self.tab_at(x, y) {
-                    let prev_active = self.active_tab;
-                    self.active_tab = t;
-                    let exit = self.close_active_tab();
-                    if exit {
+                    // `close_tab_at` already handles the "restore the
+                    // user's previous focus, shifted for the removed
+                    // slot" dance — no inline copy to drift.
+                    if self.close_tab_at(t) {
                         event_loop.exit();
-                    } else if prev_active != t && prev_active < self.tabs.len() {
-                        // Restore focus to the tab the user was on,
-                        // shifted down by one if it sat after the
-                        // closed slot. close_active_tab leaves us on
-                        // `tabs.len() - 1`, which isn't what we want
-                        // when the user middle-clicked a background tab.
-                        let restore = if prev_active > t {
-                            prev_active - 1
-                        } else {
-                            prev_active
-                        };
-                        if restore < self.tabs.len() {
-                            self.active_tab = restore;
-                            self.sync_terminal_size();
-                            self.update_title();
-                        }
                     }
                 } else {
                     self.paste_primary();
