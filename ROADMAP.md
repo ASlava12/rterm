@@ -30,11 +30,11 @@
   и `--shell-integration bash` после `--config` теперь работают.
   Unit на позиционную независимость + функциональная проверка.
 
-- [ ] **Panic-hook с записью в файл.**
-  `std::panic::set_hook` в `main` → паника + backtrace в
-  `<cache>/rterm/panic.log`. Критично для Windows
-  (`windows_subsystem = "windows"` — stderr исчезает).
-  DoD: индуцированная паника (env-gated) оставляет файл с backtrace.
+- [x] **Panic-hook с записью в файл.** (2026-07)
+  `install_panic_hook` дописывает панику + backtrace в
+  `<cache>/rterm/panic.log` и чейнится к дефолтному хуку. Запись
+  вынесена в чистый `write_panic_record` (тестируемо без глобального
+  стейта). Unit на append + сохранение сообщения/backtrace.
 
 - [ ] **Дренировать OSC 52 у всех панелей, не только фокусной.**
   `take_pending_clipboard()` вызывается только для фокусной

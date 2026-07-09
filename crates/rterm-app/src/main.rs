@@ -1466,6 +1466,7 @@ fn main() -> Result<()> {
     } = parse_gui_overrides(std::env::args().skip(1));
 
     init_tracing();
+    install_panic_hook();
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         target = std::env::consts::OS,
@@ -2749,6 +2750,57 @@ fn init_tracing() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
+/// Install a panic hook that appends the panic message + location +
+/// backtrace to `<cache>/rterm/panic.log`, then chains to the default
+/// hook (so console / tracing still get it). Critical on Windows: the
+/// release binary is `windows_subsystem = "windows"`, so a panic's
+/// stderr goes nowhere and the window just vanishes — the log file is
+/// the only breadcrumb. `RUST_BACKTRACE` controls backtrace verbosity
+/// as usual. The log is APPENDED (not truncated) so repeated crashes
+/// across sessions are all captured.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    let log_path = cache_dir().map(|d| d.join("panic.log"));
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(path) = log_path.as_ref() {
+            let loc = info
+                .location()
+                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                .unwrap_or_else(|| "<unknown>".to_string());
+            // Payload is usually &str or String.
+            let msg = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic payload>".to_string());
+            let bt = std::backtrace::Backtrace::force_capture().to_string();
+            write_panic_record(path, &loc, &msg, &bt);
+        }
+        // Chain to the default hook so console output / abort behaviour
+        // is unchanged.
+        default_hook(info);
+    }));
+}
+
+/// Append one panic record to `path` (creating parent dirs). Pure I/O
+/// so the format + append behaviour is unit-testable without touching
+/// the process-global panic hook or env. Best-effort: every failure is
+/// swallowed — we're already unwinding, there's nothing useful to do.
+fn write_panic_record(path: &std::path::Path, loc: &str, msg: &str, backtrace: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        use std::io::Write;
+        let _ = writeln!(
+            f,
+            "\n=== rterm {} panicked at {loc} ===\n{msg}\n{backtrace}",
+            env!("CARGO_PKG_VERSION"),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2992,6 +3044,30 @@ mod tests {
             ),
             Some("opacity_".to_string()),
         );
+    }
+
+    #[test]
+    fn write_panic_record_appends_message_and_backtrace() {
+        // The panic hook's file writer: two records must both land
+        // (append, not truncate), each carrying its location, message,
+        // and backtrace. Parent dir is created on demand.
+        let dir = std::env::temp_dir().join(format!(
+            "rterm-test-panic-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("rterm").join("panic.log");
+
+        super::write_panic_record(&path, "src/foo.rs:1:2", "boom one", "bt-a");
+        super::write_panic_record(&path, "src/bar.rs:3:4", "boom two", "bt-b");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("src/foo.rs:1:2") && body.contains("boom one"));
+        assert!(body.contains("src/bar.rs:3:4") && body.contains("boom two"));
+        assert!(body.contains("bt-a") && body.contains("bt-b"), "backtraces kept");
+        // Both records present → appended, not overwritten.
+        assert_eq!(body.matches("panicked at").count(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
