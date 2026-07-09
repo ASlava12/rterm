@@ -69,13 +69,13 @@
   `ime_cursor_rect` с тестом). Composing показывает ОС-попап; Backspace
   во время композиции правит preedit (перехвачен ОС, не уходит в PTY).
 
-- [ ] **IME: инлайн-рендер preedit у курсора.** (follow-up к IME)
-  Сейчас composing показывает ОС-кандидатное окно. Дорисовать
-  composing-текст подчёркнутым inline в позиции курсора (нужен
-  preedit-буфер в `TextLayer` + staging в `prepare`, по образцу
-  удалённого `title_bar`). `Ime::Preedit(text, range)` уже приходит —
-  сохранить `text` в App и отрисовать.
-  DoD: composing-текст виден inline под курсором; курсор не съезжает.
+- [x] **IME: инлайн-рендер preedit у курсора.** (2026-07)
+  `Ime::Preedit` сохраняется в `App.ime_preedit`; отрисовывается inline
+  у курсора акцентным цветом поверх solid-backdrop квада (легибельность
+  над контентом панели). Реализовано через `PreeditDraw` + `ime_buffer`
+  в `TextLayer` + staging в `prepare`/`render` (по образцу бывшего
+  `title_bar`); ширина по `UnicodeWidthStr`. Компилируется/рендерит без
+  паник; визуальную корректность проверять живым IME на macOS.
 
 - [ ] **Kitty keyboard protocol (CSI u, progressive enhancement).**
   Ждут neovim / helix / fish. Минимум: `CSI > flags u` push/pop stack,

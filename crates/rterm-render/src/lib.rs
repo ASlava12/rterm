@@ -682,6 +682,9 @@ pub struct TextLayer {
     header_tabs_ghost_buffer: Buffer,
     /// Bottom-of-window status bar text — shell name, cwd, pane count.
     status_bar_buffer: Buffer,
+    /// In-flight IME composition (preedit) text, drawn inline at the
+    /// cursor. Empty most of the time.
+    ime_buffer: Buffer,
     overlay_buffer: Buffer,
     font_size: f32,
     line_height: f32,
@@ -777,6 +780,15 @@ pub struct HeaderRightDraw<'a> {
 
 /// Bottom-of-window status bar text (shell, cwd, pane info).
 pub struct StatusBarDraw<'a> {
+    pub spans: SpanList<'a>,
+    pub rect: PaneRect,
+}
+
+/// In-flight IME composition (preedit) text, drawn inline starting at
+/// the terminal cursor. `rect.left/top` is the cursor pixel; width is
+/// the composition's cell span (a solid backdrop quad is painted
+/// separately so the glyphs stay legible over terminal content).
+pub struct PreeditDraw<'a> {
     pub spans: SpanList<'a>,
     pub rect: PaneRect,
 }
@@ -999,6 +1011,9 @@ impl TextLayer {
         header_tabs_ghost_buffer.set_wrap(&mut font_system, Wrap::None);
         let mut status_bar_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_height));
         status_bar_buffer.set_monospace_width(&mut font_system, Some(cell_width));
+        let mut ime_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_height));
+        ime_buffer.set_monospace_width(&mut font_system, Some(cell_width));
+        ime_buffer.set_wrap(&mut font_system, Wrap::None);
         let mut overlay_buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_height));
         overlay_buffer.set_monospace_width(&mut font_system, Some(cell_width));
 
@@ -1016,6 +1031,7 @@ impl TextLayer {
             header_tabs_buffer,
             header_tabs_ghost_buffer,
             status_bar_buffer,
+            ime_buffer,
             overlay_buffer,
             font_size,
             line_height,
@@ -1099,6 +1115,7 @@ impl TextLayer {
             &mut self.header_right_buffer,
             &mut self.header_tabs_buffer,
             &mut self.status_bar_buffer,
+            &mut self.ime_buffer,
             &mut self.overlay_buffer,
         ] {
             b.set_metrics(&mut self.font_system, metrics);
@@ -1157,6 +1174,7 @@ impl TextLayer {
             &mut self.header_right_buffer,
             &mut self.header_tabs_buffer,
             &mut self.status_bar_buffer,
+            &mut self.ime_buffer,
             &mut self.overlay_buffer,
         ] {
             b.set_monospace_width(&mut self.font_system, Some(cell_width));
@@ -1234,6 +1252,7 @@ impl TextLayer {
         header_tabs: Option<&HeaderTabsDraw<'_>>,
         header_tabs_ghost: Option<&HeaderTabsGhostDraw<'_>>,
         status_bar: Option<&StatusBarDraw<'_>>,
+        preedit: Option<&PreeditDraw<'_>>,
         overlay: Option<&OverlayDraw<'_>>,
         viewport_size: (u32, u32),
     ) -> Result<()> {
@@ -1505,6 +1524,44 @@ impl TextLayer {
                     bottom: (h.rect.top + h.rect.height) as i32,
                 },
                 default_color: GlyphColor::rgb(220, 220, 220),
+                custom_glyphs: &[],
+            });
+        }
+        // IME preedit — composition text drawn inline at the cursor.
+        // A solid backdrop quad (emitted by the caller) sits under it;
+        // here we just shape + stage the glyphs in an accent colour so
+        // the composing text reads as distinct from committed cells.
+        if let Some(h) = preedit {
+            self.ime_buffer.set_size(
+                &mut self.font_system,
+                Some(h.rect.width.max(1.0)),
+                Some(h.rect.height.max(1.0)),
+            );
+            self.ime_buffer.set_rich_text(
+                &mut self.font_system,
+                h.spans.iter().map(|(s, fg, bold)| {
+                    let mut a = default_attrs.color(GlyphColor::rgb(fg[0], fg[1], fg[2]));
+                    if *bold {
+                        a = a.weight(Weight::BOLD);
+                    }
+                    (*s, a)
+                }),
+                default_attrs,
+                Shaping::Advanced,
+            );
+            self.ime_buffer.shape_until_scroll(&mut self.font_system, false);
+            main_areas.push(TextArea {
+                buffer: &self.ime_buffer,
+                left: h.rect.left,
+                top: h.rect.top,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: h.rect.left as i32,
+                    top: h.rect.top as i32,
+                    right: (h.rect.left + h.rect.width) as i32,
+                    bottom: (h.rect.top + h.rect.height) as i32,
+                },
+                default_color: GlyphColor::rgb(230, 230, 230),
                 custom_glyphs: &[],
             });
         }
@@ -2019,6 +2076,7 @@ impl GpuState {
         header_tabs: Option<&HeaderTabsDraw<'_>>,
         header_tabs_ghost: Option<&HeaderTabsGhostDraw<'_>>,
         status_bar: Option<&StatusBarDraw<'_>>,
+        preedit: Option<&PreeditDraw<'_>>,
         overlay: Option<&OverlayDraw<'_>>,
         flash: f32,
         show_scrollbar: bool,
@@ -2162,6 +2220,7 @@ impl GpuState {
             header_tabs,
             header_tabs_ghost,
             status_bar,
+            preedit,
             overlay,
             (self.config.width, self.config.height),
         ) {
@@ -3567,6 +3626,10 @@ pub struct App {
     /// `None` until the loop installs it in `resumed`. Also used to
     /// clear the pending-wake flag at the start of each frame.
     waker: Option<Waker>,
+    /// In-flight IME composition (preedit) text, rendered inline at the
+    /// cursor. Empty when no composition is active. Updated from
+    /// `WindowEvent::Ime(Preedit)` and cleared on Commit / Disabled.
+    ime_preedit: String,
 }
 
 const CURSOR_BLINK_PERIOD_MS: u128 = 1000;
@@ -3742,6 +3805,7 @@ impl App {
             render_test_only,
             last_frame_tick: None,
             waker: None,
+            ime_preedit: String::new(),
             last_atlas_trim: None,
             tab_silence_ms,
             slow_command_ms,
@@ -11383,21 +11447,35 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::KeyboardInput { .. } => {}
             WindowEvent::Ime(ime) => {
                 use winit::event::Ime;
-                // Final composed text (CJK, dead keys, macOS long-press
-                // accents) — send it to the focused pane's shell exactly
-                // like typed input. Preedit / Enabled / Disabled / empty
-                // Commit need nothing here: the OS candidate window shows
-                // composition, kept anchored by the cursor-area update.
-                if let Ime::Commit(text) = &ime {
-                    if !text.is_empty() {
-                        if let Some(pane) = self.focused_pane() {
-                            pane.send_input(text.as_bytes());
+                match ime {
+                    // Final composed text (CJK, dead keys, macOS
+                    // long-press accents) — send it to the focused
+                    // pane's shell exactly like typed input, and clear
+                    // any composition preview.
+                    Ime::Commit(text) => {
+                        self.ime_preedit.clear();
+                        if !text.is_empty() {
+                            if let Some(pane) = self.focused_pane() {
+                                pane.send_input(text.as_bytes());
+                            }
                         }
                     }
+                    // Composition in progress — store the preedit for
+                    // inline rendering at the cursor.
+                    Ime::Preedit(text, _range) => {
+                        self.ime_preedit = text;
+                    }
+                    // Composition ended / IME turned off — nothing is
+                    // being composed anymore.
+                    Ime::Disabled => self.ime_preedit.clear(),
+                    Ime::Enabled => {}
                 }
                 // Re-anchor the IME candidate window to the terminal
                 // cursor so composition renders where the text lands.
                 self.update_ime_cursor_area();
+                if let Some(state) = self.state.as_ref() {
+                    state.window.request_redraw();
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 // Paste-confirmation modal grabs wheel events while
@@ -13388,6 +13466,34 @@ impl ApplicationHandler<UserEvent> for App {
                     .map(|s| s.text.cell_width())
                     .unwrap_or(8.0);
                 let header_clip_os_decorations = self.os_decorations;
+                // IME preedit: composition text drawn inline at the
+                // cursor. Computed here (before the `self.state.as_mut()`
+                // borrow, which `focused_pane_rect` / cursor reads would
+                // otherwise conflict with) as `(text, rect)`. `None`
+                // when nothing is composing. The rect starts at the
+                // cursor pixel and spans the composition's display width.
+                let preedit_info: Option<(String, PaneRect)> =
+                    if self.ime_preedit.is_empty() {
+                        None
+                    } else {
+                        self.state.as_ref().and_then(|s| {
+                            let cell_w = s.text.cell_width();
+                            let line_h = s.text.line_height();
+                            let rect = self.focused_pane_rect()?;
+                            let (col, row) = self
+                                .focused_pane()
+                                .and_then(|p| p.terminal.lock().ok().map(|t| t.cursor()))
+                                .map(|c| (c.col, c.row))?;
+                            let (x, y, _, h) =
+                                ime_cursor_rect(rect, col, row, cell_w, line_h);
+                            use unicode_width::UnicodeWidthStr;
+                            let w = (self.ime_preedit.width() as f32 * cell_w).max(cell_w);
+                            Some((
+                                self.ime_preedit.clone(),
+                                PaneRect { left: x, top: y, width: w, height: h },
+                            ))
+                        })
+                    };
                 {
                     static R_PRELAY: std::sync::Once = std::sync::Once::new();
                     R_PRELAY.call_once(|| tracing::debug!("redraw: about to enter state branch"));
@@ -13593,6 +13699,14 @@ impl ApplicationHandler<UserEvent> for App {
                         header_right.map(|(spans, rect)| HeaderRightDraw { spans, rect });
                     let status_bar_draw =
                         status_bar.map(|(spans, rect)| StatusBarDraw { spans, rect });
+                    // IME preedit inline draw: accent-coloured composition
+                    // spans at the cursor. Storage outlives the borrowed
+                    // spans below.
+                    let preedit_accent: [u8; 3] = [235, 200, 120];
+                    let preedit_draw = preedit_info.as_ref().map(|(text, rect)| PreeditDraw {
+                        spans: vec![(text.as_str(), preedit_accent, false)],
+                        rect: *rect,
+                    });
                     // Paste-confirmation modal in Edit mode wants
                     // wrap-off so its mini-editor reads "1 buffer
                     // line == 1 visual row" — the click-to-cursor
@@ -13630,6 +13744,18 @@ impl ApplicationHandler<UserEvent> for App {
                     // would otherwise leak through. The bar text itself
                     // sits in `main_areas` and renders on top of this.
                     after_panes_quads.extend(status_bar_quads);
+                    // Solid backdrop behind the IME preedit so the
+                    // composition text stays legible over whatever cells
+                    // sit under the cursor. Drawn after pane glyphs and
+                    // under the preedit text (which is in `main_areas`).
+                    if let Some((_, rect)) = preedit_info.as_ref() {
+                        after_panes_quads.push(bg::BgQuad::from_srgb(
+                            [rect.left, rect.top],
+                            [rect.width, rect.height],
+                            [40, 44, 52],
+                            0.96,
+                        ));
+                    }
                     // Resize-marker strip / corner-L the cursor is over
                     // — drawn on top of pane content so the affordance
                     // is visible.
@@ -13813,6 +13939,7 @@ impl ApplicationHandler<UserEvent> for App {
                         header_tabs_draw.as_ref(),
                         header_tabs_ghost_draw.as_ref(),
                         status_bar_draw.as_ref(),
+                        preedit_draw.as_ref(),
                         overlay_draw.as_ref(),
                         flash,
                         self.show_scrollbar,
