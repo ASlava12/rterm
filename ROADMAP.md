@@ -24,11 +24,11 @@
   самого первого коммита Kitty-протокола. Убрал мёртвый `let _ = col;`
   и закрепил поведение unit-тестом (`kitty_x_y_offsets_shift_the_placement`).
 
-- [ ] **CLI: `--history` / `--shell-integration` с любым положением флага.**
-  Сейчас `args().nth(2)` / `skip(2)` предполагают, что флаг — первый
-  (`crates/rterm-app/src/main.rs:~1361`), и `rterm --config x.toml
-  --history list` ломается. Вычислять под-аргументы от позиции флага.
-  DoD: unit на извлечение аргументов при флаге в разных позициях.
+- [x] **CLI: `--history` / `--shell-integration` с любым положением флага.** (2026-07)
+  Новый `args_after_flag(_in)` берёт хвост от позиции флага вместо
+  хардкода `.skip(2)`/`.nth(2)`. `rterm --config x.toml --history list`
+  и `--shell-integration bash` после `--config` теперь работают.
+  Unit на позиционную независимость + функциональная проверка.
 
 - [ ] **Panic-hook с записью в файл.**
   `std::panic::set_hook` в `main` → паника + backtrace в

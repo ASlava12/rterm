@@ -1358,7 +1358,12 @@ fn main() -> Result<()> {
                 // rterm's existing prompt-jump / slow-command
                 // detection, and (once OSC 133-based capture
                 // lands) the command-history capture too.
-                let shell = std::env::args().nth(2).unwrap_or_default();
+                // Position-independent: `--shell-integration bash`
+                // works even after `--config x.toml`.
+                let shell = args_after_flag("--shell-integration")
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
                 return run_shell_integration(&shell);
             }
             "--history" => {
@@ -1369,7 +1374,9 @@ fn main() -> Result<()> {
                 // operation, prints, exits. Designed so users can
                 // verify the capture is working end-to-end without
                 // having to bring up the popup UI.
-                return run_history_subcommand(std::env::args().skip(2));
+                // Position-independent: everything after `--history`,
+                // not a hardcoded `.skip(2)`.
+                return run_history_subcommand(args_after_flag("--history"));
             }
             "--print-default-config" => {
                 // Emit the bundled `default.toml` template verbatim
@@ -2547,6 +2554,19 @@ fn arg_after_flag(flag: &str) -> Option<String> {
     arg_after_flag_in(std::env::args(), flag)
 }
 
+/// Every argument that FOLLOWS `flag` in `args` (the flag token and
+/// everything before it dropped). Position-independent replacement for
+/// a hardcoded `.skip(2)` — so `rterm --config x.toml --history list`
+/// routes `["list"]` to the subcommand instead of `["x.toml", ...]`.
+/// Returns empty when the flag is absent or is the last token.
+fn args_after_flag_in<I: IntoIterator<Item = String>>(args: I, flag: &str) -> Vec<String> {
+    args.into_iter().skip_while(|a| a != flag).skip(1).collect()
+}
+
+fn args_after_flag(flag: &str) -> Vec<String> {
+    args_after_flag_in(std::env::args(), flag)
+}
+
 /// Cheap "did you mean?" suggestion for a misspelled font family. Walks
 /// `installed` looking for a case-insensitive substring overlap in
 /// either direction (so `"jetbrains"` finds `"JetBrains Mono"`, and
@@ -2972,6 +2992,37 @@ mod tests {
             ),
             Some("opacity_".to_string()),
         );
+    }
+
+    #[test]
+    fn args_after_flag_is_position_independent() {
+        let mk = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Regression: `--history list` used a hardcoded `.skip(2)`, so
+        // a preceding `--config x.toml` shifted the subcommand out of
+        // range and the router saw the wrong tokens.
+        assert_eq!(
+            args_after_flag_in(
+                mk(&["rterm", "--config", "x.toml", "--history", "list", "--limit", "5"]),
+                "--history",
+            ),
+            vec!["list", "--limit", "5"],
+        );
+        // Flag first — the common case — still returns the full tail.
+        assert_eq!(
+            args_after_flag_in(mk(&["rterm", "--history", "clear"]), "--history"),
+            vec!["clear"],
+        );
+        // Single sub-arg (shell name) after a preceding flag.
+        assert_eq!(
+            args_after_flag_in(
+                mk(&["rterm", "--config", "x.toml", "--shell-integration", "bash"]),
+                "--shell-integration",
+            ),
+            vec!["bash"],
+        );
+        // Flag absent or last → empty.
+        assert!(args_after_flag_in(mk(&["rterm", "--version"]), "--history").is_empty());
+        assert!(args_after_flag_in(mk(&["rterm", "--history"]), "--history").is_empty());
     }
 
     #[test]
