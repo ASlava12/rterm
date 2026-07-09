@@ -1510,6 +1510,16 @@ fn main() -> Result<()> {
         }
     };
 
+    // `--smoke` is a headless PTY+parser sanity run. Check it HERE,
+    // before any plugin setup: `run_smoke` only needs `config` (it
+    // drives a Pty + Terminal directly), and running the user's
+    // init.lua / plugins or spawning the hot-reload watcher would make
+    // the CI check non-deterministic and leak a never-terminating
+    // thread.
+    if std::env::args().any(|a| a == "--smoke") {
+        return run_smoke(&config);
+    }
+
     let plugins = Arc::new(Mutex::new(PluginHost::new()?));
     if let Ok(host) = plugins.lock() {
         host.set_clipboard_reader(Arc::new(|| {
@@ -1576,9 +1586,9 @@ fn main() -> Result<()> {
     let config_path = explicit_config
         .clone()
         .or_else(Config::default_path);
-    if std::env::args().any(|a| a == "--smoke") {
-        run_smoke(&config)
-    } else {
+    // `--smoke` already returned early (before plugin setup); this is
+    // always the GUI path.
+    {
         run_gui(
             &config,
             plugins,
@@ -2472,7 +2482,19 @@ fn run_smoke(_config: &Config) -> Result<()> {
         }
     }
     let _ = pty.kill();
-    let _ = reader_thread.join();
+    // Bounded join: on Windows/ConPTY the master reader can stay
+    // blocked in read() after the child is killed (no EOF), so an
+    // unconditional `join()` would hang the CI job until its outer
+    // timeout. Wait briefly, then detach — the process is about to
+    // exit, which reaps the thread.
+    {
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        thread::spawn(move || {
+            let _ = reader_thread.join();
+            let _ = done_tx.send(());
+        });
+        let _ = done_rx.recv_timeout(Duration::from_secs(2));
+    }
 
     let first_line: String = (0..term.size().cols)
         .filter_map(|c| term.grid().cell(Position { col: c, row: 0 }).map(|cell| cell.ch))
