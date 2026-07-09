@@ -183,13 +183,13 @@ crates/
 
 ## Roadmap
 
-The CLAUDE.md TODO carries the live list. Known headline items:
-
-1. Selection anchored to absolute logical lines (currently viewport-relative;
-   drifts when scrollback shifts).
-2. Right-click context menu (currently pastes).
-3. Sixel / ReGIS image decoding.
-4. Ghost label following the cursor during tab drag-reorder.
+The live, prioritized work plan lives in [ROADMAP.md](ROADMAP.md) —
+quick wins (settings toggle for highlighting, Kitty placement offsets,
+CLI/panic-hook fixes), medium items (IME input, Kitty keyboard
+protocol, incremental search, broadcast input, GIF animation), and the
+headline features (Sixel graphics, profiles/SSH manager, ligatures,
+damage tracking). Items previously listed here (absolute-line
+selection, right-click context menu, tab-drag ghost label) shipped.
 
 ## License
 
