@@ -18,11 +18,11 @@
   через `persist_config_value`. Тесты: toggle через глобал + round-trip
   persist.
 
-- [ ] **Kitty-графика: использовать `X=`/`Y=` офсеты размещения.**
-  Значение уже распарсено и выбрасывается —
-  `crates/rterm-core/src/terminal.rs` (`commit_kitty_image`,
-  `let _ = col;`). Прокинуть в `ImagePlacement`.
-  DoD: `icat --place` с офсетом рисует со сдвигом; unit на placement.
+- [x] **Kitty-графика: `X=`/`Y=` офсеты размещения.** (2026-07)
+  Находка аудита оказалась устаревшей: `col`/`abs_row` уже
+  вычислялись с `x_offset`/`y_offset` и использовались в placement с
+  самого первого коммита Kitty-протокола. Убрал мёртвый `let _ = col;`
+  и закрепил поведение unit-тестом (`kitty_x_y_offsets_shift_the_placement`).
 
 - [ ] **CLI: `--history` / `--shell-integration` с любым положением флага.**
   Сейчас `args().nth(2)` / `skip(2)` предполагают, что флаг — первый

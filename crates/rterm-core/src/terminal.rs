@@ -1689,7 +1689,6 @@ impl Terminal {
         for _ in 0..rows {
             perform.linefeed();
         }
-        let _ = col;
     }
 
     /// Route one post-APC byte either into the vte feed buffer or
@@ -7950,6 +7949,24 @@ mod tests {
         assert!(matches!(img.format, crate::image::ImageFormat::Png));
         // Cursor advanced past the 2-row image.
         assert_eq!(t.cursor().row, 2);
+    }
+
+    #[test]
+    fn kitty_x_y_offsets_shift_the_placement() {
+        // Kitty `X=` / `Y=` are cell offsets from the cursor. Move the
+        // cursor to a known spot, then place an image with offsets and
+        // assert the placement column / absolute row reflect them —
+        // guards against the offsets being silently dropped.
+        use base64::Engine;
+        let mut t = term(80, 24);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(red_pixel_png());
+        // Cursor → row 3, col 5 (1-based) = row 2, col 4 (0-based).
+        t.advance(b"\x1b[3;5H");
+        t.advance(&kitty_apc("a=T,f=100,c=2,r=1,X=3,Y=2", &b64));
+        let p = t.image_placements()[0];
+        assert_eq!(p.col, 4 + 3, "X= offset added to cursor column");
+        // Primary screen, no scrollback yet → abs_row = cursor.row + Y.
+        assert_eq!(p.abs_row, (2 + 2) as i64, "Y= offset added to cursor row");
     }
 
     #[test]
