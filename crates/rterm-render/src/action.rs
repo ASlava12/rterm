@@ -68,6 +68,9 @@ pub enum AppAction {
     SwapPaneNext,
     SwapPanePrev,
     ToggleBellMute,
+    /// Toggle "broadcast input": while on, typed keys go to EVERY pane
+    /// in the active tab at once (iTerm2 / tmux `setw synchronize-panes`).
+    ToggleBroadcast,
     OpenHoveredUrl,
     /// Rotate to the next built-in theme (Default → Dracula → Solarized
     /// Dark → Solarized Light → Nord → Gruvbox Dark → Light → Default …).
@@ -197,6 +200,7 @@ impl AppAction {
             "swap_pane_next" | "move_pane_next" => Self::SwapPaneNext,
             "swap_pane_prev" | "swap_pane_previous" | "move_pane_prev" => Self::SwapPanePrev,
             "toggle_bell_mute" | "mute_bell" | "unmute_bell" => Self::ToggleBellMute,
+            "toggle_broadcast" | "broadcast_input" | "synchronize_panes" => Self::ToggleBroadcast,
             "open_hovered_url" | "open_url" => Self::OpenHoveredUrl,
             "cycle_theme" | "next_theme" => Self::CycleTheme,
             "cycle_theme_prev" | "prev_theme" | "previous_theme" => Self::CycleThemePrev,
@@ -285,6 +289,7 @@ impl AppAction {
             AppAction::SwapPaneNext => "swap_pane_next",
             AppAction::SwapPanePrev => "swap_pane_prev",
             AppAction::ToggleBellMute => "toggle_bell_mute",
+            AppAction::ToggleBroadcast => "toggle_broadcast",
             AppAction::OpenHoveredUrl => "open_hovered_url",
             AppAction::CycleTheme => "cycle_theme",
             AppAction::CycleThemePrev => "cycle_theme_prev",
@@ -356,6 +361,7 @@ impl AppAction {
         (AppAction::SwapPaneNext, "Swap focused pane with next"),
         (AppAction::SwapPanePrev, "Swap focused pane with previous"),
         (AppAction::ToggleBellMute, "Toggle bell mute (focused pane)"),
+        (AppAction::ToggleBroadcast, "Toggle broadcast input to all panes"),
         (AppAction::OpenHoveredUrl, "Open URL under cursor in browser"),
         (AppAction::ToggleHelp, "Toggle help overlay"),
         (AppAction::CycleTheme, "Theme: cycle to next built-in"),

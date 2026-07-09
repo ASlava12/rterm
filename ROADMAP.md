@@ -92,10 +92,12 @@
   DoD: ввод в поиске при 100k-строчном scrollback не блокирует
   ингест (load-тест по latency).
 
-- [ ] **Broadcast input (ввод во все панели таба).**
-  Действие `toggle_broadcast` + маркер в статус-баре; рассылка через
-  существующий `send_input` по панелям таба.
-  DoD: тоггл в палитре/кейбинд; ввод дублируется; индикация видна.
+- [x] **Broadcast input (ввод во все панели таба).** (2026-07)
+  Действие `AppAction::ToggleBroadcast` (алиасы `broadcast_input` /
+  `synchronize_panes`) в палитре; `forward_key_to_pty` рефакторен —
+  байты идут через `dispatch_input_bytes`, который при активном
+  broadcast рассылает во ВСЕ панели активного таба. Статус-бар
+  форсируется с маркером `⇉ BROADCAST`. Off по умолчанию, runtime-only.
 
 - [ ] **GIF-анимация.**
   Кадры декодирует crate `image`; нужен per-frame тайминг в

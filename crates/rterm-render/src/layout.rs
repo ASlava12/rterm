@@ -110,7 +110,9 @@ impl App {
     /// path to decide whether to paint the bar; layout uses the
     /// stricter `bottom_bar_reserves_space`.
     pub(crate) fn bottom_bar_has_content(&self) -> bool {
-        if self.search.is_some() {
+        // Broadcast mode surfaces the status bar so its "typing to all
+        // panes" marker stays visible the whole time it's active.
+        if self.search.is_some() || self.broadcast_input {
             return true;
         }
         let Some(tab) = self.active_tab() else { return false };

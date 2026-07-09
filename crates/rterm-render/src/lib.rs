@@ -3504,6 +3504,11 @@ pub struct App {
     cursor_blink: bool,
     /// `terminal.show_scrollbar` — toggles the right-edge scrollbar.
     show_scrollbar: bool,
+    /// When on, typed keystrokes are broadcast to every pane in the
+    /// active tab at once (`toggle_broadcast` action). Off by default;
+    /// runtime-only (not persisted). The status bar shows a marker
+    /// while active.
+    broadcast_input: bool,
     /// `[image].auto_detect` — opt-in detection of raw PNG / JPEG
     /// magic bytes in the input stream. Mirrored here so the
     /// Settings overlay can render the checkbox state without
@@ -3787,6 +3792,7 @@ impl App {
             scroll_on_output,
             cursor_blink,
             show_scrollbar,
+            broadcast_input: false,
             image_auto_detect,
             bell_visual,
             bell_urgent,
@@ -8164,6 +8170,16 @@ impl App {
             AppAction::SwapPaneNext => self.swap_focused_pane(1),
             AppAction::SwapPanePrev => self.swap_focused_pane(-1),
             AppAction::ToggleBellMute => self.toggle_focused_pane_bell_mute(),
+            AppAction::ToggleBroadcast => {
+                self.broadcast_input = !self.broadcast_input;
+                self.events.emit(
+                    "broadcast",
+                    if self.broadcast_input { "true" } else { "false" },
+                );
+                if let Some(state) = self.state.as_ref() {
+                    state.window.request_redraw();
+                }
+            }
             AppAction::OpenHoveredUrl => self.open_hovered_url(),
             AppAction::ToggleHelp => {
                 self.show_help = !self.show_help;
@@ -9819,12 +9835,33 @@ impl App {
         self.events.emit("paste", &to_send);
     }
 
+    /// Deliver `bytes` to the keyboard-input target(s): the focused
+    /// pane normally, or EVERY pane in the active tab when broadcast is
+    /// on. Also resets each target's scrollback view to live and marks
+    /// it for redraw, matching the single-pane behaviour.
+    fn dispatch_input_bytes(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if self.broadcast_input {
+            if let Some(tab) = self.active_tab() {
+                for pane in tab.panes() {
+                    pane.scroll_offset.store(0, Ordering::Relaxed);
+                    pane.send_input(bytes);
+                }
+            }
+        } else if let Some(pane) = self.focused_pane() {
+            pane.scroll_offset.store(0, Ordering::Relaxed);
+            pane.send_input(bytes);
+        }
+    }
+
     fn forward_key_to_pty(&self, event: &KeyEvent) {
         let Some(pane) = self.focused_pane() else { return };
-        // Any keystroke jumps the view back to the live grid.
-        pane.scroll_offset.store(0, Ordering::Relaxed);
         // Note: the App-level handler clears `self.selection` and resets the
-        // cursor blink phase after this.
+        // cursor blink phase after this. `app_cursor` is read from the
+        // FOCUSED pane's mode even when broadcasting — a single mode is
+        // the pragmatic choice (panes rarely disagree on DECCKM).
         let ctrl = self.modifiers.contains(ModifiersState::CONTROL);
         let alt = self.modifiers.contains(ModifiersState::ALT);
         let app_cursor = pane
@@ -9836,7 +9873,7 @@ impl App {
         if let Key::Named(named) = &event.logical_key {
             if let Some(bytes) = named_key_bytes(*named, self.modifiers, app_cursor) {
                 self.events.emit("key", &format!("{:?}", named));
-                pane.send_input(&bytes);
+                self.dispatch_input_bytes(&bytes);
                 return;
             }
         }
@@ -9847,9 +9884,9 @@ impl App {
                 let b = text.as_bytes()[0];
                 if let Some(m) = ctrl_byte(b) {
                     if alt {
-                        pane.send_input(&[0x1b, m]);
+                        self.dispatch_input_bytes(&[0x1b, m]);
                     } else {
-                        pane.send_input(&[m]);
+                        self.dispatch_input_bytes(&[m]);
                     }
                     return;
                 }
@@ -9858,9 +9895,9 @@ impl App {
                 let mut out = Vec::with_capacity(text.len() + 1);
                 out.push(0x1b);
                 out.extend_from_slice(text.as_bytes());
-                pane.send_input(&out);
+                self.dispatch_input_bytes(&out);
             } else {
-                pane.send_input(text.as_bytes());
+                self.dispatch_input_bytes(text.as_bytes());
             }
         }
     }
@@ -14437,6 +14474,7 @@ mod tests {
             AppAction::SwapPaneNext,
             AppAction::SwapPanePrev,
             AppAction::ToggleBellMute,
+            AppAction::ToggleBroadcast,
             AppAction::OpenHoveredUrl,
             AppAction::CycleTheme,
             AppAction::CycleThemePrev,
@@ -14509,6 +14547,7 @@ mod tests {
                 AppAction::SwapPaneNext => (),
                 AppAction::SwapPanePrev => (),
                 AppAction::ToggleBellMute => (),
+                AppAction::ToggleBroadcast => (),
                 AppAction::OpenHoveredUrl => (),
                 AppAction::CycleTheme => (),
                 AppAction::CycleThemePrev => (),

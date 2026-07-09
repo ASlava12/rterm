@@ -348,6 +348,7 @@ auto_detect = false
 #   quit, font_increase, font_decrease, font_reset, opacity_increase,
 #   opacity_decrease, opacity_reset, toggle_last_tab, copy_hovered_url,
 #   reset_pane, swap_pane_next, swap_pane_prev, toggle_bell_mute,
+#   toggle_broadcast,
 #   open_hovered_url, cycle_theme, cycle_theme_prev, open_settings,
 #   rename_tab, snap_window_left, snap_window_right, snap_window_top,
 #   snap_window_bottom, maximize_toggle, minimize_window,

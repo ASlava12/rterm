@@ -234,19 +234,30 @@ impl App {
         let tab_count = self.tabs.len();
         let shell = pane.display_title();
         // Layout: " ▸ <shell>   ◉ <cwd>   ⌗ <pane>/<panes>   ▤ <tab>/<tabs> "
+        // Push every string FIRST so no `&str` into `storage` is held
+        // across a later `push` (which could reallocate).
         storage.push(format!(" ▸ {}", shell));
         storage.push(format!("   ◉ {}", cwd_str));
         storage.push(format!("   ⌗ {}/{}", pane_idx, pane_count));
         storage.push(format!("   ▤ {}/{}", self.active_tab + 1, tab_count));
+        // Broadcast marker — prominent so the user can't forget every
+        // keystroke is going to all panes.
+        if self.broadcast_input {
+            storage.push("   ⇉ BROADCAST".to_string());
+        }
         let fg = palette::default_fg();
         let dim = fg.map(|c| c.saturating_sub(60));
         let accent: [u8; 3] = [0, 122, 204];
-        let spans = vec![
+        let warn: [u8; 3] = [235, 120, 60];
+        let mut spans = vec![
             (storage[0].as_str(), accent, true),
             (storage[1].as_str(), dim, false),
             (storage[2].as_str(), dim, false),
             (storage[3].as_str(), dim, false),
         ];
+        if self.broadcast_input {
+            spans.push((storage[4].as_str(), warn, true));
+        }
         Some((spans, rect))
     }
 

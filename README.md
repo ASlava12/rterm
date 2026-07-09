@@ -41,6 +41,9 @@ GPU renderer → window. Tabs and BSP-split panes are wired. Lua plugins observe
 - **Selection**: drag / double-click word / triple-click line, clipboard
   copy via `Ctrl+Shift+C` (no auto-copy).
 - **Search overlay**: literal + regex, forward / backward, `Esc` exits.
+- **Broadcast input**: `toggle_broadcast` sends every keystroke to all panes
+  in the active tab at once (iTerm2 / tmux synchronize-panes); a
+  `⇉ BROADCAST` marker shows in the status bar while active.
 - **Syntax highlighting**: WindTerm-style client-side regex rules recolour
   terminal output (URLs, IPs, UUIDs, hex, `ERROR`/`WARN`/`INFO`, quoted
   strings, numbers) — applied only to default-coloured text, so it never
