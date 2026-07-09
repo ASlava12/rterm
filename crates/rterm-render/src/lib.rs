@@ -298,6 +298,30 @@ fn build_spans(
 }
 
 
+/// Drain the pending OSC 52 clipboard write from every `(uid,
+/// terminal)` pair and return the one belonging to `focused_uid`.
+/// EVERY pane is drained regardless of focus — so a background pane
+/// can't accumulate a pending write and then flush a stale clipboard
+/// overwrite when it later gains focus — but only the focused pane's
+/// write is returned to apply; the rest are dropped.
+fn drain_osc52<'a>(
+    panes: impl Iterator<Item = (u64, &'a SharedTerminal)>,
+    focused_uid: Option<u64>,
+) -> Option<String> {
+    let mut focused: Option<String> = None;
+    for (uid, term) in panes {
+        let pending = term.lock().ok().and_then(|mut t| t.take_pending_clipboard());
+        if let Some(b64) = pending {
+            if Some(uid) == focused_uid {
+                focused = Some(b64);
+            } else {
+                tracing::debug!(uid, "dropped OSC 52 clipboard write from a non-focused pane");
+            }
+        }
+    }
+    focused
+}
+
 /// Glue trait so the renderer can write input bytes and resize the PTY
 /// without depending on the rterm-pty crate directly.
 pub trait TerminalIo: Send + Sync {
@@ -13155,12 +13179,23 @@ impl ApplicationHandler<UserEvent> for App {
                     self.update_title();
                 }
 
-                // OSC 52 clipboard write request: take from focused pane only.
-                let osc52 = self
+                // OSC 52 clipboard write. Drain EVERY pane each frame so
+                // a background pane can't accumulate pending writes and
+                // then flush a stale clipboard overwrite the moment it
+                // gains focus. Only the focused pane's write is applied
+                // (matching the "focused pane controls the clipboard"
+                // intent); background panes' writes are drained + dropped.
+                let focused_uid = self
                     .tabs
                     .get(self.active_tab)
                     .and_then(|t| t.focused_pane())
-                    .and_then(|p| p.terminal.lock().ok().and_then(|mut t| t.take_pending_clipboard()));
+                    .map(|p| p.uid);
+                let panes_iter = self
+                    .tabs
+                    .iter()
+                    .flat_map(|t| t.panes().into_iter().map(|p| (p.uid, &p.terminal)))
+                    .collect::<Vec<_>>();
+                let osc52 = drain_osc52(panes_iter.into_iter(), focused_uid);
                 if let Some(b64) = osc52 {
                     // Drain the pending OSC 52 even when policy is deny —
                     // otherwise a shell that keeps trying would have the
@@ -15065,6 +15100,32 @@ mod tests {
         let substring = fuzzy_score("next tab", "tab").unwrap();
         let fuzzy = fuzzy_score("toggle a button", "tab").unwrap();
         assert!(substring > fuzzy, "substring={substring} fuzzy={fuzzy}");
+    }
+
+    #[test]
+    fn drain_osc52_applies_focused_and_drains_all() {
+        // Two panes both queue an OSC 52 write. Only the focused pane's
+        // payload is returned; the background pane's is dropped — AND
+        // both terminals are drained (so nothing accumulates to flush
+        // stale later).
+        let mk = |b64: &str| {
+            let t = Arc::new(Mutex::new(Terminal::new(rterm_core::Size {
+                cols: 8,
+                rows: 1,
+            })));
+            t.lock()
+                .unwrap()
+                .advance(format!("\x1b]52;c;{b64}\x07").as_bytes());
+            t
+        };
+        let focused = mk("Rm9v"); // "Foo"
+        let background = mk("QmFy"); // "Bar"
+        let panes = vec![(1u64, &focused), (2u64, &background)];
+        let out = drain_osc52(panes.into_iter(), Some(1));
+        assert_eq!(out.as_deref(), Some("Rm9v"), "focused pane's write applied");
+        // Both drained: a second drain yields nothing from either.
+        assert!(focused.lock().unwrap().take_pending_clipboard().is_none());
+        assert!(background.lock().unwrap().take_pending_clipboard().is_none());
     }
 
     #[test]
