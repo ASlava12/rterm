@@ -12,12 +12,11 @@
 
 ## P0 — Быстрые победы (≤ 1 день каждая)
 
-- [ ] **Тумблер подсветки синтаксиса в Settings-оверлее.**
-  Рядом с `Cursor blink` / `Scrollbar`, по образцу
-  `SettingsHit::ToggleAutoDetectImages` (persist в `config.toml` через
-  `persist_config_value`). Движок уже глобальный
-  (`rterm-render/src/highlight.rs`).
-  DoD: чекбокс в оверлее; состояние переживает рестарт; unit на persist.
+- [x] **Тумблер подсветки синтаксиса в Settings-оверлее.** (2026-07)
+  Чекбокс `[x] Syntax highlighting` + клавиша `Y`; рантайм-флип через
+  `highlight::set_enabled`/`is_enabled`, persist `[highlight].enabled`
+  через `persist_config_value`. Тесты: toggle через глобал + round-trip
+  persist.
 
 - [ ] **Kitty-графика: использовать `X=`/`Y=` офсеты размещения.**
   Значение уже распарсено и выбрасывается —

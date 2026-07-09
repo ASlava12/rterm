@@ -1892,6 +1892,22 @@ fn run_gui(
                 });
             arc
         });
+    let on_highlight_change: Option<rterm_render::HighlightToggleCallback> =
+        config_path.as_ref().map(|path| {
+            let path = path.clone();
+            let arc: rterm_render::HighlightToggleCallback =
+                Arc::new(move |enabled: bool| {
+                    if let Err(e) = persist_highlight_enabled_to_config(&path, enabled) {
+                        tracing::warn!(
+                            error = %e,
+                            enabled,
+                            path = %path.display(),
+                            "failed to persist [highlight].enabled to config.toml"
+                        );
+                    }
+                });
+            arc
+        });
     rterm_render::run(rterm_render::RunConfig {
         title: "rterm".to_string(),
         size: (config.window.width, config.window.height),
@@ -1918,6 +1934,7 @@ fn run_gui(
         active_theme: initial_theme,
         on_theme_change,
         on_image_auto_detect_change,
+        on_highlight_change,
         os_decorations: config.window.os_decorations,
         allow_osc52: config.terminal.allow_osc52,
         // Pass the [guake] snapshot through unconditionally. The
@@ -2051,6 +2068,26 @@ fn persist_image_auto_detect_to_config(
         || {
             let mut cfg = Config::default();
             cfg.image.auto_detect = enabled;
+            toml::to_string_pretty(&cfg).context("serialize config")
+        },
+    )
+}
+
+/// Rewrite `[highlight].enabled` in the user's `config.toml` via
+/// [`persist_config_value`] — invoked from the Settings-overlay
+/// highlight toggle.
+fn persist_highlight_enabled_to_config(
+    path: &std::path::Path,
+    enabled: bool,
+) -> Result<()> {
+    persist_config_value(
+        path,
+        "highlight",
+        "enabled",
+        toml_edit::Value::from(enabled),
+        || {
+            let mut cfg = Config::default();
+            cfg.highlight.enabled = enabled;
             toml::to_string_pretty(&cfg).context("serialize config")
         },
     )
@@ -3221,6 +3258,24 @@ mod tests {
         let plugin = host.known_theme_names();
         let plugin: Vec<&str> = plugin.iter().map(String::as_str).collect();
         assert_eq!(renderer, plugin, "renderer and plugin theme tables disagree");
+    }
+
+    #[test]
+    fn persist_highlight_enabled_round_trips() {
+        // The Settings-overlay highlight toggle persists via this path;
+        // the value must survive a restart (round-trip through the
+        // config file). Default is `true`, so write `false` then back.
+        let dir = std::env::temp_dir().join("rterm-test-persist-highlight");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let _ = std::fs::remove_file(&path);
+
+        super::persist_highlight_enabled_to_config(&path, false).unwrap();
+        assert!(!Config::load_from(&path).unwrap().highlight.enabled);
+        super::persist_highlight_enabled_to_config(&path, true).unwrap();
+        assert!(Config::load_from(&path).unwrap().highlight.enabled);
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

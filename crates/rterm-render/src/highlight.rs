@@ -38,6 +38,7 @@ pub struct HighlightRuleInput {
     pub bold: bool,
 }
 
+#[derive(Clone)]
 struct CompiledRule {
     re: Regex,
     fg: [u8; 3],
@@ -141,6 +142,23 @@ pub fn set_rules(enabled: bool, use_builtins: bool, custom: Vec<HighlightRuleInp
     }
 }
 
+/// Flip only the master enable flag, keeping the compiled rules —
+/// what the Settings-overlay toggle uses so it doesn't have to
+/// re-pass (or re-parse) the rule set. Cheap: clones the existing
+/// rules into a fresh engine with the new flag.
+pub fn set_enabled(enabled: bool) {
+    if let Ok(mut g) = engine_slot().lock() {
+        let rules = g.rules.clone();
+        *g = Arc::new(HighlightEngine { enabled, rules });
+    }
+}
+
+/// Current master enable flag. `false` when highlighting is off,
+/// regardless of how many rules are compiled.
+pub fn is_enabled() -> bool {
+    engine_slot().lock().map(|g| g.enabled).unwrap_or(false)
+}
+
 /// Parse a colour string into RGB. Accepts `#RRGGBB`, `#RGB`, the same
 /// without `#`, and a set of common colour names (One Dark-ish so they
 /// read well on a dark theme). Returns `None` for anything else so the
@@ -226,6 +244,12 @@ fn builtin_rules() -> Vec<HighlightRuleInput> {
         r(r"\b\d+(?:\.\d+)?\b", CYAN, false),
     ]
 }
+
+/// Serializes tests that mutate the process-global highlight engine
+/// (here and the `build_spans` integration test in `lib.rs`) so their
+/// set/reset can't interleave under the parallel test runner.
+#[cfg(test)]
+pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 mod tests {
@@ -323,6 +347,29 @@ mod tests {
         assert!(!eng.is_active());
         let empty = compile(vec![]);
         assert!(!empty.is_active());
+    }
+
+    #[test]
+    fn set_rules_then_toggle_enabled_via_global() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Drives the Settings-overlay toggle: install rules enabled,
+        // flip off and on via `set_enabled`, read back via
+        // `is_enabled`. Rules survive the flip.
+        set_rules(
+            true,
+            false,
+            vec![HighlightRuleInput { pattern: "x".to_string(), fg: [1, 1, 1], bold: false }],
+        );
+        assert!(is_enabled());
+        assert!(active().is_active(), "enabled + rules → active");
+        set_enabled(false);
+        assert!(!is_enabled());
+        assert!(!active().is_active(), "disabled → inactive even with rules");
+        set_enabled(true);
+        assert!(is_enabled());
+        assert!(active().is_active(), "re-enabled keeps the rules");
+        // Reset the global so other tests see no rules.
+        set_rules(false, false, vec![]);
     }
 
     #[test]

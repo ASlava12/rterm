@@ -619,6 +619,13 @@ impl App {
         );
         row += 1;
 
+        let hl_row = row;
+        let hl_mark = if crate::highlight::is_enabled() { "[x]" } else { "[ ]" };
+        storage.push(format!("  {} Syntax highlighting\n", hl_mark));
+        spans.push((storage.len() - 1, fg, false));
+        push_hit(&mut self.settings_hits, hl_row, 2, 24, SettingsHit::ToggleHighlight);
+        row += 1;
+
         storage.push("\n".to_string());
         spans.push((storage.len() - 1, fg, false));
         row += 1;
@@ -635,7 +642,7 @@ impl App {
         // Hints — keep the keyboard cheats discoverable.
         storage.push(
             "  Keys: T/Shift+T theme · F/Shift+F font · O/Shift+O opacity\n  \
-             0 reset font · 9 reset opacity · B blink · S scrollbar · ? help · Esc close\n"
+             0 reset font · 9 reset opacity · B blink · S scrollbar · Y highlight · ? help · Esc close\n"
                 .to_string(),
         );
         spans.push((storage.len() - 1, muted, false));

@@ -2714,6 +2714,8 @@ enum SettingsHit {
     /// input stream" feature. Off by default; flipping here
     /// propagates to every live pane's `Terminal`.
     ToggleAutoDetectImages,
+    /// Toggle WindTerm-style client-side syntax highlighting.
+    ToggleHighlight,
     /// Swap to the help overlay (`Ctrl+Shift+H` equivalent).
     OpenHelp,
     /// Close the settings overlay.
@@ -2756,6 +2758,11 @@ pub type ThemeChangeCallback = Arc<dyn Fn(&str) + Send + Sync>;
 /// implements this to rewrite the value in `~/.config/rterm/config.toml`
 /// so the choice sticks across restarts.
 pub type ImageAutoDetectCallback = Arc<dyn Fn(bool) + Send + Sync>;
+
+/// Same shape, invoked when the user toggles syntax highlighting from
+/// the Settings overlay. rterm-app rewrites `[highlight].enabled` in
+/// config.toml so the choice sticks across restarts.
+pub type HighlightToggleCallback = Arc<dyn Fn(bool) + Send + Sync>;
 
 /// Active tab-switch animation. The accent stripe under the active tab
 /// slides from `from_idx` to `to_idx` over `TAB_SWITCH_ANIM_MS` ms.
@@ -3253,6 +3260,11 @@ pub struct RunConfig {
     /// rterm-app can write it back into
     /// `~/.config/rterm/config.toml`.
     pub on_image_auto_detect_change: Option<ImageAutoDetectCallback>,
+    /// Persistence callback for the Settings overlay's
+    /// `[x] Syntax highlighting` checkbox — rewrites
+    /// `[highlight].enabled` in config.toml. `None` disables
+    /// persistence (the toggle still works for the session).
+    pub on_highlight_change: Option<HighlightToggleCallback>,
     /// Whether the OS should draw the window title bar and decorations.
     /// `false` (default) makes rterm own the entire window chrome —
     /// matches the Chrome/Firefox look. Set to `true` to fall back to
@@ -3434,6 +3446,9 @@ pub struct App {
     /// Persistence sink for the auto-detect toggle. See
     /// [`RunConfig::on_image_auto_detect_change`].
     on_image_auto_detect_change: Option<ImageAutoDetectCallback>,
+    /// Persistence sink for the syntax-highlight toggle. See
+    /// [`RunConfig::on_highlight_change`].
+    on_highlight_change: Option<HighlightToggleCallback>,
     /// Whether the OS draws the title bar / window border. Cached at
     /// construction so the `resumed()` event creates the window with
     /// the matching `WindowAttributes::with_decorations` flag.
@@ -3646,6 +3661,7 @@ impl App {
             active_theme,
             on_theme_change,
             on_image_auto_detect_change,
+            on_highlight_change,
             os_decorations,
             allow_osc52,
             guake,
@@ -3732,6 +3748,7 @@ impl App {
             },
             on_theme_change,
             on_image_auto_detect_change,
+            on_highlight_change,
             os_decorations,
             palette: None,
             window_focused: true,
@@ -4516,6 +4533,16 @@ impl App {
                     cb(self.image_auto_detect);
                 }
             }
+            Some(SettingsHit::ToggleHighlight) => {
+                // Runtime flip lives in the global highlight engine;
+                // persist `[highlight].enabled` via the callback so it
+                // survives a restart.
+                let now = !highlight::is_enabled();
+                highlight::set_enabled(now);
+                if let Some(cb) = self.on_highlight_change.as_ref() {
+                    cb(now);
+                }
+            }
             Some(SettingsHit::OpenHelp) => {
                 self.show_settings = false;
                 self.show_help = true;
@@ -4589,6 +4616,13 @@ impl App {
                 }
                 "s" => {
                     self.show_scrollbar = !self.show_scrollbar;
+                }
+                "y" => {
+                    let now = !highlight::is_enabled();
+                    highlight::set_enabled(now);
+                    if let Some(cb) = self.on_highlight_change.as_ref() {
+                        cb(now);
+                    }
                 }
                 "?" => {
                     self.show_settings = false;
@@ -15035,6 +15069,7 @@ mod tests {
 
     #[test]
     fn build_spans_highlights_only_default_fg_cells() {
+        let _guard = highlight::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Install a rule that colours "ERROR" red, then render a grid
         // where the word appears once in plain (default fg) text and
         // once already coloured green by SGR. The plain one must pick
