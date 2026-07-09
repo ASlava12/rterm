@@ -8536,22 +8536,17 @@ impl App {
         if cell_w <= 0.0 || line_h <= 0.0 {
             return;
         }
-        // Re-derive the button-row Y from the same layout the
-        // renderer used: header (1) + blank (1) + preview rows +
-        // optional "+N more" line + blank (1) = button row index.
-        let preview_total = modal.line_count();
-        let preview_rendered = preview_total.min(12);
-        let more_line = usize::from(preview_total > 12);
-        let button_row_index = 1 + 1 + preview_rendered + more_line + 1;
-        // Hit-zone is 4 rows tall: the actual button row plus 3
-        // rows below it (the blank row, the hint line, and one row
-        // of slack). Real-world clicks routinely landed 1–2 rows
-        // below the visual button when the modal was densely
-        // packed with a long preview; widening the zone catches
-        // them without overlapping the preview text above.
+        // Re-derive the button-row Y from the same layout the renderer
+        // used (see `confirm_button_row_index`).
+        let button_row_index = confirm_button_row_index(modal.line_count());
+        // The Confirm overlay renders wrap-off (1 logical line == 1
+        // visual row — see `overlay_nowrap`), so `button_row_index` is
+        // exact and no longer drifts under a long preview. A 1-row
+        // tolerance below the button keeps clicks that land a hair low
+        // (on the gap before the hint line) working.
         let yf = y as f32;
         let row_top = rect.top + button_row_index as f32 * line_h;
-        let row_bottom = rect.top + (button_row_index + 4) as f32 * line_h;
+        let row_bottom = rect.top + (button_row_index + 2) as f32 * line_h;
         if yf < row_top || yf >= row_bottom {
             return;
         }
@@ -10860,6 +10855,17 @@ fn half_page_rows(page: i32) -> i32 {
     } else {
         (page / 2).max(1)
     }
+}
+
+/// Logical row index of the paste-confirmation button row, matching
+/// the span layout in `paste_confirmation_spans` (Confirm mode):
+/// header (1) + blank (1) + preview rows (capped at 12) + optional
+/// "+N more" line + blank (1). With the Confirm overlay rendered
+/// wrap-off, logical rows == visual rows, so this is the exact row.
+fn confirm_button_row_index(preview_total: usize) -> usize {
+    let preview_rendered = preview_total.min(12);
+    let more_line = usize::from(preview_total > 12);
+    1 + 1 + preview_rendered + more_line + 1
 }
 
 /// Pixel rect (x, y, w, h) of the terminal cursor cell within a pane,
@@ -13760,11 +13766,13 @@ impl ApplicationHandler<UserEvent> for App {
                         && self.rename_tab.is_none()
                         && self.context_menu.is_none()
                         && self.palette.is_none();
+                    // The paste modal (BOTH Edit and Confirm) needs
+                    // wrap-off. Edit's click-to-cursor relies on it; the
+                    // Confirm button hit-test derives the button row as a
+                    // logical-line count, so a wrapped preview line would
+                    // push the visual button row below its hit rect.
                     let overlay_nowrap = settings_overlay_shown
-                        || matches!(
-                            self.paste_confirmation.as_ref().map(|m| &m.mode),
-                            Some(paste_confirm::PasteMode::Edit { .. }),
-                        );
+                        || self.paste_confirmation.is_some();
                     let overlay_draw = overlay_rect.map(|rect| OverlayDraw {
                         spans: overlay_spans,
                         rect,
@@ -15268,6 +15276,19 @@ mod tests {
         let substring = fuzzy_score("next tab", "tab").unwrap();
         let fuzzy = fuzzy_score("toggle a button", "tab").unwrap();
         assert!(substring > fuzzy, "substring={substring} fuzzy={fuzzy}");
+    }
+
+    #[test]
+    fn confirm_button_row_index_matches_layout() {
+        // 1-line paste: header(1) + blank(1) + 1 preview + blank(1) → 4.
+        assert_eq!(confirm_button_row_index(1), 4);
+        // Exactly 12 lines: no "+N more" line → 2 + 12 + 1 = 15.
+        assert_eq!(confirm_button_row_index(12), 15);
+        // Over 12: preview capped at 12 + one "+N more" line → 16.
+        assert_eq!(confirm_button_row_index(50), 16);
+        // Monotonic up to the cap, then flat.
+        assert!(confirm_button_row_index(5) < confirm_button_row_index(11));
+        assert_eq!(confirm_button_row_index(100), confirm_button_row_index(13));
     }
 
     #[test]
