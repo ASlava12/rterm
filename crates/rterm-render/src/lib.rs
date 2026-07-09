@@ -9429,61 +9429,32 @@ impl App {
         } else {
             state.query.to_lowercase().chars().collect()
         };
-        let Ok(term) = pane.terminal.lock() else { return };
-        // On alt screen the renderer pins the viewport to the alt grid
-        // (iter 263), so primary scrollback is unreachable — pretend it's
-        // empty so search only finds matches the user can actually scroll
-        // to within the current TUI app's buffer.
-        let sb_len = if term.is_on_alt_screen() { 0 } else { term.scrollback_len() };
-        let total_lines = sb_len + term.size().rows as usize;
-        for line_idx in 0..total_lines {
-            let row_cells: &[rterm_core::Cell] = if line_idx < sb_len {
-                match term.scrollback_line(line_idx) {
-                    Some(r) => r,
-                    None => continue,
-                }
-            } else {
-                let g_row = (line_idx - sb_len) as u16;
-                match term.grid().row(g_row) {
-                    Some(r) => r,
-                    None => continue,
-                }
-            };
-            if let Some(re) = &regex {
-                // Build row as a String so regex can scan it; we map byte
-                // offsets back to column indices by counting chars.
-                let row_str: String = row_cells.iter().map(|c| c.ch).collect();
-                for m in re.find_iter(&row_str) {
-                    if m.range().is_empty() {
-                        continue;
-                    }
-                    let start_col = row_str[..m.start()].chars().count();
-                    let end_col = row_str[..m.end()].chars().count();
-                    state.matches.push((line_idx, start_col as u16, end_col as u16));
-                }
-            } else {
-                let mut start = 0usize;
-                while start + q_chars.len() <= row_cells.len() {
-                    let m = (0..q_chars.len()).all(|i| {
-                        let cell_ch = row_cells[start + i].ch;
-                        if case_sensitive {
-                            cell_ch == q_chars[i]
-                        } else {
-                            cell_ch.to_lowercase().eq(q_chars[i].to_lowercase())
-                        }
-                    });
-                    if m {
-                        state
-                            .matches
-                            .push((line_idx, start as u16, (start + q_chars.len()) as u16));
-                        start += q_chars.len();
-                    } else {
-                        start += 1;
-                    }
-                }
+        // Snapshot every row's characters under a BRIEF lock, then
+        // release it before the (potentially slow) match loop — so the
+        // PTY reader thread isn't blocked scanning a huge scrollback on
+        // every keystroke (the old code held the lock for the whole
+        // scan). On alt screen the renderer pins the viewport to the
+        // alt grid, so primary scrollback is unreachable — treat it as
+        // empty so search only finds what the user can scroll to.
+        let rows: Vec<Vec<char>> = {
+            let Ok(term) = pane.terminal.lock() else { return };
+            let sb_len = if term.is_on_alt_screen() { 0 } else { term.scrollback_len() };
+            let total_lines = sb_len + term.size().rows as usize;
+            let mut rows = Vec::with_capacity(total_lines);
+            for line_idx in 0..total_lines {
+                let cells: Option<&[rterm_core::Cell]> = if line_idx < sb_len {
+                    term.scrollback_line(line_idx)
+                } else {
+                    term.grid().row((line_idx - sb_len) as u16)
+                };
+                // Push a row per logical line (empty for a missing one)
+                // so the snapshot index stays == the logical line index.
+                rows.push(cells.map(|r| r.iter().map(|c| c.ch).collect()).unwrap_or_default());
             }
-        }
-        drop(term);
+            rows
+        };
+
+        state.matches = search_rows(&rows, regex.as_ref(), &q_chars, case_sensitive);
 
         if !state.matches.is_empty() {
             state.current = state.matches.len() - 1;
@@ -10863,6 +10834,56 @@ fn half_page_rows(page: i32) -> i32 {
     } else {
         (page / 2).max(1)
     }
+}
+
+/// Find every match of the search query across `rows` (each element a
+/// logical line's characters). Returns `(line_idx, start_col, end_col)`
+/// per match, in row-then-column order. When `regex` is `Some`, it
+/// overrides substring matching; otherwise `q_chars` is the (already
+/// case-folded when `!case_sensitive`) query and each row is scanned
+/// left-to-right for non-overlapping matches. Pure over the snapshot,
+/// so the terminal lock is not held during the scan.
+fn search_rows(
+    rows: &[Vec<char>],
+    regex: Option<&regex::Regex>,
+    q_chars: &[char],
+    case_sensitive: bool,
+) -> Vec<(usize, u16, u16)> {
+    let mut matches = Vec::new();
+    for (line_idx, row_chars) in rows.iter().enumerate() {
+        if let Some(re) = regex {
+            // Build the row as a String so regex can scan it; map byte
+            // offsets back to column (char) indices.
+            let row_str: String = row_chars.iter().collect();
+            for m in re.find_iter(&row_str) {
+                if m.range().is_empty() {
+                    continue;
+                }
+                let start_col = row_str[..m.start()].chars().count();
+                let end_col = row_str[..m.end()].chars().count();
+                matches.push((line_idx, start_col as u16, end_col as u16));
+            }
+        } else if !q_chars.is_empty() {
+            let mut start = 0usize;
+            while start + q_chars.len() <= row_chars.len() {
+                let hit = (0..q_chars.len()).all(|i| {
+                    let cell_ch = row_chars[start + i];
+                    if case_sensitive {
+                        cell_ch == q_chars[i]
+                    } else {
+                        cell_ch.to_lowercase().eq(q_chars[i].to_lowercase())
+                    }
+                });
+                if hit {
+                    matches.push((line_idx, start as u16, (start + q_chars.len()) as u16));
+                    start += q_chars.len();
+                } else {
+                    start += 1;
+                }
+            }
+        }
+    }
+    matches
 }
 
 /// Logical row index of the paste-confirmation button row, matching
@@ -15275,6 +15296,29 @@ mod tests {
         let substring = fuzzy_score("next tab", "tab").unwrap();
         let fuzzy = fuzzy_score("toggle a button", "tab").unwrap();
         assert!(substring > fuzzy, "substring={substring} fuzzy={fuzzy}");
+    }
+
+    #[test]
+    fn search_rows_substring_and_regex() {
+        let rows: Vec<Vec<char>> = ["foo bar foo", "BARfoo", "nothing"]
+            .iter()
+            .map(|s| s.chars().collect())
+            .collect();
+        // Substring, case-insensitive ("foo" has no uppercase): 2 hits
+        // on row 0 (cols 0 and 8), 1 on row 1 (cols 3..6).
+        let q: Vec<char> = "foo".chars().collect();
+        let m = search_rows(&rows, None, &q, false);
+        assert_eq!(m, vec![(0, 0, 3), (0, 8, 11), (1, 3, 6)]);
+        // Case-sensitive "BAR" matches only row 1 col 0.
+        let qb: Vec<char> = "BAR".chars().collect();
+        assert_eq!(search_rows(&rows, None, &qb, true), vec![(1, 0, 3)]);
+        // Regex `f.o` matches "foo" twice on row 0, once on row 1.
+        let re = regex::Regex::new("f.o").unwrap();
+        let mr = search_rows(&rows, Some(&re), &[], false);
+        assert_eq!(mr, vec![(0, 0, 3), (0, 8, 11), (1, 3, 6)]);
+        // Empty query / no rows → no matches, no panic.
+        assert!(search_rows(&rows, None, &[], false).is_empty());
+        assert!(search_rows(&[], None, &q, false).is_empty());
     }
 
     #[test]
