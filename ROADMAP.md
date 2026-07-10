@@ -232,7 +232,7 @@
   Wayland-протокол); либо, если вне скоупа, явно задокументировать
   «Windows-only», чтобы не читалось как тихий no-op.
 
-- [~] **Sixel-графика.** Главный пункт роадмапа. (в работе, 2026-07)
+- [~] **Sixel-графика.** Главный пункт роадмапа. (функционален; полиш, 2026-07)
   План (из CLAUDE.md): DCS-расширение парсера в rterm-core (Sixel идёт
   как `DCS P1;P2;P3 q ... ST`), потоковый декодер палитро-строк в
   RGBA, регистрация через существующий image store (`register_image`)
@@ -248,13 +248,20 @@
   капы 4096²/16M пикс; мусор/пустой → None без паники. 6 юнит-тестов
   (колонка/прозрачность/RGB+repeat/банды/raster/junk). Pub-модуль, ещё
   не подключён к DCS (безопасно: поведение не меняется).
-  **Stage 2 (далее):** мост DCS→изображение — `hook`/`put`/`unhook` в
-  `TerminalPerform` (детект `q`-финала без intermediates, накопление до
-  `IMAGE_MAX_PAYLOAD_BYTES`), декод + `register_image(Rgba8)` +
-  `place_image` в позиции курсора (учесть, что регистрация — на
-  `impl Terminal`, а unhook — на `TerminalPerform`: нужен shared-буфер
-  или немедленная регистрация через &mut-рефы image-store).
-  **Stage 3:** reflow-выравнивание по сетке, fuzz-хардненинг.
+  **Stage 2 (сделано):** мост DCS→изображение. `TerminalPerform` уже
+  имеет &mut-доступ к image-store, так что регистрация идёт прямо в
+  `unhook` (не нужен отложенный буфер). `hook` детектит `q`-финал без
+  intermediates (отличие от `$q`/`+q` запросов) → `dcs_is_sixel`; `put`
+  копит тело в `dcs_buf` до `IMAGE_MAX_PAYLOAD_BYTES`; `unhook` →
+  `commit_sixel` → `sixel::decode` → новый `place_decoded_image`
+  (cols/rows-оценка 8×16 px как у iTerm2, `register_image_inline(Rgba8)`,
+  `ImagePlacement` в позиции курсора, `linefeed`×rows). Рендер
+  переиспользуется как есть (Rgba8 идёт через тот же image-pass).
+  `img2sixel`/`lsix` теперь отображают картинки. Тесты: DCS→placement +
+  DCS-мусор без паники/размещения. **Sixel функционален end-to-end.**
+  **Stage 3 (полиш, по желанию):** точное reflow-выравнивание по сетке
+  при ресайзе, fuzz-хардненинг парсера, P2-фон-режим (`?` background
+  select), aspect-ratio из raster-атрибутов.
 
 - [ ] **Профили и SSH-менеджер (WindTerm-режим).**
   Сохранённые подключения: `[[profiles]]` в конфиге (имя, команда/

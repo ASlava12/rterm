@@ -377,6 +377,10 @@ pub struct Terminal {
     /// (`DCS + q <hex-cap-names> ST`). Apps use this to ask the terminal
     /// what terminfo capabilities it supports.
     dcs_is_xtgettcap: bool,
+    /// True while accumulating a Sixel graphics body (`DCS P1;P2;P3 q
+    /// <data> ST`). The data buffers into `dcs_buf` (up to
+    /// `IMAGE_MAX_PAYLOAD_BYTES`) and is decoded + placed at `unhook`.
+    dcs_is_sixel: bool,
     /// Last graphic character emitted via `print`. REP (`CSI Pn b`) repeats
     /// this character `Pn` times. Reset by any control-byte execute or CSI
     /// dispatch other than `b` itself.
@@ -787,6 +791,7 @@ impl Terminal {
             dcs_buf: Vec::new(),
             dcs_is_rqss: false,
             dcs_is_xtgettcap: false,
+            dcs_is_sixel: false,
             last_printed: None,
             current_title: None,
             title_stack: Vec::new(),
@@ -1720,6 +1725,7 @@ impl Terminal {
             dcs_buf: &mut self.dcs_buf,
             dcs_is_rqss: &mut self.dcs_is_rqss,
             dcs_is_xtgettcap: &mut self.dcs_is_xtgettcap,
+            dcs_is_sixel: &mut self.dcs_is_sixel,
             last_printed: &mut self.last_printed,
             current_title: &mut self.current_title,
             title_stack: &mut self.title_stack,
@@ -2160,6 +2166,7 @@ impl Terminal {
             dcs_buf: &mut self.dcs_buf,
             dcs_is_rqss: &mut self.dcs_is_rqss,
             dcs_is_xtgettcap: &mut self.dcs_is_xtgettcap,
+            dcs_is_sixel: &mut self.dcs_is_sixel,
             last_printed: &mut self.last_printed,
             current_title: &mut self.current_title,
             title_stack: &mut self.title_stack,
@@ -2236,6 +2243,7 @@ struct TerminalPerform<'a> {
     dcs_buf: &'a mut Vec<u8>,
     dcs_is_rqss: &'a mut bool,
     dcs_is_xtgettcap: &'a mut bool,
+    dcs_is_sixel: &'a mut bool,
     last_printed: &'a mut Option<char>,
     current_title: &'a mut Option<String>,
     title_stack: &'a mut Vec<String>,
@@ -2503,6 +2511,59 @@ impl<'a> TerminalPerform<'a> {
         // behaviour. `linefeed` handles the scroll-region rules
         // and OSC 133 plumbing the same way a shell-emitted '\n'
         // would.
+        for _ in 0..rows {
+            self.linefeed();
+        }
+    }
+
+    /// Decode the accumulated Sixel body (`dcs_buf`) and place the image
+    /// at the cursor. Called from `unhook` when a `DCS … q` finished.
+    fn commit_sixel(&mut self) {
+        let Some(img) = crate::sixel::decode(self.dcs_buf.as_slice()) else {
+            return;
+        };
+        self.place_decoded_image(
+            crate::image::ImageFormat::Rgba8,
+            img.width,
+            img.height,
+            img.rgba,
+        );
+    }
+
+    /// Register an already-decoded RGBA image and place it at the cursor,
+    /// advancing past its cell footprint. Cell estimate matches the
+    /// iTerm2 path (8 px / col, 16 px / row); the renderer refines at
+    /// draw time. Shared entry point for protocols that hand us pixels
+    /// directly (Sixel today; more later).
+    fn place_decoded_image(
+        &mut self,
+        format: crate::image::ImageFormat,
+        width_px: u32,
+        height_px: u32,
+        data: Vec<u8>,
+    ) {
+        if width_px == 0 || height_px == 0 {
+            return;
+        }
+        let cols = ((width_px as f32 / 8.0).ceil().max(1.0) as u32).min(200) as u16;
+        let rows = ((height_px as f32 / 16.0).ceil().max(1.0) as u32).min(80) as u16;
+        let on_alt = *self.active == ALT;
+        let sb_len = if on_alt { 0 } else { self.scrollback.len() };
+        let abs_row = sb_len as i64 + self.cursor.row as i64;
+        let col = self.cursor.col;
+        let Some(id) = self.register_image_inline(format, width_px, height_px, data) else {
+            return;
+        };
+        self.image_placements.push(crate::image::ImagePlacement {
+            image_id: id,
+            abs_row,
+            col,
+            rows,
+            cols,
+            width_px,
+            height_px,
+            placement_id: 0,
+        });
         for _ in 0..rows {
             self.linefeed();
         }
@@ -3710,9 +3771,22 @@ impl<'a> Perform for TerminalPerform<'a> {
         // Both variants buffer their payload via `put` and reply at
         // `unhook`. They're mutually exclusive — at most one flag is set.
         *self.dcs_is_xtgettcap = intermediates == b"+" && byte == 'q';
+        // Sixel graphics: `DCS <P1;P2;P3> q <data> ST` — final byte `q`
+        // with NO intermediate (which is what tells it apart from the
+        // `$ q` / `+ q` queries above). The body accumulates in `dcs_buf`
+        // and is decoded + placed at `unhook`.
+        *self.dcs_is_sixel = intermediates.is_empty() && byte == 'q';
     }
 
     fn put(&mut self, byte: u8) {
+        // Sixel bodies are large (a whole image) — allow up to the shared
+        // image payload cap rather than the tiny query ceilings.
+        if *self.dcs_is_sixel {
+            if self.dcs_buf.len() < IMAGE_MAX_PAYLOAD_BYTES {
+                self.dcs_buf.push(byte);
+            }
+            return;
+        }
         // Cap the buffer so a malformed DCS string can't grow unboundedly.
         // XTGETTCAP can chain many cap names (`TN;Co;bce`), so allow a
         // larger ceiling than the RQSS selectors.
@@ -3723,6 +3797,12 @@ impl<'a> Perform for TerminalPerform<'a> {
     }
 
     fn unhook(&mut self) {
+        if *self.dcs_is_sixel {
+            *self.dcs_is_sixel = false;
+            self.commit_sixel();
+            self.dcs_buf.clear();
+            return;
+        }
         if *self.dcs_is_xtgettcap {
             self.dispatch_xtgettcap();
             self.dcs_buf.clear();
@@ -6702,6 +6782,31 @@ mod tests {
         assert!(t.bracketed_paste());
         t.advance(b"\x1b[?2004l");
         assert!(!t.bracketed_paste());
+    }
+
+    #[test]
+    fn sixel_dcs_decodes_and_places_an_image() {
+        let mut t = term(20, 10);
+        // DCS q <red, RGB 100;0;0, full-column sixel repeated 4×> ST.
+        // → a 4×6 image placed at the cursor (col 0).
+        t.advance(b"\x1bPq#1;2;100;0;0!4~\x1b\\");
+        let placements = t.image_placements();
+        assert_eq!(placements.len(), 1, "one placement created");
+        let p = &placements[0];
+        assert_eq!(p.width_px, 4);
+        assert_eq!(p.height_px, 6);
+        assert_eq!(p.col, 0);
+        // Cursor advanced past the image's one-row footprint.
+        assert_eq!(t.cursor().row, 1);
+    }
+
+    #[test]
+    fn sixel_dcs_garbage_does_not_crash_or_place() {
+        let mut t = term(20, 10);
+        // A `DCS q` with control/binary junk and no paintable sixels must
+        // decode to nothing — no placement, no panic.
+        t.advance(b"\x1bPq\x00\x01\x02 \r\x1b\\");
+        assert!(t.image_placements().is_empty());
     }
 
     #[test]
