@@ -42,6 +42,12 @@
 
 use std::sync::{Arc, Mutex};
 
+/// Ceiling on the accumulated line buffer. A real command is nowhere near
+/// this; the cap only exists so a paste (or synthesised burst) that never
+/// contains a line terminator can't grow `raw` without bound. Past it,
+/// further bytes are dropped until the next submit resets the buffer.
+const RAW_CAP: usize = 64 * 1024;
+
 /// Accumulated command line for one pane. Held inside `Pane` and
 /// fed every byte the renderer writes to that pane's PTY.
 pub(crate) struct CommandBuffer {
@@ -56,9 +62,19 @@ pub(crate) struct CommandBuffer {
     csi_params: Vec<u8>,
     /// `true` once the current line has absorbed any bracketed-paste
     /// content (a `CSI 200 ~` was seen). Lets the recorder redact
-    /// pasted secrets from history. Reset when the line is submitted or
-    /// killed (Ctrl+U / Ctrl+C).
+    /// pasted secrets from history. On submit it is reset to
+    /// [`Self::in_paste`] (NOT unconditionally to `false`) so every line
+    /// of a *multi-line* paste stays tainted, and it is cleared by a
+    /// genuine (non-paste) Ctrl+U / Ctrl+C.
     line_has_paste: bool,
+    /// `true` while between a `CSI 200 ~` (paste start) and its matching
+    /// `CSI 201 ~` (paste end). A bracketed paste is a per-*payload* span,
+    /// not a per-*line* flag: a pasted secret can contain literal newlines,
+    /// each of which submits a line. Tracking the span keeps lines 2..N of
+    /// the paste tainted (else the secret's later lines would be recorded
+    /// despite `redact_pasted`). Also suppresses in-payload control bytes
+    /// (`\x15`/`\x03`) from clearing the taint.
+    in_paste: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +104,7 @@ impl CommandBuffer {
             state: EscapeState::Normal,
             csi_params: Vec::new(),
             line_has_paste: false,
+            in_paste: false,
         }
     }
 
@@ -114,22 +131,31 @@ impl CommandBuffer {
                         // boundary.
                         self.pop_char();
                     }
-                    0x15 => {
+                    0x15 if !self.in_paste => {
                         // Ctrl+U — kill line, so the paste taint clears too.
+                        // Only a GENUINE keystroke (outside a paste span)
+                        // counts; a literal 0x15 byte inside pasted content
+                        // must NOT clear the taint (else the tail leaks).
                         self.raw.clear();
                         self.line_has_paste = false;
                     }
                     0x17 => self.kill_word(), // Ctrl+W
-                    0x03 => {
-                        // Ctrl+C — cancel line, clear paste taint.
+                    0x03 if !self.in_paste => {
+                        // Ctrl+C — cancel line, clear paste taint. As with
+                        // Ctrl+U, only outside a paste span.
                         self.raw.clear();
                         self.line_has_paste = false;
                     }
                     0x09 => {}                // TAB — see module doc
                     0x00..=0x1f => {
-                        // Drop any other C0 control byte silently.
+                        // Drop any other C0 control byte silently (this also
+                        // catches an in-paste 0x15/0x03, whose editing arms
+                        // above are gated on `!in_paste`).
                     }
-                    _ => self.raw.push(b),
+                    // Printable / UTF-8 byte. Cap the buffer so a paste with
+                    // no line terminator can't grow it without bound.
+                    _ if self.raw.len() < RAW_CAP => self.raw.push(b),
+                    _ => {}
                 },
                 EscapeState::EscSeen => match b {
                     b'[' => {
@@ -147,11 +173,16 @@ impl CommandBuffer {
                 EscapeState::Csi => {
                     // CSI terminator: any byte in 0x40..=0x7e.
                     if (0x40..=0x7e).contains(&b) {
-                        // Recognise bracketed-paste start (`CSI 200 ~`) so
-                        // the recorder can redact the pasted secret. The
-                        // markers themselves are dropped either way.
+                        // Recognise bracketed-paste start/end (`CSI 200 ~`
+                        // / `CSI 201 ~`) so the recorder can redact the
+                        // pasted secret across the whole payload — including
+                        // its embedded newlines. The markers themselves are
+                        // dropped either way.
                         if b == b'~' && self.csi_params == b"200" {
                             self.line_has_paste = true;
+                            self.in_paste = true;
+                        } else if b == b'~' && self.csi_params == b"201" {
+                            self.in_paste = false;
                         }
                         self.state = EscapeState::Normal;
                     } else if self.csi_params.len() < 8 {
@@ -221,7 +252,10 @@ impl CommandBuffer {
     /// when `[history] redact_pasted` is on.
     fn take_command(&mut self) -> Option<(String, bool)> {
         let bytes = std::mem::take(&mut self.raw);
-        let had_paste = std::mem::replace(&mut self.line_has_paste, false);
+        // Reset the line taint to whether we're STILL inside a paste span:
+        // a multi-line paste keeps lines 2..N tainted so a pasted secret
+        // that spans newlines is fully redacted, not just its first line.
+        let had_paste = std::mem::replace(&mut self.line_has_paste, self.in_paste);
         let s = String::from_utf8(bytes).ok()?;
         let trimmed = s.trim();
         if trimmed.is_empty() {
@@ -550,6 +584,59 @@ mod tests {
             h.lookup("pasted-secret").unwrap().is_none(),
             "pasted command redacted from history"
         );
+    }
+
+    #[test]
+    fn multi_line_paste_is_fully_redacted() {
+        // A pasted multi-line secret carries literal newlines between the
+        // 200~/201~ markers; each newline submits a line. EVERY line must
+        // stay tainted so the whole secret is redacted — not just line 1
+        // (the bug: the per-line taint reset on the first newline, leaking
+        // lines 2..N).
+        let mut b = CommandBuffer::new();
+        let out = b.feed(b"\x1b[200~AKIAIOSFODNN7\nwJalrXUtnFEMI\x1b[201~\r");
+        assert_eq!(
+            out,
+            vec![
+                ("AKIAIOSFODNN7".to_string(), true),
+                ("wJalrXUtnFEMI".to_string(), true),
+            ],
+            "both lines of the multi-line paste stay tainted",
+        );
+        // Once the paste span ends, a genuinely typed command is clean.
+        assert_eq!(b.feed(b"ls\r"), vec![("ls".to_string(), false)]);
+    }
+
+    #[test]
+    fn control_byte_inside_paste_keeps_taint() {
+        // A literal Ctrl+C / Ctrl+U byte *inside* pasted content is data,
+        // not a keystroke — it must not clear the paste taint (else the
+        // tail after it would leak).
+        let mut b = CommandBuffer::new();
+        let out = b.feed(b"\x1b[200~before\x03after\x1b[201~\r");
+        assert_eq!(
+            out,
+            vec![("beforeafter".to_string(), true)],
+            "in-paste control byte dropped but taint survives",
+        );
+        // A genuine Ctrl+C OUTSIDE a paste still cancels + clears the taint.
+        let mut b2 = CommandBuffer::new();
+        let out2 = b2.feed(b"\x1b[200~x\x1b[201~\x03typed\r");
+        assert_eq!(
+            out2,
+            vec![("typed".to_string(), false)],
+            "genuine post-paste Ctrl+C cancels the pasted line and untaints",
+        );
+    }
+
+    #[test]
+    fn raw_buffer_is_capped_without_a_terminator() {
+        // A large paste with no line terminator must not grow the buffer
+        // without bound.
+        let mut b = CommandBuffer::new();
+        let huge = vec![b'x'; RAW_CAP + 5000];
+        assert!(b.feed(&huge).is_empty(), "no newline → no submission");
+        assert!(b.current_input().len() <= RAW_CAP, "buffer stays capped");
     }
 
     #[test]
