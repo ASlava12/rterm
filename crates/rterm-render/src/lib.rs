@@ -5263,23 +5263,6 @@ impl App {
         false
     }
 
-    /// Update mouse-hover on the context menu when the cursor moves.
-    fn update_context_menu_hover(&mut self, x: f64, y: f64) {
-        let menu = match self.context_menu.as_ref() {
-            Some(m) => m.clone(),
-            None => return,
-        };
-        let new_hover = self.context_menu_item_at(&menu, x, y);
-        if let Some(m) = self.context_menu.as_mut() {
-            if m.hovered != new_hover {
-                m.hovered = new_hover;
-                if let Some(state) = self.state.as_ref() {
-                    state.window.request_redraw();
-                }
-            }
-        }
-    }
-
     /// Build the STATIC header chrome (hamburger only). Tab labels
     /// live in `header_tabs_spans` and are rendered into a separate
     /// buffer so they can slide with `tab_scroll_offset` without
@@ -8237,22 +8220,6 @@ impl App {
             .collect()
     }
 
-    /// Mouse-click on the paste-confirmation modal. Confirm mode:
-    /// hit-test the button row. Edit mode: project the click onto
-    /// a (line, column) in the buffer and move the cursor there.
-    fn handle_paste_confirmation_press(&mut self, x: f64, y: f64) {
-        use paste_confirm::PasteMode;
-        let Some(modal) = self.paste_confirmation.clone() else { return };
-        match modal.mode {
-            PasteMode::Confirm { .. } => {
-                self.paste_modal_press_confirm(&modal, x, y);
-            }
-            PasteMode::Edit { .. } => {
-                self.paste_modal_press_edit(x, y);
-            }
-        }
-    }
-
     /// Button hit-test for the Confirm dialog. Clicks outside any
     /// button are absorbed but ignored — the modal stays up.
     fn paste_modal_press_confirm(
@@ -8415,44 +8382,6 @@ impl App {
         }
     }
 
-    /// Mouse-wheel handling for the paste-confirmation modal. In
-    /// edit mode, the wheel shifts the VIEWPORT (not the cursor) by
-    /// a few lines per tick — same convention as every text editor.
-    /// The cursor stays where the user left it; if they keep
-    /// scrolling past it, the caret simply scrolls off-screen. As
-    /// soon as they type / arrow, the clamp pulls the viewport back.
-    /// In confirm mode, the wheel is absorbed silently to keep a
-    /// stray scroll from leaking through to the pane below.
-    fn handle_paste_confirmation_wheel(&mut self, delta: MouseScrollDelta) {
-        use paste_confirm::PasteMode;
-        // Take viewport rows in a pre-pass so we don't hold a
-        // mut borrow across the call.
-        let visible_rows = self.paste_modal_visible_rows();
-        let wrap_cols = self.paste_modal_wrap_cols();
-        let Some(modal) = self.paste_confirmation.as_mut() else { return };
-        let PasteMode::Edit { .. } = modal.mode else {
-            return; // Confirm mode: absorb only.
-        };
-        // ~3 lines per wheel notch matches browser / VSCode
-        // defaults. Touchpad pixel-deltas are normalised against
-        // the same scale.
-        let step = match delta {
-            MouseScrollDelta::LineDelta(_, y) => y * 3.0,
-            MouseScrollDelta::PixelDelta(p) => (p.y as f32) / 12.0,
-        };
-        let lines = step.round() as i32;
-        if lines == 0 {
-            return;
-        }
-        // Wheel up (positive delta in winit) → scroll buffer UP
-        // visually = view EARLIER lines. We shift the viewport
-        // WITHOUT moving the cursor — matches every editor's
-        // wheel-scroll convention. Cursor stays where the user
-        // left it; the renderer's clamp will pull the viewport
-        // back when the user types again.
-        modal.scroll_by(-(lines as i64), visible_rows, wrap_cols);
-    }
-
     /// Clamp the paste modal's `scroll_line` so the cursor stays
     /// inside the viewport. Idempotent — when the cursor is
     /// already in view, `scroll_line` is untouched. Called from
@@ -8610,54 +8539,6 @@ impl App {
                 self.paste_confirmation = None;
             }
         }
-    }
-
-    /// Mouse-click on the suggestion popup. Returns `true` when the
-    /// click landed inside the popup rect (and was therefore
-    /// consumed); `false` lets the caller treat the click as
-    /// "outside" and close the popup before continuing normal
-    /// dispatch.
-    ///
-    /// Hit-test: convert the click's row inside the popup to an
-    /// entry index via `(y - rect.top - pad) / line_h + scroll`.
-    /// Out-of-range rows (e.g. clicking the "↓ N more" trailer
-    /// line) still count as inside the rect, but no row is
-    /// selected — the popup closes and nothing is injected.
-    fn handle_suggestion_popup_press(&mut self, x: f64, y: f64) -> bool {
-        let Some(popup) = self.suggestion_popup.clone() else { return false };
-        let Some(rect) = self.suggestion_popup_rect(&popup) else { return false };
-        let xf = x as f32;
-        let yf = y as f32;
-        if xf < rect.left
-            || xf >= rect.left + rect.width
-            || yf < rect.top
-            || yf >= rect.top + rect.height
-        {
-            return false;
-        }
-        // Convert pixel offset → entry index. The spans builder
-        // uses `line_height()` per row and a 2px vertical pad.
-        let line_h = self
-            .state
-            .as_ref()
-            .map(|s| s.text.line_height())
-            .filter(|h| *h > 0.0)
-            .unwrap_or(16.0);
-        let row_in_popup = ((yf - rect.top - 2.0) / line_h) as usize;
-        let entry_idx = popup.scroll + row_in_popup;
-        if let Some(entry) = popup.entries.get(entry_idx) {
-            let text = entry.text.clone();
-            self.suggestion_popup = None;
-            if let Some(pane) = self.focused_pane() {
-                pane.send_input(b"\x15");
-                pane.send_input(text.as_bytes());
-            }
-        } else {
-            // Click on the trailer / past the last row → just
-            // close, no inject.
-            self.suggestion_popup = None;
-        }
-        true
     }
 
     /// Per-frame refresh: query the history store when input has

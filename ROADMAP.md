@@ -226,10 +226,14 @@
   (редактор имени таба); затем оверлейные key-хендлеры
   `handle_settings_key` / `handle_context_menu_key` /
   `handle_paste_confirmation_key` / `handle_suggestion_popup_key`.
-  `lib.rs` 16.0k → 14.8k (`input.rs` ~1220). Все key-хендлеры теперь в
-  `input.rs`. Далее: мышиные press/move/wheel-хендлеры
-  (`handle_paste_confirmation_press/wheel`, `handle_suggestion_popup_press`,
-  context-menu hover, pane/tab hit-test) в `input.rs`; затем `frame.rs`
+  `lib.rs` 16.0k → 14.8k. Все key-хендлеры теперь в `input.rs`. Плюс
+  мышиные entry-хендлеры модалок/попапов
+  (`handle_paste_confirmation_press` / `handle_paste_confirmation_wheel`
+  / `handle_suggestion_popup_press` / `update_context_menu_hover`).
+  `lib.rs` → 14.7k (`input.rs` ~1342). Далее: пере­ехавшие entry-точки
+  тянут за собой хелперы хит-теста (`paste_modal_press_*` /
+  `paste_modal_hit_test` / `suggestion_popup_rect` /
+  `context_menu_item_at`) — их тоже в `input.rs`; затем `frame.rs`
   (RedrawRequested-пайплайн) и `snapshot.rs`. (2) чистая математика (геометрия, хит-тесты,
   кодирование) — в свободные функции ради юнит-тестов; (3) убрать
   дублирование (инлайн-копии `close_tab_at` и т.п.), стейл-комментарии,
