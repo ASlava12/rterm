@@ -221,9 +221,11 @@
   как `impl App`: PTY-паста (`paste_clipboard` / `paste_primary` /
   `write_paste` / `commit_paste_now`), key→байты (`dispatch_input_bytes`
   / `forward_key_to_pty`), колесо (`handle_scroll`) и key-диспетчеры
-  (`handle_key` / `handle_palette_key` / `handle_search_key`). `lib.rs`
-  16.0k → 15.4k. Далее: собрать оставшиеся key-хендлеры
-  (`handle_settings_key` / `handle_rename_key` / `handle_scroll_key` /
+  (`handle_key` / `handle_palette_key` / `handle_search_key`), плюс
+  `handle_scroll_key` (Shift+PgUp/PgDn/Home/End) и `handle_rename_key`
+  (редактор имени таба). `lib.rs` 16.0k → 15.2k (`input.rs` ~855).
+  Далее: собрать оставшиеся key-хендлеры (`handle_settings_key` /
+  `handle_context_menu_key` / `handle_suggestion_popup_key` /
   paste-confirm) и мышиные press/move-хендлеры в `input.rs`; затем
   `frame.rs` (RedrawRequested-пайплайн) и `snapshot.rs`. (2) чистая математика (геометрия, хит-тесты,
   кодирование) — в свободные функции ради юнит-тестов; (3) убрать

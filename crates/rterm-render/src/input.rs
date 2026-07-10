@@ -16,7 +16,8 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use crate::{
     clamp_scroll_offset, ctrl_byte, encode_mouse, is_bare_modifier_key,
     mouse_mode_for,
-    named_key_bytes, paste_confirm, word_back_delete_index, App, SelectionPoint,
+    named_key_bytes, paste_confirm, word_back_delete_index, App, ScrollNav,
+    SelectionPoint,
 };
 
 impl App {
@@ -689,5 +690,167 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Handle Shift+PageUp/PageDown/Home/End for keyboard scrollback nav.
+    /// Returns `true` if the event was consumed.
+    pub(crate) fn handle_scroll_key(&self, event: &KeyEvent) -> bool {
+        if !self.modifiers.contains(ModifiersState::SHIFT) {
+            return false;
+        }
+        if self.modifiers.contains(ModifiersState::CONTROL)
+            || self.modifiers.contains(ModifiersState::ALT)
+        {
+            return false;
+        }
+        let Key::Named(named) = &event.logical_key else { return false };
+        let kind = match named {
+            NamedKey::PageUp => ScrollNav::PageUp,
+            NamedKey::PageDown => ScrollNav::PageDown,
+            NamedKey::Home => ScrollNav::Home,
+            NamedKey::End => ScrollNav::End,
+            _ => return false,
+        };
+        self.scroll_view(kind);
+        true
+    }
+
+    pub(crate) fn handle_rename_key(&mut self, event: &KeyEvent) -> bool {
+        if event.state != ElementState::Pressed {
+            return false;
+        }
+        let ctrl = self.modifiers.contains(ModifiersState::CONTROL);
+        let mut key_consumed = true;
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => self.cancel_tab_rename(),
+            Key::Named(NamedKey::Enter) => self.commit_tab_rename(),
+            Key::Named(NamedKey::Backspace) => {
+                if let Some(rt) = self.rename_tab.as_mut() {
+                    rt.pristine = false;
+                    if rt.cursor > 0 {
+                        let mut idx = rt.cursor.saturating_sub(1);
+                        while idx > 0 && !rt.buffer.is_char_boundary(idx) {
+                            idx -= 1;
+                        }
+                        rt.buffer.replace_range(idx..rt.cursor, "");
+                        rt.cursor = idx;
+                    }
+                }
+            }
+            Key::Named(NamedKey::Delete) => {
+                if let Some(rt) = self.rename_tab.as_mut() {
+                    rt.pristine = false;
+                    let mut end = rt.cursor + 1;
+                    while end <= rt.buffer.len() && !rt.buffer.is_char_boundary(end) {
+                        end += 1;
+                    }
+                    if end <= rt.buffer.len() {
+                        rt.buffer.replace_range(rt.cursor..end, "");
+                    }
+                }
+            }
+            Key::Named(NamedKey::ArrowLeft) => {
+                if let Some(rt) = self.rename_tab.as_mut() {
+                    rt.pristine = false;
+                    if rt.cursor > 0 {
+                        let mut idx = rt.cursor.saturating_sub(1);
+                        while idx > 0 && !rt.buffer.is_char_boundary(idx) {
+                            idx -= 1;
+                        }
+                        rt.cursor = idx;
+                    }
+                }
+                self.reset_cursor_blink();
+            }
+            Key::Named(NamedKey::ArrowRight) => {
+                if let Some(rt) = self.rename_tab.as_mut() {
+                    rt.pristine = false;
+                    let mut idx = rt.cursor + 1;
+                    while idx <= rt.buffer.len() && !rt.buffer.is_char_boundary(idx) {
+                        idx += 1;
+                    }
+                    rt.cursor = idx.min(rt.buffer.len());
+                }
+                self.reset_cursor_blink();
+            }
+            Key::Named(NamedKey::Home) => {
+                if let Some(rt) = self.rename_tab.as_mut() {
+                    rt.pristine = false;
+                    rt.cursor = 0;
+                }
+                self.reset_cursor_blink();
+            }
+            Key::Named(NamedKey::End) => {
+                if let Some(rt) = self.rename_tab.as_mut() {
+                    rt.pristine = false;
+                    rt.cursor = rt.buffer.len();
+                }
+                self.reset_cursor_blink();
+            }
+            Key::Character(c) if ctrl => {
+                // Ctrl+letter shortcuts inside the rename overlay.
+                match c.as_str().to_ascii_lowercase().as_str() {
+                    "u" => {
+                        // Ctrl+U: clear the line, matches readline /
+                        // search overlay convention.
+                        if let Some(rt) = self.rename_tab.as_mut() {
+                            rt.buffer.clear();
+                            rt.cursor = 0;
+                            rt.pristine = false;
+                        }
+                    }
+                    "w" => {
+                        // Ctrl+W: delete previous word.
+                        if let Some(rt) = self.rename_tab.as_mut() {
+                            rt.pristine = false;
+                            let bytes = rt.buffer.as_bytes();
+                            let mut idx = rt.cursor;
+                            // Skip trailing whitespace.
+                            while idx > 0
+                                && bytes[idx - 1].is_ascii_whitespace()
+                            {
+                                idx -= 1;
+                            }
+                            // Skip preceding non-whitespace.
+                            while idx > 0
+                                && !bytes[idx - 1].is_ascii_whitespace()
+                            {
+                                idx -= 1;
+                            }
+                            while idx > 0 && !rt.buffer.is_char_boundary(idx) {
+                                idx -= 1;
+                            }
+                            rt.buffer.replace_range(idx..rt.cursor, "");
+                            rt.cursor = idx;
+                        }
+                    }
+                    _ => key_consumed = false,
+                }
+            }
+            Key::Character(c) => {
+                if let Some(rt) = self.rename_tab.as_mut() {
+                    // Pristine → first printable char replaces the
+                    // prefilled title entirely (Chrome/Firefox URL bar
+                    // "select-all on focus" feel without true
+                    // selection).
+                    if rt.pristine {
+                        rt.buffer.clear();
+                        rt.cursor = 0;
+                        rt.pristine = false;
+                    }
+                    let s = c.as_str();
+                    rt.buffer.insert_str(rt.cursor, s);
+                    rt.cursor += s.len();
+                }
+            }
+            _ => key_consumed = false,
+        }
+        if key_consumed {
+            self.reset_cursor_blink();
+        }
+        if let Some(state) = self.state.as_ref() {
+            state.window.request_redraw();
+        }
+        false
     }
 }
