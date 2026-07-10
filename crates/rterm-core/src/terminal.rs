@@ -6810,6 +6810,32 @@ mod tests {
     }
 
     #[test]
+    fn sixel_dcs_fuzz_full_path_never_panics() {
+        // Wrap random bodies in a full `DCS q … ST` and push them through
+        // the parser, exercising hook/put/unhook + commit_sixel end to
+        // end. Deterministic LCG; the terminal must never panic.
+        let mut state: u64 = 0xD1B5_4A32_D192_ED03;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let alphabet: &[u8] = b"#!$-\"0123456789;?~\x1b\\@AZ ";
+        let mut t = term(24, 12);
+        for _ in 0..400 {
+            let len = (next() % 200) as usize;
+            let mut seq = Vec::with_capacity(len + 4);
+            seq.extend_from_slice(b"\x1bPq");
+            for _ in 0..len {
+                seq.push(alphabet[(next() as usize) % alphabet.len()]);
+            }
+            seq.extend_from_slice(b"\x1b\\");
+            t.advance(&seq);
+        }
+    }
+
+    #[test]
     fn kitty_keyboard_flag_stack_push_pop_set_query() {
         let mut t = term(8, 2);
         // Empty stack → legacy (0), and `CSI ? u` reports 0.

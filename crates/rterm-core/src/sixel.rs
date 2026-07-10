@@ -85,12 +85,18 @@ pub fn decode(data: &[u8]) -> Option<SixelImage> {
                     i += 1;
                     if (0x3F..=0x7E).contains(&sc) {
                         let bits = sc - 0x3F;
-                        for _ in 0..n.max(1) {
+                        // Clamp the run to the remaining width budget so a
+                        // huge `!Pn` can't grow the grid without bound
+                        // before the per-iteration guard below runs — the
+                        // repeat loop would otherwise be a memory bomb.
+                        let remaining = (MAX_DIM + 1).saturating_sub(x) as u32;
+                        let count = n.max(1).min(remaining);
+                        for _ in 0..count {
                             put_sixel(&mut grid, x, band, bits, palette[color]);
                             x += 1;
                         }
                         max_x = max_x.max(x);
-                        if bits != 0 {
+                        if bits != 0 && count > 0 {
                             max_band = Some(max_band.map_or(band, |m| m.max(band)));
                         }
                     }
@@ -341,6 +347,42 @@ mod tests {
         // 1×6 column.
         let img = decode(b"\"1;1;10;8#1~").expect("decodes");
         assert_eq!((img.width, img.height), (10, 8));
+    }
+
+    #[test]
+    fn fuzz_decode_never_panics_and_stays_bounded() {
+        // Deterministic LCG (no external rng, reproducible). Feed many
+        // random byte strings — biased toward Sixel-significant chars so
+        // the control paths get exercised — and assert the decoder never
+        // panics, never exceeds the caps, and returns a correctly-sized
+        // buffer whenever it produces an image.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let alphabet: &[u8] = b"#!$-\"0123456789;?@ABYZ~\x00\xff ";
+        for _ in 0..3000 {
+            let len = (next() % 600) as usize;
+            let data: Vec<u8> = (0..len)
+                .map(|_| alphabet[(next() as usize) % alphabet.len()])
+                .collect();
+            if let Some(img) = decode(&data) {
+                assert!(img.width as usize <= MAX_DIM);
+                assert!(img.height as usize <= MAX_DIM);
+                assert_eq!(
+                    img.rgba.len(),
+                    img.width as usize * img.height as usize * 4,
+                    "rgba length matches declared dimensions"
+                );
+            }
+        }
+        // A pathological run-length must not hang or OOM — it's clamped to
+        // the width budget, then rejected for exceeding it.
+        assert!(decode(b"!4294967295~").is_none());
+        assert!(decode(b"#999999999999;2;100;0;0~").is_some());
     }
 
     #[test]
