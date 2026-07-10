@@ -124,12 +124,15 @@
   различают «(invalid key)» / «(custom action)» / builtin (+ поле
   `"custom"` в JSON). Тест на приём кастомного имени.
 
-- [ ] **SGR-Pixels mouse (DECSET `?1016`).**
-  Репорт координат мыши в пикселях (SGR-фрейминг), запрашивают neovim/
-  notcurses вместе с `?1006`. Нет арма в `handle_private_mode`
-  (`terminal.rs:~3169`), `decrqm_value` (`~3107`) возвращает 0. DoD:
-  обрабатывать `?1016` (флаг pixel-report), масштабировать col/row в
-  пиксели в `encode_mouse`, отразить в `decrqm_value`.
+- [x] **SGR-Pixels mouse (DECSET `?1016`).** (2026-07)
+  Ядро: поле `Terminal.sgr_pixel_mouse` — `?1016` set форсит `sgr_mouse`
+  (пиксель-репорты идут в SGR-фрейминге) + DECRQM + RIS-сброс; reset
+  оставляет `?1006`. Аксессор `sgr_pixel_mouse()`. Render: `mouse_mode_for`
+  → `(mode, sgr, pixel)`; новый `pixel_to_pane_px` (пиксельный офсет в
+  пределах панели) + централизующий `mouse_report_coords(idx,x,y,pixel)`
+  зовётся во всех 4 сайтах репорта (wheel/press/drag/release). По спеке
+  пиксельные ординаты те же 1-based → `encode_mouse` не менялся. Тест на
+  core-toggle+force+DECRQM.
 
 - [x] **IME: ввод CJK / dead keys / long-press macOS.** (2026-07)
   `set_ime_allowed(true)` при создании окна; `WindowEvent::Ime` arm —

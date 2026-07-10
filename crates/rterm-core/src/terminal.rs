@@ -230,6 +230,11 @@ pub struct Terminal {
     pending_bell: bool,
     mouse_tracking: MouseTracking,
     sgr_mouse: bool,
+    /// DECSET ?1016 — SGR-Pixels mouse: report coordinates in pixels
+    /// rather than character cells (same `CSI <` framing as ?1006).
+    /// Enabling it also forces `sgr_mouse` on. The renderer reads
+    /// `sgr_pixel_mouse()` and sends pixel offsets to `encode_mouse`.
+    sgr_pixel_mouse: bool,
     bracketed_paste: bool,
     /// DECSET ?1007 — alternate scroll mode. When on the alt-screen and
     /// no mouse tracking is active, the renderer translates wheel
@@ -729,6 +734,7 @@ impl Terminal {
             pending_bell: false,
             mouse_tracking: MouseTracking::Off,
             sgr_mouse: false,
+            sgr_pixel_mouse: false,
             bracketed_paste: false,
             alternate_scroll: true,
             reverse_screen: false,
@@ -1084,6 +1090,11 @@ impl Terminal {
     }
     pub fn sgr_mouse(&self) -> bool {
         self.sgr_mouse
+    }
+    /// DECSET ?1016 — whether mouse reports should carry pixel offsets
+    /// instead of cell coordinates. Implies `sgr_mouse()`.
+    pub fn sgr_pixel_mouse(&self) -> bool {
+        self.sgr_pixel_mouse
     }
     pub fn bracketed_paste(&self) -> bool {
         self.bracketed_paste
@@ -1647,6 +1658,7 @@ impl Terminal {
             pending_bell: &mut self.pending_bell,
             mouse_tracking: &mut self.mouse_tracking,
             sgr_mouse: &mut self.sgr_mouse,
+            sgr_pixel_mouse: &mut self.sgr_pixel_mouse,
             bracketed_paste: &mut self.bracketed_paste,
             alternate_scroll: &mut self.alternate_scroll,
             reverse_screen: &mut self.reverse_screen,
@@ -2086,6 +2098,7 @@ impl Terminal {
             pending_bell: &mut self.pending_bell,
             mouse_tracking: &mut self.mouse_tracking,
             sgr_mouse: &mut self.sgr_mouse,
+            sgr_pixel_mouse: &mut self.sgr_pixel_mouse,
             bracketed_paste: &mut self.bracketed_paste,
             alternate_scroll: &mut self.alternate_scroll,
             reverse_screen: &mut self.reverse_screen,
@@ -2159,6 +2172,7 @@ struct TerminalPerform<'a> {
     pending_bell: &'a mut bool,
     mouse_tracking: &'a mut MouseTracking,
     sgr_mouse: &'a mut bool,
+    sgr_pixel_mouse: &'a mut bool,
     bracketed_paste: &'a mut bool,
     alternate_scroll: &'a mut bool,
     reverse_screen: &'a mut bool,
@@ -3120,6 +3134,7 @@ impl<'a> TerminalPerform<'a> {
             1004 => Some(*self.focus_tracking),
             1006 => Some(*self.sgr_mouse),
             1007 => Some(*self.alternate_scroll),
+            1016 => Some(*self.sgr_pixel_mouse),
             2004 => Some(*self.bracketed_paste),
             2026 => Some(*self.sync_output),
             _ => None,
@@ -3182,6 +3197,15 @@ impl<'a> TerminalPerform<'a> {
                 // DECSET ?1007 — alternate scroll mode (wheel→cursor keys
                 // on the alt-screen when mouse tracking is off).
                 1007 => *self.alternate_scroll = set,
+                // DECSET ?1016 — SGR-Pixels mouse. Enabling it forces SGR
+                // framing on (pixel reports use the same `CSI <` form);
+                // disabling reverts to cell coordinates but leaves ?1006.
+                1016 => {
+                    *self.sgr_pixel_mouse = set;
+                    if set {
+                        *self.sgr_mouse = true;
+                    }
+                }
                 2004 => *self.bracketed_paste = set,
                 // DECSET ?2026 — Synchronized Output Mode. Apps (neovim,
                 // kakoune, helix) bracket a multi-segment frame with
@@ -4506,6 +4530,7 @@ impl<'a> Perform for TerminalPerform<'a> {
             *self.origin_mode = false;
             *self.mouse_tracking = MouseTracking::Off;
             *self.sgr_mouse = false;
+            *self.sgr_pixel_mouse = false;
             *self.bracketed_paste = false;
             *self.alternate_scroll = true;
             *self.focus_tracking = false;
@@ -6570,6 +6595,26 @@ mod tests {
         assert!(t.bracketed_paste());
         t.advance(b"\x1b[?2004l");
         assert!(!t.bracketed_paste());
+    }
+
+    #[test]
+    fn sgr_pixel_mouse_mode_forces_sgr_and_toggles() {
+        // ?1016 (SGR-Pixels) reports pixel coords; enabling it also forces
+        // SGR framing (?1006) on, and DECRQM round-trips.
+        let mut t = term(4, 1);
+        assert!(!t.sgr_pixel_mouse());
+        assert!(!t.sgr_mouse());
+        t.advance(b"\x1b[?1016h");
+        assert!(t.sgr_pixel_mouse());
+        assert!(t.sgr_mouse(), "?1016 implies SGR framing");
+        t.advance(b"\x1b[?1016$p");
+        assert_eq!(t.take_osc_responses(), vec!["\x1b[?1016;1$y".to_string()]);
+        // Disabling ?1016 drops pixel reporting but leaves ?1006 alone.
+        t.advance(b"\x1b[?1016l");
+        assert!(!t.sgr_pixel_mouse());
+        assert!(t.sgr_mouse(), "?1016 reset must not disable ?1006");
+        t.advance(b"\x1b[?1016$p");
+        assert_eq!(t.take_osc_responses(), vec!["\x1b[?1016;2$y".to_string()]);
     }
 
     #[test]

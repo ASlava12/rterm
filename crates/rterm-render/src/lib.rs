@@ -6163,6 +6163,33 @@ impl App {
         Some(SelectionPoint { row, col })
     }
 
+    /// Pixel offset of `(x, y)` inside pane `pane_idx`, clamped to the
+    /// pane's bounds. Feeds SGR-Pixels (DECSET ?1016) mouse reports, which
+    /// carry pixel coordinates instead of cell col/row. Returns physical
+    /// pixels relative to the pane's top-left; `None` if the pane has no
+    /// layout rect.
+    fn pixel_to_pane_px(&self, pane_idx: usize, x: f64, y: f64) -> Option<(u16, u16)> {
+        let rects = self.layout_active_tab();
+        let rect = rects.get(pane_idx)?;
+        let px = (x - rect.left as f64).clamp(0.0, (rect.width as f64 - 1.0).max(0.0));
+        let py = (y - rect.top as f64).clamp(0.0, (rect.height as f64 - 1.0).max(0.0));
+        Some((px as u16, py as u16))
+    }
+
+    /// Coordinates for a mouse report to `pane_idx`: pixel offset within
+    /// the pane when SGR-Pixels (DECSET ?1016) is active, else cell
+    /// col/row. Both feed `encode_mouse` (which applies the 1-based +1).
+    /// Falls back to `(0, 0)` when the pane has no layout rect.
+    fn mouse_report_coords(&self, pane_idx: usize, x: f64, y: f64, pixel: bool) -> (u16, u16) {
+        if pixel {
+            self.pixel_to_pane_px(pane_idx, x, y).unwrap_or((0, 0))
+        } else {
+            self.pixel_to_cell(pane_idx, x, y)
+                .map(|p| (p.col, p.row))
+                .unwrap_or((0, 0))
+        }
+    }
+
     /// Find the Split path whose gap is currently under the cursor (within
     /// ±GAP_HIT pixels), or None.
     fn gap_at(&self, x: f64, y: f64) -> Option<(tree::TreePath, SplitDir)> {
@@ -6451,9 +6478,15 @@ impl App {
         }
         if let Some(i) = self.mouse_pty_pane.take() {
             if let Some(pane) = self.active_tab().and_then(|t| t.pane_at(i)) {
-                if let Some((_mode, sgr)) = mouse_mode_for(pane) {
-                    if let Some(p) = self.pixel_to_cell(i, self.cursor_pos.x, self.cursor_pos.y) {
-                        let bytes = encode_mouse(sgr, 0, p.col, p.row, false);
+                if let Some((_mode, sgr, pixel)) = mouse_mode_for(pane) {
+                    {
+                        let (cx, cy) = self.mouse_report_coords(
+                            i,
+                            self.cursor_pos.x,
+                            self.cursor_pos.y,
+                            pixel,
+                        );
+                        let bytes = encode_mouse(sgr, 0, cx, cy, false);
                         pane.send_input(&bytes);
                     }
                 }
@@ -7960,14 +7993,16 @@ fn encode_mouse(sgr: bool, button: u32, col: u16, row: u16, press: bool) -> Vec<
     }
 }
 
-/// Read mouse mode of a pane's terminal. Returns Some((mode, sgr)) when on.
-fn mouse_mode_for(pane: &Pane) -> Option<(MouseTracking, bool)> {
+/// Read mouse mode of a pane's terminal. Returns `Some((mode, sgr,
+/// pixel))` when tracking is on — `sgr` = SGR framing (?1006/?1016),
+/// `pixel` = SGR-Pixels coordinates (?1016).
+fn mouse_mode_for(pane: &Pane) -> Option<(MouseTracking, bool, bool)> {
     let t = pane.terminal.lock().ok()?;
     let m = t.mouse_tracking();
     if m == MouseTracking::Off {
         None
     } else {
-        Some((m, t.sgr_mouse()))
+        Some((m, t.sgr_mouse(), t.sgr_pixel_mouse()))
     }
 }
 

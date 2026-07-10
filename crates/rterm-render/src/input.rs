@@ -152,13 +152,12 @@ impl App {
             return;
         };
         // If the shell wants mouse events, forward wheel as button 64 / 65.
-        if let Some((_mode, sgr)) = mouse_mode_for(pane) {
-            let p = self
-                .pixel_to_cell(target_idx, self.cursor_pos.x, self.cursor_pos.y)
-                .unwrap_or(SelectionPoint { row: 0, col: 0 });
+        if let Some((_mode, sgr, pixel)) = mouse_mode_for(pane) {
+            let (cx, cy) =
+                self.mouse_report_coords(target_idx, self.cursor_pos.x, self.cursor_pos.y, pixel);
             let button = if step > 0 { 64 } else { 65 };
             for _ in 0..step.unsigned_abs() {
-                let bytes = encode_mouse(sgr, button, p.col, p.row, true);
+                let bytes = encode_mouse(sgr, button, cx, cy, true);
                 pane.send_input(&bytes);
             }
             return;
@@ -1658,8 +1657,9 @@ impl App {
         // If the pane's shell asked for mouse reporting, forward the click
         // instead of starting a local selection.
         if let Some(pane) = self.active_tab().and_then(|t| t.pane_at(i)) {
-            if let Some((_mode, sgr)) = mouse_mode_for(pane) {
-                let bytes = encode_mouse(sgr, 0, p.col, p.row, true);
+            if let Some((_mode, sgr, pixel)) = mouse_mode_for(pane) {
+                let (cx, cy) = self.mouse_report_coords(i, x, y, pixel);
+                let bytes = encode_mouse(sgr, 0, cx, cy, true);
                 pane.send_input(&bytes);
                 self.mouse_pty_pane = Some(i);
                 self.selection = None;
@@ -1810,13 +1810,12 @@ impl App {
         // any-event tracking on.
         if let Some(i) = self.mouse_pty_pane {
             if let Some(pane) = self.active_tab().and_then(|t| t.pane_at(i)) {
-                if let Some((mode, sgr)) = mouse_mode_for(pane) {
+                if let Some((mode, sgr, pixel)) = mouse_mode_for(pane) {
                     if matches!(mode, MouseTracking::ButtonEvent | MouseTracking::AnyEvent) {
-                        if let Some(p) = self.pixel_to_cell(i, x, y) {
-                            // Button 0 (left) with +32 motion bit.
-                            let bytes = encode_mouse(sgr, 32, p.col, p.row, true);
-                            pane.send_input(&bytes);
-                        }
+                        // Button 0 (left) with +32 motion bit.
+                        let (cx, cy) = self.mouse_report_coords(i, x, y, pixel);
+                        let bytes = encode_mouse(sgr, 32, cx, cy, true);
+                        pane.send_input(&bytes);
                     }
                 }
             }
