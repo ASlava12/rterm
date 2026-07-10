@@ -14,6 +14,14 @@ use crate::grid::{Cell, CellAttrs, Grid, Position, Size};
 const DEFAULT_SCROLLBACK_LIMIT: usize = 10_000;
 const PRIMARY: usize = 0;
 const ALT: usize = 1;
+
+/// Max depth of the Kitty keyboard flag stack (per screen). The spec
+/// leaves this implementation-defined; matches xterm/kitty's small bound
+/// so a misbehaving app can't grow it without limit.
+const KITTY_KBD_STACK_MAX: usize = 32;
+/// Valid Kitty keyboard flag bits (0b1..0b10000). Higher bits are masked
+/// off on the way in so a query round-trips exactly what we honour.
+const KITTY_KBD_FLAG_MASK: u8 = 0b1_1111;
 const TAB_STEP: usize = 8;
 
 /// Decode an even-length ASCII hex string into a UTF-8 String. Used by
@@ -230,6 +238,13 @@ pub struct Terminal {
     pending_bell: bool,
     mouse_tracking: MouseTracking,
     sgr_mouse: bool,
+    /// Kitty keyboard protocol flag stack, per screen (index by `active`:
+    /// PRIMARY / ALT — the spec keeps main and alt-screen stacks separate).
+    /// The current flags are the top of the active screen's stack, or 0
+    /// (legacy encoding) when empty. Pushed by `CSI > flags u`, popped by
+    /// `CSI < n u`, modified by `CSI = flags ; mode u`, queried by
+    /// `CSI ? u`. Depth-capped at `KITTY_KBD_STACK_MAX`.
+    kitty_kbd_stack: [Vec<u8>; 2],
     /// DECSET ?1016 — SGR-Pixels mouse: report coordinates in pixels
     /// rather than character cells (same `CSI <` framing as ?1006).
     /// Enabling it also forces `sgr_mouse` on. The renderer reads
@@ -734,6 +749,7 @@ impl Terminal {
             pending_bell: false,
             mouse_tracking: MouseTracking::Off,
             sgr_mouse: false,
+            kitty_kbd_stack: [Vec::new(), Vec::new()],
             sgr_pixel_mouse: false,
             bracketed_paste: false,
             alternate_scroll: true,
@@ -1095,6 +1111,13 @@ impl Terminal {
     /// instead of cell coordinates. Implies `sgr_mouse()`.
     pub fn sgr_pixel_mouse(&self) -> bool {
         self.sgr_pixel_mouse
+    }
+    /// Current Kitty keyboard progressive-enhancement flags for the active
+    /// screen (top of its stack, or 0 = legacy encoding). The renderer
+    /// reads this in `forward_key_to_pty`: when non-zero it encodes keys
+    /// in the `CSI ... u` form per the protocol instead of legacy bytes.
+    pub fn kitty_keyboard_flags(&self) -> u8 {
+        self.kitty_kbd_stack[self.active].last().copied().unwrap_or(0)
     }
     pub fn bracketed_paste(&self) -> bool {
         self.bracketed_paste
@@ -1659,6 +1682,7 @@ impl Terminal {
             mouse_tracking: &mut self.mouse_tracking,
             sgr_mouse: &mut self.sgr_mouse,
             sgr_pixel_mouse: &mut self.sgr_pixel_mouse,
+            kitty_kbd_stack: &mut self.kitty_kbd_stack,
             bracketed_paste: &mut self.bracketed_paste,
             alternate_scroll: &mut self.alternate_scroll,
             reverse_screen: &mut self.reverse_screen,
@@ -2099,6 +2123,7 @@ impl Terminal {
             mouse_tracking: &mut self.mouse_tracking,
             sgr_mouse: &mut self.sgr_mouse,
             sgr_pixel_mouse: &mut self.sgr_pixel_mouse,
+            kitty_kbd_stack: &mut self.kitty_kbd_stack,
             bracketed_paste: &mut self.bracketed_paste,
             alternate_scroll: &mut self.alternate_scroll,
             reverse_screen: &mut self.reverse_screen,
@@ -2173,6 +2198,7 @@ struct TerminalPerform<'a> {
     mouse_tracking: &'a mut MouseTracking,
     sgr_mouse: &'a mut bool,
     sgr_pixel_mouse: &'a mut bool,
+    kitty_kbd_stack: &'a mut [Vec<u8>; 2],
     bracketed_paste: &'a mut bool,
     alternate_scroll: &'a mut bool,
     reverse_screen: &'a mut bool,
@@ -4467,7 +4493,61 @@ impl<'a> Perform for TerminalPerform<'a> {
                         _ => {}
                     }
                 }
+                // Kitty keyboard: query current flags — `CSI ? u` → reply
+                // `CSI ? <flags> u` for the active screen's stack top.
+                'u' => {
+                    let flags = self.kitty_kbd_stack[*self.active].last().copied().unwrap_or(0);
+                    self.osc_responses.push_back(format!("\x1b[?{flags}u"));
+                }
                 _ => {}
+            }
+            return;
+        }
+        // Kitty keyboard: push flags — `CSI > flags u`. Enters enhanced
+        // mode with `flags` on top of the active screen's stack.
+        if intermediates == b">" && c == 'u' {
+            let flags = (first_param_or(params, 0) as u8) & KITTY_KBD_FLAG_MASK;
+            let stack = &mut self.kitty_kbd_stack[*self.active];
+            if stack.len() >= KITTY_KBD_STACK_MAX {
+                stack.remove(0);
+            }
+            stack.push(flags);
+            return;
+        }
+        // Kitty keyboard: pop `n` (default 1) flag entries — `CSI < n u`.
+        if intermediates == b"<" && c == 'u' {
+            let n = first_param_or(params, 1).max(1) as usize;
+            let stack = &mut self.kitty_kbd_stack[*self.active];
+            for _ in 0..n {
+                if stack.pop().is_none() {
+                    break;
+                }
+            }
+            return;
+        }
+        // Kitty keyboard: set flags — `CSI = flags ; mode u`. mode 1 (default)
+        // replaces, 2 sets the given bits, 3 clears them. Modifies the top
+        // of the active stack (pushing an entry if the stack is empty so a
+        // bare `CSI = flags u` before any push still takes effect).
+        if intermediates == b"=" && c == 'u' {
+            let flags = (first_param_or(params, 0) as u8) & KITTY_KBD_FLAG_MASK;
+            let mode = params
+                .iter()
+                .nth(1)
+                .and_then(|s| s.first().copied())
+                .filter(|v| *v != 0)
+                .unwrap_or(1);
+            let stack = &mut self.kitty_kbd_stack[*self.active];
+            let cur = stack.last().copied().unwrap_or(0);
+            let new = match mode {
+                2 => cur | flags,
+                3 => cur & !flags,
+                _ => flags,
+            } & KITTY_KBD_FLAG_MASK;
+            if let Some(top) = stack.last_mut() {
+                *top = new;
+            } else {
+                stack.push(new);
             }
             return;
         }
@@ -4556,6 +4636,8 @@ impl<'a> Perform for TerminalPerform<'a> {
             *self.mouse_tracking = MouseTracking::Off;
             *self.sgr_mouse = false;
             *self.sgr_pixel_mouse = false;
+            self.kitty_kbd_stack[0].clear();
+            self.kitty_kbd_stack[1].clear();
             *self.bracketed_paste = false;
             *self.alternate_scroll = true;
             *self.focus_tracking = false;
@@ -6620,6 +6702,46 @@ mod tests {
         assert!(t.bracketed_paste());
         t.advance(b"\x1b[?2004l");
         assert!(!t.bracketed_paste());
+    }
+
+    #[test]
+    fn kitty_keyboard_flag_stack_push_pop_set_query() {
+        let mut t = term(8, 2);
+        // Empty stack → legacy (0), and `CSI ? u` reports 0.
+        assert_eq!(t.kitty_keyboard_flags(), 0);
+        t.advance(b"\x1b[?u");
+        assert_eq!(t.take_osc_responses(), vec!["\x1b[?0u".to_string()]);
+        // Push flags 5, query reports 5.
+        t.advance(b"\x1b[>5u");
+        assert_eq!(t.kitty_keyboard_flags(), 5);
+        t.advance(b"\x1b[?u");
+        assert_eq!(t.take_osc_responses(), vec!["\x1b[?5u".to_string()]);
+        // `CSI = 2 ; 2 u` sets (OR) bit 2 → 7; mode 3 clears bit 1 → 6.
+        t.advance(b"\x1b[=2;2u");
+        assert_eq!(t.kitty_keyboard_flags(), 7);
+        t.advance(b"\x1b[=1;3u");
+        assert_eq!(t.kitty_keyboard_flags(), 6);
+        // Push another, then pop 1 restores the previous top.
+        t.advance(b"\x1b[>9u");
+        assert_eq!(t.kitty_keyboard_flags(), 9);
+        t.advance(b"\x1b[<u");
+        assert_eq!(t.kitty_keyboard_flags(), 6);
+        // Pop past the bottom is safe → 0.
+        t.advance(b"\x1b[<5u");
+        assert_eq!(t.kitty_keyboard_flags(), 0);
+    }
+
+    #[test]
+    fn kitty_keyboard_stack_is_per_screen() {
+        let mut t = term(8, 2);
+        t.advance(b"\x1b[>1u"); // primary: flags 1
+        assert_eq!(t.kitty_keyboard_flags(), 1);
+        t.advance(b"\x1b[?1049h"); // enter alt screen
+        assert_eq!(t.kitty_keyboard_flags(), 0, "alt screen starts with its own empty stack");
+        t.advance(b"\x1b[>3u"); // alt: flags 3
+        assert_eq!(t.kitty_keyboard_flags(), 3);
+        t.advance(b"\x1b[?1049l"); // back to primary
+        assert_eq!(t.kitty_keyboard_flags(), 1, "primary stack preserved across alt");
     }
 
     #[test]

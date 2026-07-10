@@ -23,10 +23,17 @@ GPU renderer → window. Tabs and BSP-split panes are wired. Lua plugins observe
 - Full VT/ANSI parser: SGR (16/256/truecolor + underline styles + reverse +
   blink + strike/overline), cursor motion (CUU/CUD/CUF/CUB/CUP/HVP/CHA/VPA
   /CNL/CPL), erase (ED/EL/ICH/DCH/IL/DL/ECH), scrolling (SU/SD/RI/IND/NEL),
-  save/restore (DECSC/DECRC + CSI s/u), DECSET/DECRST including alt-screen,
-  bracketed paste, mouse tracking (X10 / button-event / any-event / SGR),
+  save/restore (DECSC/DECRC + CSI s/u + ?1048), DECSET/DECRST including
+  alt-screen, bracketed paste, mouse tracking (X10 / button-event /
+  any-event / SGR / SGR-Pixels ?1016), alternate scroll (?1007),
   focus reporting, synchronized output (DECSET ?2026), reverse screen
   (DECSCNM / ?5).
+- **Kitty keyboard protocol** (progressive enhancement): `CSI > flags u`
+  push / `CSI < u` pop / `CSI = u` set / `CSI ? u` query, per-screen flag
+  stack. When an app enables it (neovim / helix / fish), keys are encoded
+  in the unambiguous `CSI … u` form — Ctrl+letter, Escape, Shift+Tab and
+  friends stop colliding with legacy control bytes. Functional keys reuse
+  the xterm modifier form; text/event/repeat fields honoured.
 - **OSC**: 0/1/2 (title) · 4 (palette query/set) · 7 (cwd) · 8 (hyperlinks
   with auto-detect) · 9 (single-arg notifications + 9;4 progress + 9;9 cwd) ·
   10/11/12 (default fg/bg/cursor color + query) · 52 (clipboard write) ·

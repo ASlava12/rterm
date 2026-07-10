@@ -356,11 +356,29 @@ impl App {
         // the pragmatic choice (panes rarely disagree on DECCKM).
         let ctrl = self.modifiers.contains(ModifiersState::CONTROL);
         let alt = self.modifiers.contains(ModifiersState::ALT);
-        let app_cursor = pane
+        let (app_cursor, kitty_flags) = pane
             .terminal
             .lock()
-            .map(|t| t.app_cursor_keys())
-            .unwrap_or(false);
+            .map(|t| (t.app_cursor_keys(), t.kitty_keyboard_flags()))
+            .unwrap_or((false, 0));
+
+        // Kitty keyboard protocol: when the focused pane has pushed
+        // enhanced flags, encode text keys / Escape in the `CSI … u` form.
+        // Functional keys return None and fall through to the legacy path,
+        // which already emits the xterm modifier form the protocol reuses.
+        if kitty_flags != 0 {
+            if let Some(bytes) = kitty_encode_key(
+                &event.logical_key,
+                event.text.as_deref(),
+                self.modifiers,
+                event.repeat,
+                kitty_flags,
+            ) {
+                self.events.emit("key", &format!("{:?}", event.logical_key));
+                self.dispatch_input_bytes(&bytes);
+                return;
+            }
+        }
 
         if let Key::Named(named) = &event.logical_key {
             if let Some(bytes) = named_key_bytes(*named, self.modifiers, app_cursor) {
@@ -2025,9 +2043,180 @@ fn f1_f4_letter(k: NamedKey) -> Option<char> {
     })
 }
 
+// Kitty keyboard progressive-enhancement flag bits (see the protocol).
+const KITTY_REPORT_EVENTS: u8 = 0b0_0010;
+const KITTY_REPORT_ALL_ESC: u8 = 0b0_1000;
+const KITTY_REPORT_TEXT: u8 = 0b1_0000;
+
+/// Kitty keyboard modifier bitmask: shift=1, alt=2, ctrl=4, super=8.
+fn kitty_mods(mods: ModifiersState) -> u8 {
+    let mut m = 0u8;
+    if mods.contains(ModifiersState::SHIFT) {
+        m |= 1;
+    }
+    if mods.contains(ModifiersState::ALT) {
+        m |= 2;
+    }
+    if mods.contains(ModifiersState::CONTROL) {
+        m |= 4;
+    }
+    if mods.contains(ModifiersState::SUPER) {
+        m |= 8;
+    }
+    m
+}
+
+/// Encode one key PRESS / REPEAT under the Kitty keyboard protocol given
+/// the active `flags` (non-zero). Returns `Some(bytes)` for the keys the
+/// protocol sends in `CSI number [;mods[:event]] [;text] u` form — Escape
+/// (always, so it's distinguishable from an escape-sequence prefix), the
+/// other legacy control keys (Enter / Tab / Backspace / Space) when
+/// modified or when "report all keys" is on, and character keys carrying
+/// a ctrl/alt/super modifier or under "report all keys". Returns `None` to
+/// fall back to the legacy encoding, which already emits the xterm
+/// modifier form for functional keys (arrows / F-keys / navigation) that
+/// the protocol reuses verbatim.
+///
+/// Limitations (documented, non-corrupting): the base key code is taken
+/// from the logical key, so a shifted number-row symbol (`!`) reports its
+/// shifted codepoint rather than the unshifted base — letters, digits,
+/// navigation and modifier combos, i.e. the cases apps disambiguate on,
+/// are exact. Key-release events aren't reported (key-up is consumed
+/// before the PTY-forward path); alternate-key reporting (flag 4) is not
+/// emitted. Both degrade gracefully — the base encoding stays correct.
+fn kitty_encode_key(
+    key: &Key,
+    text: Option<&str>,
+    mods: ModifiersState,
+    repeat: bool,
+    flags: u8,
+) -> Option<Vec<u8>> {
+    let mbits = kitty_mods(mods);
+    let non_shift = mbits & 0b1110 != 0; // ctrl / alt / super
+    let all_esc = flags & KITTY_REPORT_ALL_ESC != 0;
+    let is_escape = matches!(key, Key::Named(NamedKey::Escape));
+    let is_char = matches!(key, Key::Character(_));
+
+    let codepoint: u32 = match key {
+        Key::Named(NamedKey::Escape) => 27,
+        Key::Named(NamedKey::Enter) => 13,
+        Key::Named(NamedKey::Tab) => 9,
+        Key::Named(NamedKey::Backspace) => 127,
+        Key::Named(NamedKey::Space) => 32,
+        Key::Character(s) => {
+            let mut chars = s.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) => {
+                    if c.is_ascii_uppercase() {
+                        c.to_ascii_lowercase() as u32
+                    } else {
+                        c as u32
+                    }
+                }
+                // Multi-char / dead-key composition → legacy path.
+                _ => return None,
+            }
+        }
+        // Functional keys (arrows, F-keys, Home/End/PgUp/…) → legacy.
+        _ => return None,
+    };
+
+    let use_csi_u = if is_escape {
+        true
+    } else if is_char {
+        non_shift || all_esc
+    } else {
+        // Enter / Tab / Backspace / Space: any modifier disambiguates.
+        mbits != 0 || all_esc
+    };
+    if !use_csi_u {
+        return None;
+    }
+
+    let report_events = flags & KITTY_REPORT_EVENTS != 0;
+    let report_text = flags & KITTY_REPORT_TEXT != 0;
+    let event = if report_events && repeat { Some(2u8) } else { None };
+    let text_field = if report_text {
+        text.filter(|t| !t.is_empty())
+    } else {
+        None
+    };
+
+    let mut s = format!("\x1b[{codepoint}");
+    let mods_param = mbits + 1;
+    if mods_param != 1 || event.is_some() || text_field.is_some() {
+        s.push(';');
+        s.push_str(&mods_param.to_string());
+        if let Some(e) = event {
+            s.push(':');
+            s.push_str(&e.to_string());
+        }
+    }
+    if let Some(t) = text_field {
+        s.push(';');
+        let cps: Vec<String> = t.chars().map(|c| (c as u32).to_string()).collect();
+        s.push_str(&cps.join(":"));
+    }
+    s.push('u');
+    Some(s.into_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kitty_encode_key_covers_disambiguation_and_flags() {
+        let ch = |s: &str| Key::Character(s.into());
+        let esc = Key::Named(NamedKey::Escape);
+        let tab = Key::Named(NamedKey::Tab);
+        let enter = Key::Named(NamedKey::Enter);
+        let none = ModifiersState::empty();
+        let ctrl = ModifiersState::CONTROL;
+        let shift = ModifiersState::SHIFT;
+        let alt = ModifiersState::ALT;
+        const DISAMBIG: u8 = 0b1;
+        const EVENTS: u8 = 0b10;
+        const ALL_ESC: u8 = 0b1000;
+        const TEXT: u8 = 0b1_0000;
+
+        // Ctrl+A disambiguates to `CSI 97;5u` (a=97, ctrl bit4 → mods 5).
+        assert_eq!(
+            kitty_encode_key(&ch("a"), Some("\x01"), ctrl, false, DISAMBIG),
+            Some(b"\x1b[97;5u".to_vec())
+        );
+        // Alt+a → mods 3 (alt bit2 + 1).
+        assert_eq!(
+            kitty_encode_key(&ch("a"), None, alt, false, DISAMBIG),
+            Some(b"\x1b[97;3u".to_vec())
+        );
+        // Uppercase 'A' (shift) uses the lowercased base; shift-only text
+        // key stays legacy (None) unless "report all keys".
+        assert_eq!(kitty_encode_key(&ch("A"), Some("A"), shift, false, DISAMBIG), None);
+        // Plain 'a' with no modifiers → legacy.
+        assert_eq!(kitty_encode_key(&ch("a"), Some("a"), none, false, DISAMBIG), None);
+        // Escape is always disambiguated → `CSI 27u`.
+        assert_eq!(kitty_encode_key(&esc, None, none, false, DISAMBIG), Some(b"\x1b[27u".to_vec()));
+        // Shift+Tab → `CSI 9;2u` (any modifier on a control key uses CSI u).
+        assert_eq!(kitty_encode_key(&tab, None, shift, false, DISAMBIG), Some(b"\x1b[9;2u".to_vec()));
+        // Plain Enter → legacy.
+        assert_eq!(kitty_encode_key(&enter, Some("\r"), none, false, DISAMBIG), None);
+        // Report-all-keys: plain 'a' becomes `CSI 97u`.
+        assert_eq!(kitty_encode_key(&ch("a"), Some("a"), none, false, ALL_ESC), Some(b"\x1b[97u".to_vec()));
+        // Report-events + repeat: Ctrl+A repeat → `CSI 97;5:2u`.
+        assert_eq!(
+            kitty_encode_key(&ch("a"), Some("\x01"), ctrl, true, DISAMBIG | EVENTS),
+            Some(b"\x1b[97;5:2u".to_vec())
+        );
+        // Report-text: plain 'a' under all-esc+text → `CSI 97;1;97u`.
+        assert_eq!(
+            kitty_encode_key(&ch("a"), Some("a"), none, false, ALL_ESC | TEXT),
+            Some(b"\x1b[97;1;97u".to_vec())
+        );
+        // Functional keys fall through to legacy (None) — named_key_bytes
+        // already emits the xterm modifier form the protocol reuses.
+        assert_eq!(kitty_encode_key(&Key::Named(NamedKey::ArrowUp), None, ctrl, false, DISAMBIG), None);
+    }
 
     #[test]
     fn alt_scroll_translates_wheel_to_cursor_keys() {

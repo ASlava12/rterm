@@ -150,12 +150,22 @@
   `title_bar`); ширина по `UnicodeWidthStr`. Компилируется/рендерит без
   паник; визуальную корректность проверять живым IME на macOS.
 
-- [ ] **Kitty keyboard protocol (CSI u, progressive enhancement).**
-  Ждут neovim / helix / fish. Минимум: `CSI > flags u` push/pop stack,
-  `CSI ? u` query, кодирование модификаторов по спеке в
-  `forward_key_to_pty` при активных флагах.
-  DoD: `kitten show-key` / nvim `:checkhealth` видят протокол;
-  fallback на legacy при flags=0; unit на кодирование.
+- [x] **Kitty keyboard protocol (CSI u, progressive enhancement).** (2026-07)
+  Ядро: per-screen стек флагов (`kitty_kbd_stack: [Vec<u8>; 2]`),
+  `CSI > flags u` push / `CSI < n u` pop / `CSI = flags;mode u` set /
+  `CSI ? u` query→`CSI ? flags u`, cap 32, сброс на RIS, аксессор
+  `kitty_keyboard_flags()`. Render: чистый `kitty_encode_key` — Escape
+  всегда дизамбигуируется (`CSI 27u`), текстовые клавиши с
+  ctrl/alt/super (или flag 8) → `CSI cp;mods u`, Enter/Tab/Backspace/
+  Space с модификатором → CSI u; функциональные клавиши падают в legacy
+  `named_key_bytes` (уже xterm-modifier-форма, kitty-совместимая).
+  Поля event-type (`:2` repeat, flag 2) и text (flag 16) поддержаны;
+  flags=0 → полностью legacy. Тесты: core stack/query/per-screen +
+  render-кодирование (Ctrl+A/Escape/Shift+Tab/flag8/flag2/flag16).
+  Известные ограничения (документированы, не corrupting): база клавиши
+  из logical_key (шифт-символы верхнего ряда репортят шифт-codepoint),
+  release-события не репортятся (key-up дропается до PTY-пути),
+  alternate-keys (flag 4) не эмитятся — всё degrade gracefully.
 
 - [x] **Инкрементальный поиск вне лока терминала.** (2026-07)
   `refresh_matches` снимает снимок строк (`Vec<Vec<char>>`) под коротким
