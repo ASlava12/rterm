@@ -8558,14 +8558,34 @@ fn read_proc_comm_or_none(pid: u32) -> Option<String> {
 /// Escape a string for embedding inside a TOML basic string literal
 /// (`"..."`). Used by `write_session` to serialize cwd/title fields whose
 /// raw bytes could otherwise include literal control characters (Unix
-/// allows `\n` and friends inside filenames). The mapping is the minimal
-/// set TOML requires; this isn't a general-purpose escaper.
+/// allows `\n`, ESC, and any byte but `/` and NUL inside filenames).
+///
+/// TOML basic strings forbid an UNescaped backslash, quote, or *any*
+/// control character (U+0000–U+001F, U+007F). Emitting one raw would make
+/// the whole session file fail to parse — and since the parse is
+/// all-or-nothing per block, one pathological cwd could wipe the restore.
+/// So escape the five common ones with their short forms and every other
+/// control char with `\u00XX`.
 fn toml_escape_basic_string(s: &str) -> String {
-    s.replace('\\', r"\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str(r"\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            // Remaining C0/C1/DEL controls (U+0000–U+0008, U+000B, U+000C,
+            // U+000E–U+001F, U+007F, U+0080–U+009F). `is_control()` never
+            // exceeds U+009F, so four hex digits always suffice.
+            c if c.is_control() => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\u{:04X}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Write `contents` to `path` with restrictive permissions where the
@@ -8602,10 +8622,14 @@ fn write_user_private(
     }
 }
 
-/// Append `contents` to `path` (creating it 0600 if new). A single
-/// `write_all` under `O_APPEND` is atomic on POSIX, so two processes
-/// appending their session concurrently concatenate cleanly rather than
-/// clobbering each other. Windows `FILE_APPEND_DATA` serialises likewise.
+/// Append `contents` to `path` (creating it 0600 if new). Under `O_APPEND`
+/// each `write()` is seek-to-EOF-then-write atomically on POSIX, so two
+/// processes appending their (single-`write`-sized) session concurrently
+/// concatenate cleanly rather than clobbering each other. Windows
+/// `FILE_APPEND_DATA` serialises likewise. A session write is well under
+/// any partial-write threshold, so `write_all`'s loop runs once in
+/// practice — the concatenation guarantee holds. (On a network `~/.cache`
+/// — NFS — append is not server-atomic; that's a rare setup for a cache.)
 fn append_user_private(
     path: &std::path::Path,
     contents: &[u8],
@@ -8619,6 +8643,15 @@ fn append_user_private(
         opts.mode(0o600);
     }
     let mut f = opts.open(path)?;
+    // `.mode(0o600)` above only applies when *this* call creates the file;
+    // an already-existing file (e.g. left 0o644 by an older build, a
+    // backup restore, or another tool) keeps its looser perms and would
+    // leak each tab's cwd to other local users. Tighten unconditionally.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
     f.write_all(contents)?;
     f.flush()
 }
@@ -8748,6 +8781,14 @@ mod tests {
             toml_escape_basic_string("\\\""),
             "\\\\\\\"",
         );
+        // Other control chars (ESC, NUL, DEL) are illegal RAW in a TOML
+        // basic string and must become `\u00XX` — a cwd byte like these
+        // would otherwise make the whole session file unparseable. (The
+        // escaped form round-tripping through a real TOML parse is pinned
+        // in rterm-app's `parse_session` tests, where `toml` is a dep.)
+        assert_eq!(toml_escape_basic_string("a\x1bb"), "a\\u001Bb");
+        assert_eq!(toml_escape_basic_string("a\0b"), "a\\u0000b");
+        assert_eq!(toml_escape_basic_string("a\x7fb"), "a\\u007Fb");
     }
 
     #[test]

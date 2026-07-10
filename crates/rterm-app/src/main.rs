@@ -2284,24 +2284,46 @@ fn persist_theme_to_config(path: &std::path::Path, name: &str) -> Result<()> {
 /// to make an accidental DoS impossible. Exported for tests.
 const MAX_RESTORE_TABS: usize = 256;
 
+#[derive(serde::Deserialize, Default)]
+struct SavedSession {
+    // Legacy top-level active index (single-window format); newer
+    // multi-window sessions mark the focused tab per-block.
+    #[serde(default)]
+    active: Option<usize>,
+    #[serde(default)]
+    tab: Vec<SavedTab>,
+}
+
+#[derive(serde::Deserialize)]
+struct SavedTab {
+    cwd: Option<String>,
+    title: Option<String>,
+    #[serde(default)]
+    active: Option<bool>,
+}
+
 fn parse_session(body: &str) -> Option<(Vec<rterm_render::RestoredTab>, Option<usize>)> {
-    #[derive(serde::Deserialize)]
-    struct Saved {
-        // Legacy top-level active index (single-window format); newer
-        // multi-window sessions mark the focused tab per-block.
-        #[serde(default)]
-        active: Option<usize>,
-        #[serde(default)]
-        tab: Vec<SavedTab>,
-    }
-    #[derive(serde::Deserialize)]
-    struct SavedTab {
-        cwd: Option<String>,
-        title: Option<String>,
-        #[serde(default)]
-        active: Option<bool>,
-    }
-    let parsed: Saved = toml::from_str(body).ok()?;
+    // Fast path: a well-formed file parses as one document. This also
+    // honours the legacy single-window format (top-level `active = N`).
+    let parsed = match toml::from_str::<SavedSession>(body) {
+        Ok(s) => s,
+        Err(_) => {
+            // Recovery: the file is a concatenation of independent
+            // per-window append blocks (see `write_session`). A single torn
+            // `[[tab]]` block — a window SIGKILLed mid-append, a truncated
+            // final write, or one pathological byte in a cwd — must NOT
+            // discard every other window's cleanly-appended tabs. Parse each
+            // block on its own and keep the ones that survive.
+            let recovered = recover_session_blocks(body);
+            if recovered.tab.is_empty() {
+                // Truly unparseable with nothing to salvage — preserve the
+                // "None = no restore" contract (a well-formed empty file
+                // still takes the Ok path above and restores zero tabs).
+                return None;
+            }
+            recovered
+        }
+    };
     if parsed.tab.len() > MAX_RESTORE_TABS {
         tracing::warn!(
             count = parsed.tab.len(),
@@ -2329,14 +2351,54 @@ fn parse_session(body: &str) -> Option<(Vec<rterm_render::RestoredTab>, Option<u
     Some((tabs, active))
 }
 
+/// Best-effort salvage of a session file whose whole-document parse
+/// failed. Splits on `[[tab]]` block headers (the unit `write_session`
+/// appends) and re-parses each block independently, keeping only the ones
+/// that deserialize. A torn block is dropped; every intact block from
+/// every window survives. The legacy top-level `active = N` (which sits
+/// before any block header) is not recovered — recovery falls back to the
+/// per-block `active = true` markers.
+fn recover_session_blocks(body: &str) -> SavedSession {
+    let mut tabs: Vec<SavedTab> = Vec::new();
+    let mut block = String::new();
+    let mut in_block = false;
+    let flush = |block: &str, tabs: &mut Vec<SavedTab>| {
+        if let Ok(mut s) = toml::from_str::<SavedSession>(block) {
+            tabs.append(&mut s.tab);
+        }
+    };
+    for line in body.lines() {
+        if line.trim_end() == "[[tab]]" {
+            if in_block {
+                flush(&block, &mut tabs);
+            }
+            block.clear();
+            block.push_str("[[tab]]\n");
+            in_block = true;
+        } else if in_block {
+            block.push_str(line);
+            block.push('\n');
+        }
+        // Lines before the first `[[tab]]` header (a legacy preamble) are
+        // dropped — recovery is best-effort.
+    }
+    if in_block {
+        flush(&block, &mut tabs);
+    }
+    SavedSession { active: None, tab: tabs }
+}
+
 fn read_session(
     path: &std::path::Path,
 ) -> Option<(Vec<rterm_render::RestoredTab>, Option<usize>)> {
     // Claim the session atomically: rename it aside, then read + delete the
     // copy. This clears the file so appended tabs don't restore on every
-    // future launch, and is race-safe against a concurrent window exit —
-    // its append lands in a fresh `session.toml` (preserved for next time)
-    // rather than being truncated away.
+    // future launch. A concurrent window exit that opens its append fd
+    // AFTER this rename lands in a fresh `session.toml` (preserved for next
+    // time). There is one narrow, benign race: if that window opened its fd
+    // just BEFORE the rename, its append writes into the now-unlinked inode
+    // and is lost — a microsecond window, affecting only that one window's
+    // tabs, on a best-effort convenience feature.
     let tmp = path.with_extension(format!("restoring.{}", std::process::id()));
     if std::fs::rename(path, &tmp).is_err() {
         return None; // no session file, or another launch claimed it first
@@ -3079,6 +3141,40 @@ mod tests {
         assert_eq!(tabs.len(), 3, "both windows' tabs merged");
         assert_eq!(active, Some(1), "first per-tab active wins");
         assert_eq!(tabs[2].cwd.as_deref(), Some("/w2/a"));
+    }
+
+    #[test]
+    fn parse_session_recovers_intact_blocks_around_a_torn_one() {
+        // Two windows appended clean blocks; a third window was SIGKILLed
+        // mid-append, leaving a torn trailing block (unterminated string).
+        // The whole-document parse fails, but recovery must keep both good
+        // windows' tabs rather than discarding everyone's session.
+        let body = concat!(
+            "[[tab]]\ncwd = \"/w1/a\"\n\n",
+            "[[tab]]\nactive = true\ncwd = \"/w2/a\"\n\n",
+            "[[tab]]\ncwd = \"/torn/b\n", // unterminated — invalid TOML
+        );
+        // Sanity: the whole thing really is unparseable as one document.
+        assert!(toml::from_str::<SavedSession>(body).is_err());
+        let (tabs, active) = parse_session(body).expect("recovers intact blocks");
+        assert_eq!(tabs.len(), 2, "the two intact blocks survive; torn one dropped");
+        assert_eq!(tabs[0].cwd.as_deref(), Some("/w1/a"));
+        assert_eq!(tabs[1].cwd.as_deref(), Some("/w2/a"));
+        assert_eq!(active, Some(1), "per-tab active marker survives recovery");
+    }
+
+    #[test]
+    fn escaped_control_char_in_cwd_round_trips() {
+        // A cwd containing a raw control byte (ESC) must survive a full
+        // write→read cycle. `write_session` escapes via
+        // `toml_escape_basic_string` (); here we mimic that line and
+        // confirm `parse_session` reads the original bytes back — i.e. one
+        // pathological cwd can't make the file unparseable.
+        let escaped = "/tmp/\\u001Bdir"; // what the escaper emits for /tmp/<ESC>dir
+        let body = format!("[[tab]]\ncwd = \"{escaped}\"\n");
+        let (tabs, _) = parse_session(&body).expect("escaped control parses");
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0].cwd.as_deref(), Some("/tmp/\u{1b}dir"));
     }
 
     #[test]
