@@ -8,9 +8,15 @@
 //!   `GetMessage` pump. `WM_HOTKEY` arrives in the worker's queue,
 //!   the worker forwards via `EventLoopProxy::send_event(...)`, the
 //!   main thread runs `toggle_guake` on the resulting [`UserEvent`].
-//! * Linux X11 / Wayland / macOS: not yet implemented. The function
-//!   logs a `warn!` once and returns a no-op handle so the App stays
-//!   functional with just the in-app keybind.
+//! * macOS: Carbon `RegisterEventHotKey` + an `InstallEventHandler`
+//!   on `GetEventDispatcherTarget()`. Carbon delivers `kEventHotKeyPressed`
+//!   on the main run loop that winit already pumps, so no worker thread
+//!   is needed — the handler forwards via `EventLoopProxy::send_event(...)`.
+//!   (These few Carbon Event Manager APIs remain available in 64-bit /
+//!   Apple Silicon.)
+//! * Linux X11 / Wayland: not yet implemented. The function logs a
+//!   `warn!` once and returns a no-op handle so the App stays functional
+//!   with just the in-app keybind.
 //!
 //! Returns a `GlobalHotkeyHandle` whose `Drop` impl unregisters the
 //! hotkey + signals the worker to exit. Holding the handle on `App`
@@ -20,12 +26,12 @@ use crate::keybind::parse_key_spec;
 use crate::UserEvent;
 use winit::event_loop::EventLoopProxy;
 // `KeyMatch` / `NamedKey` / `ModifiersState` are only referenced from
-// the cfg(windows) backend and from tests; gating the import keeps
-// non-Windows release builds free of unused-import warnings without
-// per-line `#[allow]`s.
-#[cfg(any(windows, test))]
+// the cfg(windows) / cfg(macos) backends and from tests; gating the
+// import keeps other release builds (e.g. Linux) free of unused-import
+// warnings without per-line `#[allow]`s.
+#[cfg(any(windows, target_os = "macos", test))]
 use crate::keybind::KeyMatch;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 use winit::keyboard::{ModifiersState, NamedKey};
 
 /// Opaque RAII handle returned by [`install_global_hotkey`]. The inner
@@ -40,9 +46,14 @@ pub(crate) struct GlobalHotkeyHandle {
     #[cfg(windows)]
     #[allow(dead_code)]
     inner: Option<windows_impl::WorkerHandle>,
-    // Non-Windows targets carry no state — the constructor logs and
+    // macOS: RAII guard that unregisters the hotkey + removes the
+    // Carbon event handler on drop. Held purely for that side effect.
+    #[cfg(target_os = "macos")]
+    #[allow(dead_code)]
+    inner: Option<macos_impl::MacHandle>,
+    // Other targets carry no state — the constructor logs and
     // returns this empty handle.
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     _stub: (),
 }
 
@@ -51,7 +62,9 @@ impl GlobalHotkeyHandle {
         Self {
             #[cfg(windows)]
             inner: None,
-            #[cfg(not(windows))]
+            #[cfg(target_os = "macos")]
+            inner: None,
+            #[cfg(not(any(windows, target_os = "macos")))]
             _stub: (),
         }
     }
@@ -88,7 +101,23 @@ pub(crate) fn install_global_hotkey(
             }
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        match macos_impl::register(mods, &key, proxy) {
+            Ok(handle) => GlobalHotkeyHandle {
+                inner: Some(handle),
+            },
+            Err(e) => {
+                tracing::warn!(
+                    spec = %spec,
+                    error = %e,
+                    "[guake].global_hotkey: macOS RegisterEventHotKey failed",
+                );
+                GlobalHotkeyHandle::empty()
+            }
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (mods, key, proxy);
         tracing::warn!(
@@ -213,6 +242,110 @@ pub(crate) fn mods_to_win32(mods: ModifiersState) -> u32 {
     }
     if mods.contains(ModifiersState::SUPER) {
         out |= MOD_WIN;
+    }
+    out
+}
+
+// --- macOS key mapping ------------------------------------------------
+//
+// Carbon `RegisterEventHotKey` wants a *virtual key code* (`kVK_*`),
+// which — unlike Win32 — is NOT the ASCII byte of the letter. The codes
+// are the fixed ANSI-keyboard positions from HIToolbox `Events.h`, so a
+// lookup table is unavoidable. Gated `any(macos, test)` so the pure
+// mapping is unit-tested on every host (mirrors the Win32 helpers).
+
+/// Translate a [`NamedKey`] into its macOS virtual key code. Returns
+/// `None` for keys Carbon can't bind (macOS keyboards have no Insert,
+/// for instance) — the caller logs + skips.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn named_to_macos_vk(key: &NamedKey) -> Option<u32> {
+    Some(match key {
+        NamedKey::Backspace => 0x33, // kVK_Delete (the ⌫ key)
+        NamedKey::Tab => 0x30,
+        NamedKey::Enter => 0x24,
+        NamedKey::Escape => 0x35,
+        NamedKey::Space => 0x31,
+        NamedKey::PageUp => 0x74,
+        NamedKey::PageDown => 0x79,
+        NamedKey::End => 0x77,
+        NamedKey::Home => 0x73,
+        NamedKey::ArrowLeft => 0x7B,
+        NamedKey::ArrowUp => 0x7E,
+        NamedKey::ArrowRight => 0x7C,
+        NamedKey::ArrowDown => 0x7D,
+        // macOS has no Insert key; map Delete to the forward-delete
+        // (`⌦`) position so `Delete` still resolves to something real.
+        NamedKey::Delete => 0x75, // kVK_ForwardDelete
+        // kVK_F1..=kVK_F12 — deliberately non-contiguous in Carbon.
+        NamedKey::F1 => 0x7A,
+        NamedKey::F2 => 0x78,
+        NamedKey::F3 => 0x63,
+        NamedKey::F4 => 0x76,
+        NamedKey::F5 => 0x60,
+        NamedKey::F6 => 0x61,
+        NamedKey::F7 => 0x62,
+        NamedKey::F8 => 0x64,
+        NamedKey::F9 => 0x65,
+        NamedKey::F10 => 0x6D,
+        NamedKey::F11 => 0x67,
+        NamedKey::F12 => 0x6F,
+        _ => return None,
+    })
+}
+
+/// Translate a single-character `KeyMatch::Char` into a macOS virtual
+/// key code. Letters/digits AND the common punctuation keys are covered
+/// — notably backtick (`kVK_ANSI_Grave`), the classic Guake drop-down
+/// key (`Super+\``). Case-insensitive; multi-char strings return `None`.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn char_to_macos_vk(c: &str) -> Option<u32> {
+    let ch = c.chars().next().filter(|_| c.chars().count() == 1)?;
+    Some(match ch.to_ascii_lowercase() {
+        'a' => 0x00, 'b' => 0x0B, 'c' => 0x08, 'd' => 0x02, 'e' => 0x0E,
+        'f' => 0x03, 'g' => 0x05, 'h' => 0x04, 'i' => 0x22, 'j' => 0x26,
+        'k' => 0x28, 'l' => 0x25, 'm' => 0x2E, 'n' => 0x2D, 'o' => 0x1F,
+        'p' => 0x23, 'q' => 0x0C, 'r' => 0x0F, 's' => 0x01, 't' => 0x11,
+        'u' => 0x20, 'v' => 0x09, 'w' => 0x0D, 'x' => 0x07, 'y' => 0x10,
+        'z' => 0x06,
+        '0' => 0x1D, '1' => 0x12, '2' => 0x13, '3' => 0x14, '4' => 0x15,
+        '5' => 0x17, '6' => 0x16, '7' => 0x1A, '8' => 0x1C, '9' => 0x19,
+        '`' => 0x32, '-' => 0x1B, '=' => 0x18, '[' => 0x21, ']' => 0x1E,
+        '\\' => 0x2A, ';' => 0x29, '\'' => 0x27, ',' => 0x2B, '.' => 0x2F,
+        '/' => 0x2C,
+        _ => return None,
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn key_to_macos_vk(key: &KeyMatch) -> Option<u32> {
+    match key {
+        KeyMatch::Named(n) => named_to_macos_vk(n),
+        KeyMatch::Char(s) => char_to_macos_vk(s),
+    }
+}
+
+/// Translate winit's [`ModifiersState`] into the Carbon modifier mask
+/// (`cmdKey`/`shiftKey`/`optionKey`/`controlKey` from `Events.h`) that
+/// `RegisterEventHotKey` expects. Platform-agnostic `u32` so tests can
+/// reach it on any host.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn mods_to_carbon(mods: ModifiersState) -> u32 {
+    const CMD_KEY: u32 = 0x0100;
+    const SHIFT_KEY: u32 = 0x0200;
+    const OPTION_KEY: u32 = 0x0800;
+    const CONTROL_KEY: u32 = 0x1000;
+    let mut out = 0;
+    if mods.contains(ModifiersState::CONTROL) {
+        out |= CONTROL_KEY;
+    }
+    if mods.contains(ModifiersState::SHIFT) {
+        out |= SHIFT_KEY;
+    }
+    if mods.contains(ModifiersState::ALT) {
+        out |= OPTION_KEY;
+    }
+    if mods.contains(ModifiersState::SUPER) {
+        out |= CMD_KEY;
     }
     out
 }
@@ -366,6 +499,204 @@ mod windows_impl {
     }
 }
 
+#[cfg(target_os = "macos")]
+mod macos_impl {
+    use super::*;
+    use std::os::raw::c_void;
+
+    // --- Carbon Event Manager FFI ------------------------------------
+    //
+    // Only the handful of symbols needed for a single global hotkey.
+    // Declared by hand (rather than pulling a `core-foundation`/`carbon`
+    // crate) to stay consistent with the hand-rolled `windows_impl`
+    // above and add no dependency. All of these survive in 64-bit
+    // Carbon (HIToolbox) on both Intel and Apple Silicon.
+
+    type OsStatus = i32; // OSStatus = SInt32
+    type EventTargetRef = *mut c_void;
+    type EventHotKeyRef = *mut c_void;
+    type EventHandlerRef = *mut c_void;
+    type EventHandlerCallRef = *mut c_void;
+    type EventRef = *mut c_void;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct EventHotKeyId {
+        signature: u32, // OSType (FourCharCode)
+        id: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct EventTypeSpec {
+        event_class: u32, // OSType
+        event_kind: u32,  // UInt32
+    }
+
+    // Modern macOS accepts a plain C function pointer as an
+    // `EventHandlerUPP`; NUL-pointer optimisation makes this ABI-
+    // identical to the `Option<fn>` some bindings use.
+    type EventHandlerProc = unsafe extern "C" fn(
+        call_ref: EventHandlerCallRef,
+        event: EventRef,
+        user_data: *mut c_void,
+    ) -> OsStatus;
+
+    #[link(name = "Carbon", kind = "framework")]
+    extern "C" {
+        fn GetEventDispatcherTarget() -> EventTargetRef;
+        fn InstallEventHandler(
+            target: EventTargetRef,
+            handler: EventHandlerProc,
+            num_types: usize, // ItemCount (unsigned long, LP64 == usize)
+            list: *const EventTypeSpec,
+            user_data: *mut c_void,
+            out_ref: *mut EventHandlerRef,
+        ) -> OsStatus;
+        fn RemoveEventHandler(handler: EventHandlerRef) -> OsStatus;
+        fn RegisterEventHotKey(
+            key_code: u32,
+            modifiers: u32,
+            hot_key_id: EventHotKeyId,
+            target: EventTargetRef,
+            options: u32, // OptionBits
+            out_ref: *mut EventHotKeyRef,
+        ) -> OsStatus;
+        fn UnregisterEventHotKey(hot_key: EventHotKeyRef) -> OsStatus;
+    }
+
+    // FourCC 'keyb' = kEventClassKeyboard.
+    const K_EVENT_CLASS_KEYBOARD: u32 = u32::from_be_bytes(*b"keyb");
+    const K_EVENT_HOTKEY_PRESSED: u32 = 5; // kEventHotKeyPressed
+    // FourCC 'rtrm' — our app signature for the hotkey id. Value is
+    // arbitrary; it only has to be stable between register/unregister.
+    const HOTKEY_SIGNATURE: u32 = u32::from_be_bytes(*b"rtrm");
+
+    /// RAII guard: unregisters the hotkey, removes the Carbon handler,
+    /// and frees the boxed proxy on drop. Field order does not matter —
+    /// `Drop` does it explicitly in the safe order.
+    pub(crate) struct MacHandle {
+        hotkey: EventHotKeyRef,
+        handler: EventHandlerRef,
+        // Boxed proxy handed to the C callback as `userData`; owned here
+        // and freed on drop *after* the handler is removed so the
+        // callback can never observe a dangling pointer.
+        proxy: *mut EventLoopProxy<UserEvent>,
+    }
+
+    // The raw pointers are only ever touched on the main thread (install
+    // + drop both run there), but `MacHandle` is stored on `App`, which
+    // winit does not require to be `Send`. No cross-thread use.
+
+    impl Drop for MacHandle {
+        fn drop(&mut self) {
+            // SAFETY: each handle/ref was produced by the matching
+            // Carbon call in `register`; removing the handler first
+            // guarantees the callback won't fire again, after which the
+            // boxed proxy is safe to reclaim.
+            unsafe {
+                if !self.hotkey.is_null() {
+                    UnregisterEventHotKey(self.hotkey);
+                }
+                if !self.handler.is_null() {
+                    RemoveEventHandler(self.handler);
+                }
+                if !self.proxy.is_null() {
+                    drop(Box::from_raw(self.proxy));
+                }
+            }
+        }
+    }
+
+    /// Carbon event handler. We register exactly one hotkey with one
+    /// `kEventHotKeyPressed` spec, so any invocation *is* our hotkey —
+    /// no need to read the event's `EventHotKeyID` back out.
+    unsafe extern "C" fn hotkey_handler(
+        _call_ref: EventHandlerCallRef,
+        _event: EventRef,
+        user_data: *mut c_void,
+    ) -> OsStatus {
+        if !user_data.is_null() {
+            // SAFETY: `user_data` is the `Box<EventLoopProxy>` pointer
+            // passed to `InstallEventHandler`; it outlives the handler
+            // (freed only after `RemoveEventHandler` in `MacHandle::drop`).
+            let proxy = &*(user_data as *const EventLoopProxy<UserEvent>);
+            // Best-effort: if the loop is gone (shutdown race), ignore.
+            let _ = proxy.send_event(UserEvent::GuakeGlobalHotkey);
+        }
+        0 // noErr — event handled.
+    }
+
+    /// Register the hotkey + install the handler on the main thread's
+    /// Carbon dispatcher. Returns an RAII handle; `Err` on any failure
+    /// (unsupported key, Carbon rejected the registration).
+    pub(crate) fn register(
+        mods: ModifiersState,
+        key: &KeyMatch,
+        proxy: EventLoopProxy<UserEvent>,
+    ) -> Result<MacHandle, String> {
+        let Some(code) = key_to_macos_vk(key) else {
+            return Err("unsupported key for RegisterEventHotKey".into());
+        };
+        let carbon_mods = mods_to_carbon(mods);
+
+        // Box the proxy so the C callback can reach it; the handle owns
+        // the box and frees it on drop.
+        let boxed = Box::into_raw(Box::new(proxy));
+        let spec = EventTypeSpec {
+            event_class: K_EVENT_CLASS_KEYBOARD,
+            event_kind: K_EVENT_HOTKEY_PRESSED,
+        };
+
+        // SAFETY: standard Carbon Event Manager sequence. Called on the
+        // main thread (see `run()` in lib.rs — before `run_app`). Every
+        // early return frees the box so it can't leak.
+        unsafe {
+            let target = GetEventDispatcherTarget();
+            if target.is_null() {
+                drop(Box::from_raw(boxed));
+                return Err("GetEventDispatcherTarget returned null".into());
+            }
+            let mut handler_ref: EventHandlerRef = std::ptr::null_mut();
+            let st = InstallEventHandler(
+                target,
+                hotkey_handler,
+                1,
+                &spec,
+                boxed as *mut c_void,
+                &mut handler_ref,
+            );
+            if st != 0 {
+                drop(Box::from_raw(boxed));
+                return Err(format!("InstallEventHandler failed: OSStatus {st}"));
+            }
+            let hotkey_id = EventHotKeyId {
+                signature: HOTKEY_SIGNATURE,
+                id: 1,
+            };
+            let mut hotkey_ref: EventHotKeyRef = std::ptr::null_mut();
+            let st = RegisterEventHotKey(
+                code,
+                carbon_mods,
+                hotkey_id,
+                target,
+                0,
+                &mut hotkey_ref,
+            );
+            if st != 0 {
+                RemoveEventHandler(handler_ref);
+                drop(Box::from_raw(boxed));
+                return Err(format!("RegisterEventHotKey failed: OSStatus {st}"));
+            }
+            Ok(MacHandle {
+                hotkey: hotkey_ref,
+                handler: handler_ref,
+                proxy: boxed,
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,5 +812,86 @@ mod tests {
         assert!(mods.contains(ModifiersState::CONTROL));
         assert!(mods.contains(ModifiersState::SHIFT));
         assert_eq!(key_to_vk(&key), Some(b'G' as u32));
+    }
+
+    #[test]
+    fn macos_named_vk_covers_function_and_nav_keys() {
+        // The Carbon kVK_F* codes are non-contiguous — pin every entry
+        // so a future edit can't silently shift a function key (the most
+        // common `[guake].global_hotkey` choice on macOS).
+        let fn_keys = [
+            (NamedKey::F1, 0x7A),
+            (NamedKey::F2, 0x78),
+            (NamedKey::F3, 0x63),
+            (NamedKey::F4, 0x76),
+            (NamedKey::F5, 0x60),
+            (NamedKey::F6, 0x61),
+            (NamedKey::F7, 0x62),
+            (NamedKey::F8, 0x64),
+            (NamedKey::F9, 0x65),
+            (NamedKey::F10, 0x6D),
+            (NamedKey::F11, 0x67),
+            (NamedKey::F12, 0x6F),
+        ];
+        for (key, expected) in fn_keys {
+            assert_eq!(named_to_macos_vk(&key), Some(expected), "F-key {key:?}");
+        }
+        // Navigation cluster.
+        assert_eq!(named_to_macos_vk(&NamedKey::Home), Some(0x73));
+        assert_eq!(named_to_macos_vk(&NamedKey::End), Some(0x77));
+        assert_eq!(named_to_macos_vk(&NamedKey::ArrowUp), Some(0x7E));
+        assert_eq!(named_to_macos_vk(&NamedKey::Space), Some(0x31));
+        // macOS keyboards have no Insert key — Carbon can't bind it.
+        assert_eq!(named_to_macos_vk(&NamedKey::Insert), None);
+    }
+
+    #[test]
+    fn macos_char_vk_is_case_insensitive_and_covers_grave() {
+        // Letters map to fixed ANSI positions, NOT their ASCII byte.
+        assert_eq!(char_to_macos_vk("a"), Some(0x00));
+        assert_eq!(char_to_macos_vk("A"), Some(0x00)); // case-insensitive
+        assert_eq!(char_to_macos_vk("z"), Some(0x06));
+        assert_eq!(char_to_macos_vk("0"), Some(0x1D));
+        assert_eq!(char_to_macos_vk("9"), Some(0x19));
+        // Backtick = kVK_ANSI_Grave — the classic Guake drop-down key.
+        assert_eq!(char_to_macos_vk("`"), Some(0x32));
+        // Unlike Win32's RegisterHotKey, punctuation resolves here.
+        assert_eq!(char_to_macos_vk("/"), Some(0x2C));
+        // Multi-char / empty are rejected.
+        assert_eq!(char_to_macos_vk("ab"), None);
+        assert_eq!(char_to_macos_vk(""), None);
+    }
+
+    #[test]
+    fn mods_to_carbon_maps_each_flag() {
+        // Carbon masks from Events.h; no NOREPEAT equivalent (Carbon
+        // hotkeys don't auto-repeat), so empty mods => 0.
+        assert_eq!(mods_to_carbon(ModifiersState::empty()), 0);
+        assert_eq!(mods_to_carbon(ModifiersState::SUPER), 0x0100);
+        assert_eq!(mods_to_carbon(ModifiersState::SHIFT), 0x0200);
+        assert_eq!(mods_to_carbon(ModifiersState::ALT), 0x0800);
+        assert_eq!(mods_to_carbon(ModifiersState::CONTROL), 0x1000);
+        let all = mods_to_carbon(
+            ModifiersState::CONTROL
+                | ModifiersState::SHIFT
+                | ModifiersState::ALT
+                | ModifiersState::SUPER,
+        );
+        assert_eq!(all, 0x1000 | 0x0800 | 0x0200 | 0x0100);
+    }
+
+    #[test]
+    fn key_to_macos_vk_round_trips_through_parse_key_spec() {
+        // Wire-level: `"F11"` in config.toml must reach kVK_F11 (0x67)
+        // through the same path the macOS backend uses.
+        let (mods, key) = parse_key_spec("F11").expect("parses");
+        assert!(mods.is_empty());
+        assert_eq!(key_to_macos_vk(&key), Some(0x67));
+        // `Super+\`` — the canonical Guake binding — resolves to Cmd +
+        // kVK_ANSI_Grave.
+        let (mods, key) = parse_key_spec("Super+`").expect("parses");
+        assert!(mods.contains(ModifiersState::SUPER));
+        assert_eq!(mods_to_carbon(mods), 0x0100);
+        assert_eq!(key_to_macos_vk(&key), Some(0x32));
     }
 }

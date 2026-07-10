@@ -189,13 +189,11 @@ pub struct GuakeConfig {
     /// rterm window is NOT focused. Uses the same syntax as
     /// `[[keybindings]].keys` (`"F11"`, `"Ctrl+Shift+`"`, ...).
     ///
-    /// Currently implemented on Windows via `RegisterHotKey`. On
-    /// Linux / macOS the field is parsed and stored but the
-    /// hot-key worker logs `warn!` once at startup and falls back to
-    /// the in-app-only binding — the system surfaces (XGrabKey,
-    /// composer-specific Wayland protocol, RegisterEventHotKey)
-    /// require separate per-platform backends that are not yet
-    /// wired up.
+    /// Implemented on Windows (`RegisterHotKey`) and macOS (Carbon
+    /// `RegisterEventHotKey`). On Linux the field is parsed and stored
+    /// but the hot-key worker logs `warn!` once at startup and falls
+    /// back to the in-app-only binding — the X11 (`XGrabKey`) and
+    /// per-compositor Wayland backends are not yet wired up.
     ///
     /// Empty / unset = no global hotkey; the in-app binding from
     /// `[[keybindings]]` still works.

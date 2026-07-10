@@ -222,15 +222,30 @@
 
 ## P2 — Крупные (недели)
 
-- [ ] **Глобальный хоткей: бэкенды macOS/Linux.** (из sweep, 2026-07)
-  Сейчас реализован только Windows; `#[cfg(not(windows))]`-ветка
-  (`rterm-render/src/global_hotkey.rs:11,91`) делает `let _ = (...)`,
-  один `warn!` и отдаёт no-op-хендл. Конфиг `[guake].global_hotkey`
-  (`rterm-config/src/lib.rs:175`) парсится, но молча не работает вне
-  Windows — актуально: разработка на macOS. DoD: macOS-бэкенд через
-  Carbon `RegisterEventHotKey`, Linux — X11 `XGrabKey` (+ путь под
-  Wayland-протокол); либо, если вне скоупа, явно задокументировать
-  «Windows-only», чтобы не читалось как тихий no-op.
+- [~] **Глобальный хоткей: бэкенды macOS/Linux.** (macOS сделан, 2026-07)
+  Был только Windows; `#[cfg(not(windows))]`-ветка делала no-op + warn.
+  **macOS (сделано):** новый `macos_impl` в `global_hotkey.rs` —
+  Carbon `RegisterEventHotKey` + `InstallEventHandler` на
+  `GetEventDispatcherTarget()`. Carbon доставляет `kEventHotKeyPressed`
+  на главный run-loop, который winit уже прокачивает, так что worker-
+  поток НЕ нужен (в отличие от Windows-пути) — хендлер форвардит через
+  `EventLoopProxy::send_event(GuakeGlobalHotkey)`. FFI hand-rolled (в
+  духе hand-rolled Windows-бэкенда, без новых зависимостей; символы
+  живы в 64-bit/Apple Silicon Carbon). RAII `MacHandle::drop` →
+  `UnregisterEventHotKey`/`RemoveEventHandler` + освобождение boxed-
+  прокси (после снятия хендлера — колбэк не увидит dangling). Маппинг:
+  `named_to_macos_vk`/`char_to_macos_vk` (kVK_*-коды — НЕ ASCII, нужна
+  таблица; покрыты буквы/цифры/пунктуация, включая backtick =
+  `kVK_ANSI_Grave` для канонического `Super+\``), `mods_to_carbon`
+  (cmd/shift/option/control маски из Events.h). Тесты: 4 юнита на
+  маппинг (F-клавиши, case-insensitive char, grave, mods, round-trip
+  через `parse_key_spec`). Проверено `--render-test` с guake-конфигом:
+  регистрация + Drop-очистка без паники (OSStatus 0), небиндируемая
+  клавиша → warn + graceful fallback. Живой захват хоткея (колбэк на
+  реальном нажатии) headless не проверяется — нужна ручная проверка на
+  Mac. Доки поправлены (модуль + `rterm-config` global_hotkey).
+  **Linux (осталось):** X11 `XGrabKey` (+ путь под Wayland-протокол);
+  сейчас всё ещё no-op + warn.
 
 - [~] **Sixel-графика.** Главный пункт роадмапа. (функционален; полиш, 2026-07)
   План (из CLAUDE.md): DCS-расширение парсера в rterm-core (Sixel идёт
