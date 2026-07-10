@@ -120,14 +120,14 @@
   толеранса. Математика ряда вынесена в тестируемую
   `confirm_button_row_index` с unit-тестом.
 
-- [~] **Мелкая консистентность UI** (пакетом):
+- [x] **Мелкая консистентность UI** (пакетом). (2026-07)
   ✅ анимация у `switch_tab` (Ctrl+Shift+←/→) как у `select_tab`;
   ✅ middle-click close через `close_tab_at` (убрана инлайн-копия);
-  ✅ `handle_key` из match-guard в обычную ветку (side-effects не в
-  guard'е).
-  ⬜ порог в пикселях перед стартом tab-drag (сейчас `tab.drag_start`
-  на каждый клик) — требует «pending drag» стейта + детекта в
-  move-хендлере; отдельный follow-up.
+  ✅ `handle_key` из match-guard в обычную ветку;
+  ✅ порог tab-drag: press ставит `tab_drag_pending`, реальный drag
+  (и `tab.drag_start`) стартует только при смещении >
+  `TAB_DRAG_THRESHOLD_PX` — плейн-клик больше не эмитит start/end
+  пару. Чистая тестируемая `tab_drag_exceeds_threshold`.
 
 ## P2 — Крупные (недели)
 

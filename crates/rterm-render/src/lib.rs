@@ -3391,6 +3391,12 @@ pub struct App {
     /// Set on left-press over the header; cleared on release after a
     /// final tab_at hit-test decides the destination.
     tab_dragging: Option<usize>,
+    /// Armed on a tab press but NOT yet a real drag: `(tab_idx,
+    /// press_x, press_y, press_offset)`. Promotes to `tab_dragging`
+    /// (and fires `tab.drag_start`) only once the cursor moves past
+    /// `TAB_DRAG_THRESHOLD_PX`, so a plain click doesn't emit a
+    /// start/end drag pair or begin a reorder.
+    tab_drag_pending: Option<(usize, f64, f64, f64)>,
     /// Pixel offset between the press point and the dragged chip's
     /// left edge. The ghost-chip rendered during drag sits at
     /// `cursor.x - press_offset` so the chip doesn't visually jump
@@ -3641,6 +3647,20 @@ const CURSOR_BLINK_PERIOD_MS: u128 = 1000;
 
 const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 
+/// How far (physical px) the cursor must move from a tab press before
+/// it becomes a real drag-reorder. Below this, the press is a plain
+/// click (focus / double-click rename) and no `tab.drag_start` fires.
+const TAB_DRAG_THRESHOLD_PX: f64 = 5.0;
+
+/// True when a pending tab press at `(px, py)` has moved far enough
+/// from `(cx, cy)` to promote to a drag. Uses squared distance to
+/// avoid a sqrt.
+fn tab_drag_exceeds_threshold(px: f64, py: f64, cx: f64, cy: f64) -> bool {
+    let dx = cx - px;
+    let dy = cy - py;
+    dx * dx + dy * dy > TAB_DRAG_THRESHOLD_PX * TAB_DRAG_THRESHOLD_PX
+}
+
 impl App {
     /// Install the optional OS-level global hotkey from
     /// `[guake].global_hotkey`. Called once after `App::new`, before
@@ -3760,6 +3780,7 @@ impl App {
             search: None,
             gap_dragging: None,
             tab_dragging: None,
+            tab_drag_pending: None,
             tab_drag_press_offset: 0.0,
             tab_swap_anim: None,
             tab_scroll_offset: 0.0,
@@ -7127,21 +7148,18 @@ impl App {
                 self.start_tab_rename(t);
                 return false;
             }
-            // Record drag source + press offset so the ghost chip in
-            // `tab_bar_quads` sits under the cursor at the same pixel
-            // offset where the user grabbed it (no jump-to-cursor on
-            // press). `tab_layout` provides each tab's pixel left
-            // edge; we subtract that from `x` to get the within-chip
-            // offset.
-            self.tab_dragging = Some(t);
-            self.tab_drag_press_offset = self
+            // Arm a PENDING drag — a real drag (with `tab.drag_start`
+            // and reordering) only begins once the cursor moves past
+            // `TAB_DRAG_THRESHOLD_PX` (see `handle_drag`). This keeps a
+            // plain click from emitting a spurious start/end drag pair.
+            // Capture the within-chip press offset now so the ghost
+            // chip sits under the cursor without jumping when the drag
+            // does start. `tab_layout` gives each tab's pixel left edge.
+            let press_offset = self
                 .tab_layout()
                 .and_then(|l| l.entries.iter().find(|e| e.idx == t).map(|e| x - e.left))
                 .unwrap_or(0.0);
-            // Fire a `tab.drag_start` edge event so plugins can
-            // suspend tooltips / hover-tracking while a drag is
-            // in flight. Payload: 1-based source tab index.
-            self.events.emit("tab.drag_start", &(t + 1).to_string());
+            self.tab_drag_pending = Some((t, x, y, press_offset));
             if t != self.active_tab {
                 self.select_tab(t);
             } else if let Some(state) = self.state.as_ref() {
@@ -7466,6 +7484,18 @@ impl App {
     }
 
     fn handle_drag(&mut self, x: f64, y: f64) {
+        // Promote a pending tab press to a real drag once the cursor
+        // has moved past the threshold — only THEN fire `tab.drag_start`
+        // and begin reordering. A press that never moves far enough
+        // stays a plain click.
+        if let Some((t, px, py, offset)) = self.tab_drag_pending {
+            if tab_drag_exceeds_threshold(px, py, x, y) {
+                self.tab_drag_pending = None;
+                self.tab_dragging = Some(t);
+                self.tab_drag_press_offset = offset;
+                self.events.emit("tab.drag_start", &(t + 1).to_string());
+            }
+        }
         // Tab drag-reorder: live-shuffle the source tab through the
         // tab strip as the cursor crosses chip boundaries. Each swap
         // also seeds a `tab_swap_anim` so the displaced sibling
@@ -7614,6 +7644,10 @@ impl App {
 
     fn handle_release(&mut self) {
         self.drag_scroll_dir = 0;
+        // A pending tab press that never crossed the drag threshold was
+        // a plain click — just drop it (focus already happened on
+        // press; no drag ever started so nothing to finalize).
+        self.tab_drag_pending = None;
         if self.gap_dragging.take().is_some() {
             return;
         }
@@ -11592,6 +11626,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.mouse_dragging
                     || self.gap_dragging.is_some()
                     || self.tab_dragging.is_some()
+                    || self.tab_drag_pending.is_some()
                 {
                     self.handle_drag(position.x, position.y);
                 }
@@ -15296,6 +15331,18 @@ mod tests {
         let substring = fuzzy_score("next tab", "tab").unwrap();
         let fuzzy = fuzzy_score("toggle a button", "tab").unwrap();
         assert!(substring > fuzzy, "substring={substring} fuzzy={fuzzy}");
+    }
+
+    #[test]
+    fn tab_drag_threshold_gates_click_vs_drag() {
+        // A press that stays within the threshold radius is a click.
+        assert!(!tab_drag_exceeds_threshold(100.0, 10.0, 100.0, 10.0));
+        assert!(!tab_drag_exceeds_threshold(100.0, 10.0, 103.0, 12.0)); // ~3.6px
+        // Moving clearly past the threshold promotes to a drag.
+        assert!(tab_drag_exceeds_threshold(100.0, 10.0, 110.0, 10.0)); // 10px
+        assert!(tab_drag_exceeds_threshold(100.0, 10.0, 100.0, 16.0)); // 6px vertical
+        // Symmetric in both directions.
+        assert!(tab_drag_exceeds_threshold(100.0, 10.0, 90.0, 10.0));
     }
 
     #[test]
