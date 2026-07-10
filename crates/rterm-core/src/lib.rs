@@ -8,6 +8,7 @@ pub mod grid;
 pub mod image;
 pub mod parser;
 pub mod plugin;
+pub mod sixel;
 pub mod terminal;
 
 pub use color::{Color, NamedColor, DEFAULT_BG, DEFAULT_FG, DEFAULT_NAMED_PALETTE};

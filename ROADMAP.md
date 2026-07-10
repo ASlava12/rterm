@@ -232,7 +232,7 @@
   Wayland-протокол); либо, если вне скоупа, явно задокументировать
   «Windows-only», чтобы не читалось как тихий no-op.
 
-- [ ] **Sixel-графика.** Главный пункт роадмапа.
+- [~] **Sixel-графика.** Главный пункт роадмапа. (в работе, 2026-07)
   План (из CLAUDE.md): DCS-расширение парсера в rterm-core (Sixel идёт
   как `DCS P1;P2;P3 q ... ST`), потоковый декодер палитро-строк в
   RGBA, регистрация через существующий image store (`register_image`)
@@ -241,6 +241,20 @@
   DoD: `img2sixel` / `lsix` отображают картинки; `cat` мусора с
   `\ePq` не крашит парсер (fuzz-тест); лимиты как у остальных
   протоколов (`IMAGE_MAX_PAYLOAD_BYTES`).
+  **Stage 1 (сделано):** чистый декодер `rterm_core::sixel::decode(data)
+  → SixelImage{width,height,rgba}` — sixel-байты (`?`..`~`, 6 пикс/байт),
+  палитра (`#Pc` select / `#Pc;Pu;Px;Py;Pz` define, RGB 0–100% + HLS),
+  `$`/`-`/`!Pn`-повтор, raster-атрибуты `"`, дефолтная VT340-палитра;
+  капы 4096²/16M пикс; мусор/пустой → None без паники. 6 юнит-тестов
+  (колонка/прозрачность/RGB+repeat/банды/raster/junk). Pub-модуль, ещё
+  не подключён к DCS (безопасно: поведение не меняется).
+  **Stage 2 (далее):** мост DCS→изображение — `hook`/`put`/`unhook` в
+  `TerminalPerform` (детект `q`-финала без intermediates, накопление до
+  `IMAGE_MAX_PAYLOAD_BYTES`), декод + `register_image(Rgba8)` +
+  `place_image` в позиции курсора (учесть, что регистрация — на
+  `impl Terminal`, а unhook — на `TerminalPerform`: нужен shared-буфер
+  или немедленная регистрация через &mut-рефы image-store).
+  **Stage 3:** reflow-выравнивание по сетке, fuzz-хардненинг.
 
 - [ ] **Профили и SSH-менеджер (WindTerm-режим).**
   Сохранённые подключения: `[[profiles]]` в конфиге (имя, команда/
