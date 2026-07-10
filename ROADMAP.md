@@ -223,11 +223,14 @@
   / `forward_key_to_pty`), колесо (`handle_scroll`) и key-диспетчеры
   (`handle_key` / `handle_palette_key` / `handle_search_key`), плюс
   `handle_scroll_key` (Shift+PgUp/PgDn/Home/End) и `handle_rename_key`
-  (редактор имени таба). `lib.rs` 16.0k → 15.2k (`input.rs` ~855).
-  Далее: собрать оставшиеся key-хендлеры (`handle_settings_key` /
-  `handle_context_menu_key` / `handle_suggestion_popup_key` /
-  paste-confirm) и мышиные press/move-хендлеры в `input.rs`; затем
-  `frame.rs` (RedrawRequested-пайплайн) и `snapshot.rs`. (2) чистая математика (геометрия, хит-тесты,
+  (редактор имени таба); затем оверлейные key-хендлеры
+  `handle_settings_key` / `handle_context_menu_key` /
+  `handle_paste_confirmation_key` / `handle_suggestion_popup_key`.
+  `lib.rs` 16.0k → 14.8k (`input.rs` ~1220). Все key-хендлеры теперь в
+  `input.rs`. Далее: мышиные press/move/wheel-хендлеры
+  (`handle_paste_confirmation_press/wheel`, `handle_suggestion_popup_press`,
+  context-menu hover, pane/tab hit-test) в `input.rs`; затем `frame.rs`
+  (RedrawRequested-пайплайн) и `snapshot.rs`. (2) чистая математика (геометрия, хит-тесты,
   кодирование) — в свободные функции ради юнит-тестов; (3) убрать
   дублирование (инлайн-копии `close_tab_at` и т.п.), стейл-комментарии,
   мёртвый код; (4) единообразить идиомы (poison-tolerant локи,
