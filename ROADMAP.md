@@ -230,10 +230,13 @@
   мышиные entry-хендлеры модалок/попапов
   (`handle_paste_confirmation_press` / `handle_paste_confirmation_wheel`
   / `handle_suggestion_popup_press` / `update_context_menu_hover`).
-  `lib.rs` → 14.7k (`input.rs` ~1342). Далее: пере­ехавшие entry-точки
-  тянут за собой хелперы хит-теста (`paste_modal_press_*` /
-  `paste_modal_hit_test` / `suggestion_popup_rect` /
-  `context_menu_item_at`) — их тоже в `input.rs`; затем `frame.rs`
+  `lib.rs` → 14.7k. Плюс ядро мышиного взаимодействия — `handle_press`
+  (клик/фокус/старт-выделения/таб-хиты, ~385 стр) и `handle_drag`
+  (drag-выделение + reorder табов). `lib.rs` → 14.2k (`input.rs` ~1826;
+  весь путь клавиатуры+мыши теперь тут). Общая геометрия хит-теста
+  (`pixel_to_cell` / `*_rect` / `abs_point` / `paste_modal_hit_test`)
+  осознанно осталась в `lib.rs` — она общая с рендером; зовётся из
+  `input.rs` как приватный-для-корня метод. Далее: `frame.rs`
   (RedrawRequested-пайплайн) и `snapshot.rs`. (2) чистая математика (геометрия, хит-тесты,
   кодирование) — в свободные функции ради юнит-тестов; (3) убрать
   дублирование (инлайн-копии `close_tab_at` и т.п.), стейл-комментарии,
