@@ -2717,7 +2717,7 @@ fn builtin_event_names() -> Vec<String> {
         "pane.command_finish", "pane.slow_command",
         "scrollback.save", "scrollback.clear",
         "prompt.jump", "command.jump",
-        "bell", "notification", "progress",
+        "bell", "notification", "attention", "progress",
         "osc52.write", "osc52.blocked",
         // Fires when `toggle_guake` is invoked while `[guake] enabled =
         // false`. Lets a plugin convert what used to be a silent no-op
@@ -3385,7 +3385,7 @@ mod tests {
             "scrollback.save", "scrollback.clear",
             "copy", "paste", "osc52.write", "osc52.blocked",
             "frame.tick", "cwd", "title", "resize",
-            "bell", "notification",
+            "bell", "notification", "attention",
             // Surfaced by `toggle_guake` when `[guake] enabled = false`.
             // Plugins use this to convert what would otherwise be a
             // silent no-op into a toast / settings-overlay nudge —

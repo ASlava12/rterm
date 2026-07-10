@@ -1214,12 +1214,19 @@ impl App {
             self.slow_command_ms = v;
         }
 
-        // Plugin-triggered taskbar ping (`rterm.attention()`).
-        if self.events.take_pending_attention() && !self.window_focused {
-            if let Some(s) = self.state.as_ref() {
-                s.window.request_user_attention(Some(
-                    winit::window::UserAttentionType::Informational,
-                ));
+        // Plugin-triggered attention (`rterm.attention()`): fire the
+        // documented `attention` event so other plugins can react
+        // (`rterm.on("attention", ...)`), and ping the taskbar when the
+        // window is unfocused. The event fires regardless of focus — the
+        // taskbar ping is the focus-gated part.
+        if self.events.take_pending_attention() {
+            self.events.emit("attention", "");
+            if !self.window_focused {
+                if let Some(s) = self.state.as_ref() {
+                    s.window.request_user_attention(Some(
+                        winit::window::UserAttentionType::Informational,
+                    ));
+                }
             }
         }
 
