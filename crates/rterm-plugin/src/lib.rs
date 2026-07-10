@@ -327,6 +327,11 @@ enum MatchKind {
 struct MatchRule {
     name: String,
     kind: MatchKind,
+    /// Optional per-rule `on` callback from `add_match(.., { on = fn })`.
+    /// Invoked with the matched line each time the rule hits, in addition
+    /// to the global `match` event. Stored as a Lua registry key so the
+    /// `Function` outlives the `add_match` call.
+    on: Option<RegistryKey>,
 }
 
 pub struct PluginHost {
@@ -1092,13 +1097,22 @@ impl PluginHost {
         let rules_for_add = Arc::clone(&match_rules);
         rterm.set(
             "add_match",
-            lua.create_function(move |_, (name, pattern, opts): (String, String, Option<Table>)| {
+            lua.create_function(move |lua, (name, pattern, opts): (String, String, Option<Table>)| {
                 if name.is_empty() {
                     return Ok(false);
                 }
                 let is_regex = opts
+                    .as_ref()
                     .and_then(|t| t.get::<Option<bool>>("regex").ok().flatten())
                     .unwrap_or(false);
+                // Optional per-rule callback: `add_match(.., { on = fn })`.
+                // Stored in the Lua registry so it survives past this call
+                // and fires (with the matched line) alongside the `match`
+                // event. A non-function `on` is ignored.
+                let on = opts
+                    .as_ref()
+                    .and_then(|t| t.get::<Option<Function>>("on").ok().flatten())
+                    .and_then(|f| lua.create_registry_value(f).ok());
                 let kind = if is_regex {
                     match Regex::new(&pattern) {
                         Ok(re) => MatchKind::Regex(re),
@@ -1124,7 +1138,7 @@ impl PluginHost {
                     );
                     return Ok(false);
                 }
-                rules.push(MatchRule { name, kind });
+                rules.push(MatchRule { name, kind, on });
                 Ok(true)
             })?,
         )?;
@@ -4092,25 +4106,51 @@ impl PluginHost {
     /// (`(.+)?` that didn't capture) become empty strings so positional
     /// indexing stays stable.
     pub fn match_output_line(&self, line: &str) -> Vec<(String, Vec<String>)> {
-        let Ok(rules) = self.match_rules.lock() else { return Vec::new() };
         let mut out = Vec::new();
-        for r in rules.iter() {
-            match &r.kind {
-                MatchKind::Substring(needle) => {
-                    if line.contains(needle.as_str()) {
-                        out.push((r.name.clone(), Vec::new()));
+        // Per-rule `on` callbacks to fire once the rules lock is released —
+        // invoking them under the lock would deadlock if the callback calls
+        // `add_match` / `remove_match`. Retrieving the `Function` from the
+        // registry is a cheap Lua-ref clone and is safe to do under lock.
+        let mut callbacks: Vec<Function> = Vec::new();
+        {
+            let Ok(rules) = self.match_rules.lock() else { return Vec::new() };
+            for r in rules.iter() {
+                let hit = match &r.kind {
+                    MatchKind::Substring(needle) => {
+                        if line.contains(needle.as_str()) {
+                            out.push((r.name.clone(), Vec::new()));
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    MatchKind::Regex(re) => {
+                        if let Some(caps) = re.captures(line) {
+                            let groups: Vec<String> = caps
+                                .iter()
+                                .skip(1)
+                                .map(|m| m.map(|x| x.as_str().to_string()).unwrap_or_default())
+                                .collect();
+                            out.push((r.name.clone(), groups));
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                };
+                if hit {
+                    if let Some(key) = &r.on {
+                        if let Ok(f) = self.lua.registry_value::<Function>(key) {
+                            callbacks.push(f);
+                        }
                     }
                 }
-                MatchKind::Regex(re) => {
-                    if let Some(caps) = re.captures(line) {
-                        let groups: Vec<String> = caps
-                            .iter()
-                            .skip(1)
-                            .map(|m| m.map(|x| x.as_str().to_string()).unwrap_or_default())
-                            .collect();
-                        out.push((r.name.clone(), groups));
-                    }
-                }
+            }
+        }
+        // Fire each matched rule's `on(line)` callback outside the lock.
+        for f in callbacks {
+            if let Err(e) = f.call::<()>(line.to_string()) {
+                tracing::warn!(target: "rterm::plugin", "add_match `on` callback error: {e}");
             }
         }
         out
@@ -8941,6 +8981,32 @@ mod tests {
         );
         // Case-sensitive: a substring rule does NOT match a different case.
         assert_eq!(host.match_output_line("Error capital"), Vec::<(String, Vec<String>)>::new());
+    }
+
+    #[test]
+    fn add_match_on_callback_fires_with_matched_line() {
+        // The per-rule `on` callback runs — with the matched line — every
+        // time the pattern hits, alongside the global `match` event.
+        let host = PluginHost::new().expect("host inits");
+        host.lua
+            .load(
+                r#"
+                seen = nil
+                hits = 0
+                rterm.add_match("err", "error", {
+                    on = function(text) seen = text; hits = hits + 1 end,
+                })
+                "#,
+            )
+            .exec()
+            .unwrap();
+        // No match → callback not called.
+        let _ = host.match_output_line("all good");
+        assert_eq!(host.lua.globals().get::<u64>("hits").unwrap(), 0);
+        // Match → callback fires once with the full line.
+        let _ = host.match_output_line("got an error: boom");
+        assert_eq!(host.lua.globals().get::<u64>("hits").unwrap(), 1);
+        assert_eq!(host.lua.globals().get::<String>("seen").unwrap(), "got an error: boom");
     }
 
     #[test]

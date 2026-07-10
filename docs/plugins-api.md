@@ -137,7 +137,7 @@
 
 | Функция | Описание |
 |---------|----------|
-| `rterm.add_match(name, pattern, opts)` | Подписать «матч» на содержимое скроллбэка. `opts = { regex = true, on = function(text, row, col) ... end }`. Событие `match` стреляет каждый раз, когда `pattern` находится в новом выводе. |
+| `rterm.add_match(name, pattern, opts)` | Подписать «матч» на содержимое скроллбэка. `opts = { regex = true, on = function(text) ... end }`, где `text` — совпавшая строка вывода. Событие `match` стреляет каждый раз, когда `pattern` находится в новом выводе; per-rule `on`-колбэк (если задан) вызывается тогда же. |
 | `rterm.remove_match(name)` / `rterm.remove_all_matches()` | Снять регистрации. |
 | `rterm.list_matches()` / `rterm.match_rules()` | Что зарегистрировано. |
 | `rterm.open_url(url)` | Открыть URL через системный обработчик. |

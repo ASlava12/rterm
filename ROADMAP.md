@@ -34,12 +34,15 @@
   Добавлено в `builtin_event_names()` + закреплено в anchor-тесте.
   `rterm.on("attention", ...)` теперь срабатывает.
 
-- [ ] **Плагины: `add_match` `opts.on` колбэк игнорируется.**
-  Доки (`docs/plugins-api.md:140`, `docs/plugins.md:169`) показывают
-  per-rule `on=function(text,row,col)`; `rterm-plugin/src/lib.rs:1094`
-  читает только `opts.regex`, `MatchRule` не хранит колбэк. DoD: хранить
-  `opts.on` как `RegistryKey` в `MatchRule` и звать на сайте
-  `emit("match")` (`event_loop.rs:~888`) — либо убрать `on` из доков.
+- [x] **Плагины: `add_match` `opts.on` колбэк теперь вызывается.** (2026-07)
+  `MatchRule` хранит `on: Option<RegistryKey>`; `add_match` читает
+  `opts.on` как `Function` и кладёт в реестр Lua. `match_output_line`
+  извлекает колбэки под локом (дешёвый Lua-ref) и зовёт `on(line)` ПОСЛЕ
+  освобождения лока (deadlock-safe, если колбэк дёргает
+  `add_match`/`remove_match`). Сигнатура в доках выправлена на
+  `function(text)` (text = совпавшая строка; row/col для line-based
+  матча не предоставляются). Тест на срабатывание. Весь P0-plugin-
+  кластер sweep'а закрыт.
 
 - [x] **Плагины: bare/`_of`-формы panel-аксессоров.** (2026-07)
   Зарегистрированы 6 недостающих bare-форм (`idle` / `scrollback_len` /
