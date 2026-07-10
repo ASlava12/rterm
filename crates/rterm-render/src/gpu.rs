@@ -6,6 +6,7 @@
 //! behaviour unchanged.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
 use winit::window::Window;
@@ -351,6 +352,12 @@ impl GpuState {
         &self.window
     }
 
+    /// Soonest an animated GIF needs its next frame, for the event loop's
+    /// `WaitUntil` scheduling. `None` when nothing is animating.
+    pub(crate) fn images_next_deadline(&self) -> Option<Instant> {
+        self.images.next_animation_deadline()
+    }
+
     /// Recompute the surface clear colour for a new opacity. The window's
     /// `with_transparent` hint and surface alpha mode are set at create
     /// time, so a runtime opacity change from 1.0 → <1.0 only visibly
@@ -536,6 +543,9 @@ impl GpuState {
         // GC textures for image ids that no longer have placements
         // (FIFO-evicted, RIS, or just panes that closed).
         self.images.sweep(&live_keys);
+        // Advance any animated GIFs to the frame due now, re-uploading it
+        // before the draw below samples the texture.
+        self.images.advance_animations(&self.queue, Instant::now());
         // Closure that the image pass uses to fetch the source
         // bytes for a (pane_uid, image_id) pair. Walks the panes
         // to find the matching `Terminal`, then asks for its

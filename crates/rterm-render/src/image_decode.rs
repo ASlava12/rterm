@@ -24,7 +24,31 @@ pub struct DecodedImage {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+    /// Animation frames for an animated GIF. Empty for a still image.
+    /// When non-empty it has ≥ 2 entries and `frames[0].rgba == rgba`
+    /// (the first frame is duplicated into `rgba` so the still upload
+    /// path stays untouched). Each frame is already fully composited
+    /// (the `image` crate applies GIF disposal), so the renderer just
+    /// swaps the whole texture per frame.
+    pub frames: Vec<AnimFrame>,
 }
+
+/// One frame of an animated image: an RGBA8 buffer plus the delay to
+/// hold it before advancing to the next frame.
+pub struct AnimFrame {
+    pub rgba: Vec<u8>,
+    pub delay_ms: u32,
+}
+
+/// Cap on decoded animation frames and their cumulative RGBA bytes — a
+/// crafted GIF could otherwise pin unbounded RAM (thousands of frames).
+const GIF_MAX_FRAMES: usize = 256;
+const GIF_MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+/// Floor for per-frame delay. GIFs frequently encode 0 (or a few ms)
+/// meaning "as fast as possible"; browsers clamp such frames, and a
+/// literal 0 would busy-spin the render loop. 0 → 100 ms (the de-facto
+/// browser default), anything else is floored at 20 ms.
+const GIF_MIN_DELAY_MS: u32 = 20;
 
 /// Decode `image` into a CPU-side RGBA8 buffer. `None` when the
 /// payload is unsupported / corrupt / too large to allocate. The
@@ -53,6 +77,7 @@ pub fn decode(image: &Image) -> Option<DecodedImage> {
                 width: image.width_px,
                 height: image.height_px,
                 rgba: image.data.clone(),
+                frames: Vec::new(),
             })
         }
         ImageFormat::Rgb8 => {
@@ -83,9 +108,69 @@ pub fn decode(image: &Image) -> Option<DecodedImage> {
                 width: image.width_px,
                 height: image.height_px,
                 rgba,
+                frames: Vec::new(),
             })
         }
-        ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Gif => {
+        ImageFormat::Gif => {
+            // Try the animated path first. On success with ≥ 2 frames we
+            // return them for playback; a single-frame GIF (or a decode
+            // hiccup) falls through to the still `ImageReader` path below.
+            if let Some((width, height, frames)) = decode_gif_animation(&image.data) {
+                if frames.len() > 1 {
+                    return Some(DecodedImage {
+                        width,
+                        height,
+                        rgba: frames[0].rgba.clone(),
+                        frames,
+                    });
+                }
+            }
+            decode_still(image)
+        }
+        ImageFormat::Png | ImageFormat::Jpeg => decode_still(image),
+    }
+}
+
+/// Decode all frames of an animated GIF into RGBA8 buffers with delays.
+/// `None` on a decode error or an empty/oversize animation. Bounded by
+/// `GIF_MAX_FRAMES` / `GIF_MAX_TOTAL_BYTES` and the 8192² dimension cap.
+fn decode_gif_animation(data: &[u8]) -> Option<(u32, u32, Vec<AnimFrame>)> {
+    use image::AnimationDecoder;
+    const MAX_DECODE_DIM: u32 = 8192;
+    let decoder =
+        image::codecs::gif::GifDecoder::new(std::io::Cursor::new(data)).ok()?;
+    let (w, h) = image::ImageDecoder::dimensions(&decoder);
+    if w == 0 || h == 0 || w > MAX_DECODE_DIM || h > MAX_DECODE_DIM {
+        return None;
+    }
+    let mut frames = Vec::new();
+    let mut total_bytes: u64 = 0;
+    for frame in decoder.into_frames() {
+        let Ok(frame) = frame else { break };
+        let (num, den) = frame.delay().numer_denom_ms();
+        let raw = num / den.max(1);
+        let delay_ms = if raw == 0 { 100 } else { raw.max(GIF_MIN_DELAY_MS) };
+        let rgba = frame.into_buffer().into_raw();
+        total_bytes = total_bytes.saturating_add(rgba.len() as u64);
+        if total_bytes > GIF_MAX_TOTAL_BYTES {
+            break;
+        }
+        frames.push(AnimFrame { rgba, delay_ms });
+        if frames.len() >= GIF_MAX_FRAMES {
+            break;
+        }
+    }
+    if frames.is_empty() {
+        None
+    } else {
+        Some((w, h, frames))
+    }
+}
+
+/// Decode a single still image (PNG / JPEG / single-frame GIF) via
+/// `ImageReader` with decompression-bomb limits.
+fn decode_still(image: &Image) -> Option<DecodedImage> {
+    {
             // Decode through `ImageReader` with explicit limits — a
             // decompression bomb (a few-KB PNG declaring 50000×50000)
             // would otherwise make the decoder allocate w*h*4 bytes
@@ -140,8 +225,8 @@ pub fn decode(image: &Image) -> Option<DecodedImage> {
                 width,
                 height,
                 rgba: rgba_img.into_raw(),
+                frames: Vec::new(),
             })
-        }
     }
 }
 
@@ -151,6 +236,33 @@ mod tests {
 
     fn img(format: ImageFormat, w: u32, h: u32, data: Vec<u8>) -> Image {
         Image { id: 1, format, width_px: w, height_px: h, data }
+    }
+
+    #[test]
+    fn gif_animation_decodes_multiple_frames_with_delays() {
+        use image::{codecs::gif::GifEncoder, Delay, Frame, RgbaImage};
+        // Encode a 2×2, 2-frame GIF in memory (delays are multiples of
+        // 10 ms so they survive GIF's centisecond quantisation exactly).
+        let mut buf = Vec::new();
+        {
+            let mut enc = GifEncoder::new(&mut buf);
+            let red = RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
+            let blue = RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 255, 255]));
+            enc.encode_frame(Frame::from_parts(red, 0, 0, Delay::from_numer_denom_ms(80, 1)))
+                .unwrap();
+            enc.encode_frame(Frame::from_parts(blue, 0, 0, Delay::from_numer_denom_ms(120, 1)))
+                .unwrap();
+        }
+        let decoded = decode(&img(ImageFormat::Gif, 2, 2, buf)).expect("gif decodes");
+        assert_eq!(decoded.width, 2);
+        assert_eq!(decoded.height, 2);
+        assert_eq!(decoded.frames.len(), 2, "both frames decoded");
+        assert_eq!(decoded.frames[0].delay_ms, 80);
+        assert_eq!(decoded.frames[1].delay_ms, 120);
+        // First frame is mirrored into `rgba` so the still upload path
+        // needs no special case; each frame is a full 2*2*4 RGBA buffer.
+        assert_eq!(decoded.rgba, decoded.frames[0].rgba);
+        assert_eq!(decoded.frames[0].rgba.len(), 2 * 2 * 4);
     }
 
     #[test]

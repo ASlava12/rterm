@@ -3403,6 +3403,13 @@ impl App {
             let last = self.last_frame_tick.unwrap_or(now);
             consider(last + Duration::from_secs(1));
         }
+        // Animated GIF playback: wake at the next frame boundary so it
+        // advances while otherwise idle (no continuous redraw).
+        if let Some(state) = self.state.as_ref() {
+            if let Some(t) = state.images_next_deadline() {
+                consider(t);
+            }
+        }
         match next {
             Some(t) => event_loop.set_control_flow(ControlFlow::WaitUntil(t)),
             None => event_loop.set_control_flow(ControlFlow::Wait),

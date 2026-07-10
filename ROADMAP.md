@@ -181,12 +181,19 @@
   broadcast рассылает во ВСЕ панели активного таба. Статус-бар
   форсируется с маркером `⇉ BROADCAST`. Off по умолчанию, runtime-only.
 
-- [ ] **GIF-анимация.**
-  Кадры декодирует crate `image`; нужен per-frame тайминг в
-  image-pass + таймерные пробуждения (событийный цикл уже умеет
-  `WaitUntil` — `schedule_after_frame`). Кэшировать кадры с бюджетом.
-  DoD: анимированный GIF через iTerm2-протокол крутится; CPU в
-  простое без анимаций не растёт.
+- [x] **GIF-анимация.** (2026-07)
+  Декодер (`image_decode`): мульти-кадровый GIF через
+  `GifDecoder`+`AnimationDecoder` → `DecodedImage.frames`
+  (`Vec<AnimFrame>{rgba, delay_ms}`), кадры уже композитны (disposal
+  применён крейтом), бюджет `GIF_MAX_FRAMES=256` / 256 MiB, задержка 0
+  → 100 ms (флор 20 ms). image-pass: `ImageCacheEntry.anim` держит кадры
+  + курсор; `advance_animations(queue, now)` продвигает по времени и
+  re-uploadит текущий кадр in-place (view/bind-group не инвалидируются),
+  с resync-защитой от долгого простоя. Тайминг вынесен в чистую
+  `advance_frame_cursor` (3 теста). Интеграция: `next_animation_deadline`
+  → `schedule_after_frame` (`WaitUntil`) → `new_events(ResumeTimeReached)`
+  → redraw. CPU в простое БЕЗ анимаций не растёт (нет анимированных GIF →
+  `None` дедлайн → `Wait`). Тест на декод 2-кадрового GIF с задержками.
 
 - [x] **`scroll_offset` u16 → u32.** (2026-07)
   `Pane.scroll_offset` → `AtomicU32`; core API (`visible_row` /

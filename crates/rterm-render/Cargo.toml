@@ -41,7 +41,7 @@ rterm-history = { workspace = true }
 image = { version = "0.25", default-features = false, features = [
     "png",     # iPhone / matplotlib / web / nearly every screenshot tool
     "jpeg",    # cameras / web
-    "gif",     # logos / memes (static — animation is out of scope)
+    "gif",     # logos / memes, animated (multi-frame playback)
     "webp",    # chrome screenshot tool default
     "bmp",     # old Windows screenshots, paint output
     "tiff",    # scanners / fax

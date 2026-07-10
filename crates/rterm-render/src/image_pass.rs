@@ -39,11 +39,12 @@
 //! against the set of currently-referenced ids.
 //!
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use bytemuck::{Pod, Zeroable};
 use rterm_core::Image;
 
-use crate::image_decode;
+use crate::image_decode::{self, AnimFrame};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -134,13 +135,25 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
 "#;
 
 struct ImageCacheEntry {
-    /// Owned GPU texture. Not read directly — the bind group below
-    /// holds the texture view that the fragment shader samples. The
-    /// field exists to extend the texture's lifetime to match its
-    /// view; dropping it would invalidate the bind group between
-    /// the prepare and render passes.
-    _texture: wgpu::Texture,
+    /// Owned GPU texture. Its view lives in `bind_group`; keeping the
+    /// texture here extends its lifetime to match. For animated GIFs it
+    /// is also re-written in place per frame (`advance`) — the view (and
+    /// so the bind group) stays valid across `write_texture`.
+    texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
+    /// `Some` for an animated GIF: the decoded frames plus playback
+    /// cursor. `None` for a still image.
+    anim: Option<AnimState>,
+}
+
+/// Playback state for an animated image. The frames are already
+/// composited; advancing just re-uploads the current frame's RGBA.
+struct AnimState {
+    frames: Vec<AnimFrame>,
+    current: usize,
+    /// When the current frame began showing. The next advance is due at
+    /// `started + frames[current].delay_ms`.
+    started: Instant,
 }
 
 pub struct ImageLayer {
@@ -442,14 +455,82 @@ impl ImageLayer {
                 },
             ],
         });
-        self.cache.insert(key, ImageCacheEntry { _texture: texture, bind_group });
+        // Animated GIF (≥ 2 frames) → keep the frames for playback; the
+        // texture just uploaded holds frame 0 (== decoded.rgba).
+        let anim = if decoded.frames.len() > 1 {
+            Some(AnimState {
+                frames: decoded.frames,
+                current: 0,
+                started: Instant::now(),
+            })
+        } else {
+            None
+        };
+        let animated = anim.is_some();
+        self.cache.insert(key, ImageCacheEntry { texture, bind_group, anim });
         tracing::info!(
             pane_uid = key.0,
             image_id = key.1,
             cache_size = self.cache.len(),
+            animated,
             "image_pass: texture cached, ready to draw",
         );
         true
+    }
+
+    /// Advance any animated GIFs whose current frame's delay has elapsed,
+    /// re-uploading the new current frame in place. Called once per frame
+    /// with `now`. Cheap when nothing is due (a few `Instant` compares);
+    /// a texture re-upload only happens at a frame boundary.
+    pub(crate) fn advance_animations(&mut self, queue: &wgpu::Queue, now: Instant) {
+        for entry in self.cache.values_mut() {
+            let Some(anim) = entry.anim.as_mut() else { continue };
+            let changed =
+                advance_frame_cursor(&anim.frames, &mut anim.current, &mut anim.started, now);
+            if changed {
+                let w = entry.texture.width();
+                let h = entry.texture.height();
+                queue.write_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: &entry.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &anim.frames[anim.current].rgba,
+                    wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(w * 4),
+                        rows_per_image: Some(h),
+                    },
+                    wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Soonest time an animated GIF needs its next frame, or `None` when
+    /// nothing is animating. The renderer feeds this into the event loop's
+    /// `WaitUntil` so playback keeps advancing while the app is otherwise
+    /// idle — without pinning the CPU to a continuous redraw.
+    pub(crate) fn next_animation_deadline(&self) -> Option<Instant> {
+        self.cache
+            .values()
+            .filter_map(|e| {
+                let anim = e.anim.as_ref()?;
+                if anim.frames.len() < 2 {
+                    return None;
+                }
+                Some(
+                    anim.started
+                        + Duration::from_millis(anim.frames[anim.current].delay_ms as u64),
+                )
+            })
+            .min()
     }
 
     /// Build the per-frame instance buffer from a flat list of
@@ -606,5 +687,97 @@ impl ImageLayer {
         // passes that follow aren't accidentally clipped to the
         // last image's pane.
         pass.set_scissor_rect(0, 0, vp_w.max(1), vp_h.max(1));
+    }
+}
+
+/// Advance an animation's `current` / `started` cursor across every frame
+/// delay that has elapsed by `now`, returning whether the visible frame
+/// changed (so the caller re-uploads). Catches up across skipped frames
+/// but resyncs after one full loop so a long idle (window hidden, sleep)
+/// can't turn into a runaway catch-up. Pure — no GPU state — so the
+/// timing is unit-testable.
+fn advance_frame_cursor(
+    frames: &[AnimFrame],
+    current: &mut usize,
+    started: &mut Instant,
+    now: Instant,
+) -> bool {
+    let n = frames.len();
+    if n < 2 {
+        return false;
+    }
+    let mut changed = false;
+    let mut steps = 0;
+    loop {
+        let delay = Duration::from_millis(frames[*current].delay_ms as u64);
+        if now.saturating_duration_since(*started) < delay {
+            break;
+        }
+        *started += delay;
+        *current = (*current + 1) % n;
+        changed = true;
+        steps += 1;
+        if steps >= n {
+            *started = now;
+            break;
+        }
+    }
+    changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frames(delays: &[u32]) -> Vec<AnimFrame> {
+        delays
+            .iter()
+            .map(|&delay_ms| AnimFrame { rgba: vec![0; 4], delay_ms })
+            .collect()
+    }
+
+    #[test]
+    fn advance_frame_cursor_holds_advances_and_wraps() {
+        let fr = frames(&[100, 100, 100]);
+        let base = Instant::now();
+        let mut cur = 0;
+        let mut started = base;
+
+        // Before the delay elapses: no change.
+        assert!(!advance_frame_cursor(&fr, &mut cur, &mut started, base + Duration::from_millis(50)));
+        assert_eq!(cur, 0);
+
+        // At 150 ms one frame boundary has passed → frame 1, `started`
+        // moves forward by exactly one delay (no drift).
+        assert!(advance_frame_cursor(&fr, &mut cur, &mut started, base + Duration::from_millis(150)));
+        assert_eq!(cur, 1);
+        assert_eq!(started, base + Duration::from_millis(100));
+
+        // At 320 ms (from base) two more boundaries → wraps 1→2→0.
+        assert!(advance_frame_cursor(&fr, &mut cur, &mut started, base + Duration::from_millis(320)));
+        assert_eq!(cur, 0);
+    }
+
+    #[test]
+    fn advance_frame_cursor_resyncs_after_a_long_idle() {
+        let fr = frames(&[30, 30]);
+        let base = Instant::now();
+        let mut cur = 0;
+        let mut started = base;
+        // A 10-second gap must not loop thousands of times: capped at one
+        // full cycle, then `started` is resynced to `now`.
+        let now = base + Duration::from_secs(10);
+        assert!(advance_frame_cursor(&fr, &mut cur, &mut started, now));
+        assert_eq!(started, now, "resynced to now after a full-loop catch-up");
+    }
+
+    #[test]
+    fn advance_frame_cursor_single_frame_is_noop() {
+        let fr = frames(&[100]);
+        let base = Instant::now();
+        let mut cur = 0;
+        let mut started = base;
+        assert!(!advance_frame_cursor(&fr, &mut cur, &mut started, base + Duration::from_secs(5)));
+        assert_eq!(cur, 0);
     }
 }
