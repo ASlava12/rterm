@@ -236,8 +236,16 @@
   весь путь клавиатуры+мыши теперь тут). Общая геометрия хит-теста
   (`pixel_to_cell` / `*_rect` / `abs_point` / `paste_modal_hit_test`)
   осознанно осталась в `lib.rs` — она общая с рендером; зовётся из
-  `input.rs` как приватный-для-корня метод. Далее: `frame.rs`
-  (RedrawRequested-пайплайн) и `snapshot.rs`. (2) чистая математика (геометрия, хит-тесты,
+  `input.rs` как приватный-для-корня метод.
+  Затем `event_loop.rs` — весь `impl ApplicationHandler<UserEvent> for
+  App` (~2.8k строк: `resumed`/`new_events`/`user_event`/`exiting`/
+  `window_event`, включая `RedrawRequested`-пайплайн со сборкой
+  снапшота для плагинов и GPU prepare/render). `lib.rs` 14.2k → 11.4k.
+  Этим закрыты оба кандидата `frame.rs` (RedrawRequested сидит в
+  `window_event`) и `snapshot.rs` (снапшот строится там же инлайн).
+  Осталось (по желанию): распилить сам `window_event` на per-arm
+  методы; вынести GPU-пайплайн (`prepare`/`render*` у `GpuState`) в
+  `gpu.rs`. (2) чистая математика (геометрия, хит-тесты,
   кодирование) — в свободные функции ради юнит-тестов; (3) убрать
   дублирование (инлайн-копии `close_tab_at` и т.п.), стейл-комментарии,
   мёртвый код; (4) единообразить идиомы (poison-tolerant локи,
