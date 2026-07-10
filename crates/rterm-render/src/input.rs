@@ -27,7 +27,7 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use crate::clipboard::clipboard_set;
 use crate::highlight;
 use crate::{
-    clamp_scroll_offset, encode_mouse, mouse_mode_for,
+    clamp_scroll_offset, encode_mouse, mouse_mod_bits, mouse_mode_for,
     paste_confirm, tab_drag_exceeds_threshold, word_back_delete_index,
     ActiveSelection, App, MenuItem, ScrollNav, SelectionMode, SelectionPoint, TabHit,
     TabSwapAnim, MULTI_CLICK_INTERVAL,
@@ -35,13 +35,17 @@ use crate::{
 
 impl App {
     pub(crate) fn handle_scroll(&mut self, delta: MouseScrollDelta) {
-        // Translate the wheel delta into integral lines first so we
-        // can decide what to scroll. Apply a 3× multiplier — the raw
-        // wheel notch was uncomfortably slow on most mice; tuned by
-        // feel against Chrome / VSCode.
+        // Translate the wheel delta into a raw notch count and an
+        // amplified line count. The 3× multiplier makes CONTENT scrolling
+        // (local scrollback, alt-screen pagers, overlays) feel right — the
+        // raw notch was uncomfortably slow, tuned by feel against Chrome /
+        // VSCode. But mouse-reporting apps (?1000–?1003) do their OWN
+        // scroll-speed handling, so they must get the RAW notch count (one
+        // report per physical notch, like every other terminal) —
+        // amplifying there tripled their scroll.
         const WHEEL_SPEED_MULT: f32 = 3.0;
-        let lines_f = match delta {
-            MouseScrollDelta::LineDelta(_, y) => y * WHEEL_SPEED_MULT,
+        let base_f = match delta {
+            MouseScrollDelta::LineDelta(_, y) => y,
             MouseScrollDelta::PixelDelta(p) => {
                 let line_h = self
                     .state
@@ -49,13 +53,20 @@ impl App {
                     .map(|s| s.text.line_height())
                     .unwrap_or(16.0)
                     .max(1.0);
-                (p.y as f32) / line_h * WHEEL_SPEED_MULT
+                (p.y as f32) / line_h
             }
         };
-        let step = lines_f.round() as i32;
+        let step = (base_f * WHEEL_SPEED_MULT).round() as i32;
         if step == 0 {
             return;
         }
+        // Raw notches for mouse-report forwarding; guarantee at least one
+        // in the scroll direction whenever we scrolled (a sub-notch
+        // trackpad delta reports a single event, not zero).
+        let notch = {
+            let n = base_f.round() as i32;
+            if n == 0 { step.signum() } else { n }
+        };
         // Modal overlays consume the wheel before anything else so
         // it doesn't bleed through to the panes / tab strip below.
         // Convention (matches key handlers): wheel UP (step > 0)
@@ -155,8 +166,11 @@ impl App {
         if let Some((_mode, sgr, pixel)) = mouse_mode_for(pane) {
             let (cx, cy) =
                 self.mouse_report_coords(target_idx, self.cursor_pos.x, self.cursor_pos.y, pixel);
-            let button = if step > 0 { 64 } else { 65 };
-            for _ in 0..step.unsigned_abs() {
+            // Forward the RAW notch count (not the 3×-amplified `step`) —
+            // the app scrolls by its own amount per report.
+            let button =
+                (if notch > 0 { 64 } else { 65 }) | mouse_mod_bits(self.modifiers);
+            for _ in 0..notch.unsigned_abs() {
                 let bytes = encode_mouse(sgr, button, cx, cy, true);
                 pane.send_input(&bytes);
             }
@@ -349,6 +363,20 @@ impl App {
     }
 
     pub(crate) fn forward_key_to_pty(&self, event: &KeyEvent) {
+        // While an IME composition is active, keys belong to the IME, not
+        // the shell. Some platforms (Windows IMM, X11 ibus/fcitx) still
+        // deliver a `KeyboardInput` alongside the `Ime` events; without
+        // this guard a Backspace editing the preedit would ALSO send `\x7f`
+        // to the PTY (corrupting the line), and a candidate-selection key
+        // would double-fire. `ime_preedit` is empty in all non-IME use, so
+        // this is a no-op for ordinary typing. (The confirming Enter that
+        // arrives *after* `Ime::Commit` cleared the preedit is deliberately
+        // NOT swallowed here — distinguishing it from a genuine submit is
+        // platform-fragile, and erring toward "let Enter through" avoids
+        // eating a real command submission.)
+        if !self.ime_preedit.is_empty() {
+            return;
+        }
         let Some(pane) = self.focused_pane() else { return };
         // Note: the App-level handler clears `self.selection` and resets the
         // cursor blink phase after this. `app_cursor` is read from the
@@ -1677,7 +1705,7 @@ impl App {
         if let Some(pane) = self.active_tab().and_then(|t| t.pane_at(i)) {
             if let Some((_mode, sgr, pixel)) = mouse_mode_for(pane) {
                 let (cx, cy) = self.mouse_report_coords(i, x, y, pixel);
-                let bytes = encode_mouse(sgr, 0, cx, cy, true);
+                let bytes = encode_mouse(sgr, mouse_mod_bits(self.modifiers), cx, cy, true);
                 pane.send_input(&bytes);
                 self.mouse_pty_pane = Some(i);
                 self.selection = None;
@@ -1830,9 +1858,10 @@ impl App {
             if let Some(pane) = self.active_tab().and_then(|t| t.pane_at(i)) {
                 if let Some((mode, sgr, pixel)) = mouse_mode_for(pane) {
                     if matches!(mode, MouseTracking::ButtonEvent | MouseTracking::AnyEvent) {
-                        // Button 0 (left) with +32 motion bit.
+                        // Button 0 (left) with +32 motion bit + modifiers.
                         let (cx, cy) = self.mouse_report_coords(i, x, y, pixel);
-                        let bytes = encode_mouse(sgr, 32, cx, cy, true);
+                        let bytes =
+                            encode_mouse(sgr, 32 | mouse_mod_bits(self.modifiers), cx, cy, true);
                         pane.send_input(&bytes);
                     }
                 }

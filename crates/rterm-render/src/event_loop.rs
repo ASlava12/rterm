@@ -345,9 +345,12 @@ impl ApplicationHandler<UserEvent> for App {
                     Ime::Commit(text) => {
                         self.ime_preedit.clear();
                         if !text.is_empty() {
-                            if let Some(pane) = self.focused_pane() {
-                                pane.send_input(text.as_bytes());
-                            }
+                            // Route through the broadcast-aware dispatch so
+                            // committed IME text reaches every pane when
+                            // broadcast is on (and resets the scroll offset),
+                            // exactly like ordinary typed keystrokes —
+                            // previously it went only to the focused pane.
+                            self.dispatch_input_bytes(text.as_bytes());
                         }
                     }
                     // Composition in progress — store the preedit for
@@ -394,16 +397,20 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = position;
-                // Three drag flavours fire `handle_drag`: text selection
+                // Drag flavours that fire `handle_drag`: text selection
                 // inside a pane (`mouse_dragging`), split-divider drag
-                // (`gap_dragging`), and tab-strip live-reorder
-                // (`tab_dragging`). Without the third gate the tab drag
-                // payload never reached `handle_drag` and tabs only
-                // shuffled on release.
+                // (`gap_dragging`), tab-strip live-reorder (`tab_dragging`),
+                // and — crucially — a button held in a pane whose shell
+                // enabled motion reporting (`mouse_pty_pane`, ?1002/?1003).
+                // Without that last gate `handle_drag`'s motion-report block
+                // was dead code, so drag-select in vim (`mouse=a`) / tmux
+                // copy-mode sent only press+release, never the motion
+                // reports in between.
                 if self.mouse_dragging
                     || self.gap_dragging.is_some()
                     || self.tab_dragging.is_some()
                     || self.tab_drag_pending.is_some()
+                    || self.mouse_pty_pane.is_some()
                 {
                     self.handle_drag(position.x, position.y);
                 }

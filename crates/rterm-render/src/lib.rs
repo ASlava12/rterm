@@ -6605,7 +6605,8 @@ impl App {
                             self.cursor_pos.y,
                             pixel,
                         );
-                        let bytes = encode_mouse(sgr, 0, cx, cy, false);
+                        let bytes =
+                            encode_mouse(sgr, mouse_mod_bits(self.modifiers), cx, cy, false);
                         pane.send_input(&bytes);
                     }
                 }
@@ -8128,12 +8129,39 @@ fn encode_mouse(sgr: bool, button: u32, col: u16, row: u16, press: bool) -> Vec<
         let suffix = if press { 'M' } else { 'm' };
         format!("\x1b[<{};{};{}{}", button, col + 1, row + 1, suffix).into_bytes()
     } else {
-        // Legacy X10. Release encodes as button 3.
-        let b = if press { (button & 0xff) as u8 + 32 } else { 3 + 32 };
+        // Legacy X10. Release encodes as button 3. `saturating_add`
+        // guards the `+32` bias against a button byte that already sits
+        // near 255 (e.g. a wheel button with modifier bits OR'd in) —
+        // without it that addition can overflow `u8` and panic in debug.
+        let b = if press {
+            ((button & 0xff) as u8).saturating_add(32)
+        } else {
+            3 + 32
+        };
         let x = ((col + 1).saturating_add(32)).min(255) as u8;
         let y = ((row + 1).saturating_add(32)).min(255) as u8;
         vec![0x1b, b'[', b'M', b, x, y]
     }
+}
+
+/// xterm mouse-report modifier bits OR'd into the button (`Cb`) field:
+/// Shift = 4, Meta/Alt = 8, Control = 16. Distinct from the keyboard
+/// modifier encoding (`xterm_mod_code`), which uses the `1 + bitsum`
+/// form. Applied at every mouse-report site so a modified click/drag/
+/// wheel reports the modifier the way a TUI expects.
+fn mouse_mod_bits(mods: winit::keyboard::ModifiersState) -> u32 {
+    use winit::keyboard::ModifiersState;
+    let mut b = 0;
+    if mods.contains(ModifiersState::SHIFT) {
+        b |= 4;
+    }
+    if mods.contains(ModifiersState::ALT) {
+        b |= 8;
+    }
+    if mods.contains(ModifiersState::CONTROL) {
+        b |= 16;
+    }
+    b
 }
 
 /// Read mouse mode of a pane's terminal. Returns `Some((mode, sgr,
@@ -8789,6 +8817,32 @@ mod tests {
         assert_eq!(toml_escape_basic_string("a\x1bb"), "a\\u001Bb");
         assert_eq!(toml_escape_basic_string("a\0b"), "a\\u0000b");
         assert_eq!(toml_escape_basic_string("a\x7fb"), "a\\u007Fb");
+    }
+
+    #[test]
+    fn mouse_mod_bits_maps_xterm_button_modifiers() {
+        use winit::keyboard::ModifiersState as M;
+        assert_eq!(mouse_mod_bits(M::empty()), 0);
+        assert_eq!(mouse_mod_bits(M::SHIFT), 4);
+        assert_eq!(mouse_mod_bits(M::ALT), 8);
+        assert_eq!(mouse_mod_bits(M::CONTROL), 16);
+        assert_eq!(mouse_mod_bits(M::SHIFT | M::ALT | M::CONTROL), 4 | 8 | 16);
+    }
+
+    #[test]
+    fn encode_mouse_carries_modifier_bits_and_never_overflows_x10() {
+        // SGR: modifiers OR'd into the Cb field are visible in the report.
+        // Ctrl+left-press at col 5,row 3 (0-based) → button 0|16 = 16, 1-based.
+        assert_eq!(encode_mouse(true, 16, 5, 3, true), b"\x1b[<16;6;4M".to_vec());
+        // Shift+wheel-up → button 64|4.
+        assert_eq!(encode_mouse(true, 64 | 4, 0, 0, true), b"\x1b[<68;1;1M".to_vec());
+        // X10 with all modifiers on a wheel button must not overflow the
+        // `+32`-biased button byte (65|4|8|16 = 93 → 93+32 = 125).
+        let x10 = encode_mouse(false, 65 | 4 | 8 | 16, 0, 0, true);
+        assert_eq!(x10, vec![0x1b, b'[', b'M', 125, 33, 33]);
+        // A pathological over-255 button saturates instead of panicking.
+        let sat = encode_mouse(false, 0xff, 0, 0, true);
+        assert_eq!(sat[3], 255u8);
     }
 
     #[test]
