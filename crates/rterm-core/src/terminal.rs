@@ -3163,6 +3163,13 @@ impl<'a> TerminalPerform<'a> {
                     self.cursor.col = 0;
                 }
                 7 => *self.autowrap = set,
+                // ?3 (DECCOLM) — 80/132-column switch. Deliberately ignored:
+                // the window size is user-controlled, so letting a remote
+                // escape resize it (xterm's behaviour) is wrong here, and
+                // honouring only the clear-screen side effect without the
+                // real column change would garble apps that then draw for
+                // 132 columns. Matches kitty / alacritty (ignore DECCOLM).
+                3 => {}
                 // ?12 (AT&T extension) — cursor blink. Some apps toggle it
                 // alongside DECSCUSR; honour it as a synonym.
                 12 => *self.cursor_should_blink = set,
@@ -3173,6 +3180,17 @@ impl<'a> TerminalPerform<'a> {
                         self.grid_mut().clear();
                     } else {
                         self.switch_screen(PRIMARY);
+                    }
+                }
+                // ?1048 — save (set) / restore (reset) the cursor, like
+                // DECSC / DECRC but toggled by mode rather than ESC 7 / 8.
+                // Some ncurses enter/exit-ca sequences bracket output with
+                // this instead of the bundled ?1049.
+                1048 => {
+                    if set {
+                        self.save_cursor();
+                    } else {
+                        self.restore_cursor();
                     }
                 }
                 1049 => {
@@ -3194,6 +3212,13 @@ impl<'a> TerminalPerform<'a> {
                 }
                 1004 => *self.focus_tracking = set,
                 1006 => *self.sgr_mouse = set,
+                // ?1005 (UTF-8) / ?1015 (urxvt) — legacy extended mouse
+                // encodings that predate SGR ?1006. Intentionally not
+                // implemented: they're effectively extinct (surviving apps
+                // also negotiate ?1006, which we support) and their byte
+                // encodings would need a separate encoder. Accepted as a
+                // no-op so they don't read as "unknown mode".
+                1005 | 1015 => {}
                 // DECSET ?1007 — alternate scroll mode (wheel→cursor keys
                 // on the alt-screen when mouse tracking is off).
                 1007 => *self.alternate_scroll = set,
@@ -6595,6 +6620,19 @@ mod tests {
         assert!(t.bracketed_paste());
         t.advance(b"\x1b[?2004l");
         assert!(!t.bracketed_paste());
+    }
+
+    #[test]
+    fn decset_1048_saves_and_restores_cursor() {
+        // ?1048 saves (h) / restores (l) the cursor, like DECSC / DECRC.
+        let mut t = term(10, 5);
+        t.advance(b"\x1b[3;5H"); // CUP → 0-based (row 2, col 4)
+        assert_eq!(t.cursor(), Position { col: 4, row: 2 });
+        t.advance(b"\x1b[?1048h"); // save
+        t.advance(b"\x1b[1;1H"); // home
+        assert_eq!(t.cursor(), Position { col: 0, row: 0 });
+        t.advance(b"\x1b[?1048l"); // restore
+        assert_eq!(t.cursor(), Position { col: 4, row: 2 });
     }
 
     #[test]
