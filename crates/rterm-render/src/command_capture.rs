@@ -228,6 +228,10 @@ impl CommandBuffer {
 pub(crate) struct CommandCapture {
     buffer: Mutex<CommandBuffer>,
     history: Option<Arc<Mutex<rterm_history::History>>>,
+    /// History bucket for this pane — the launch/palette profile name, or
+    /// `*` for a default-shell pane. Keeps a profile / SSH pane's command
+    /// history separate from the local one (see `rterm_history`).
+    context: String,
     /// Monotonic counter bumped every time `feed` mutates the
     /// buffer (i.e. on a non-empty, non-pure-control input).
     /// The renderer polls this to detect "did the user just
@@ -237,12 +241,21 @@ pub(crate) struct CommandCapture {
 }
 
 impl CommandCapture {
-    pub(crate) fn new(history: Option<Arc<Mutex<rterm_history::History>>>) -> Self {
+    pub(crate) fn new(
+        history: Option<Arc<Mutex<rterm_history::History>>>,
+        context: String,
+    ) -> Self {
         Self {
             buffer: Mutex::new(CommandBuffer::new()),
             history,
+            context: if context.is_empty() { "*".to_string() } else { context },
             generation: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// This pane's history context bucket (profile name or `*`).
+    pub(crate) fn context(&self) -> &str {
+        &self.context
     }
 
     /// Feed a chunk of bytes through the buffer + record any
@@ -261,7 +274,7 @@ impl CommandCapture {
         let Some(history) = self.history.as_ref() else { return };
         let Ok(history) = history.lock() else { return };
         for cmd in commands {
-            if let Err(e) = history.record(&cmd) {
+            if let Err(e) = history.record(&cmd, &self.context) {
                 tracing::debug!(error = %e, "history record failed");
             }
         }
@@ -451,7 +464,7 @@ mod tests {
         let history = Arc::new(Mutex::new(
             rterm_history::History::open(":memory:").unwrap(),
         ));
-        let cap = CommandCapture::new(Some(history.clone()));
+        let cap = CommandCapture::new(Some(history.clone()), "*".to_string());
         cap.feed(b"ls -la\r");
         cap.feed(b"git status\r");
         cap.feed(b"ls -la\r"); // duplicate
@@ -501,7 +514,7 @@ mod tests {
         // Pin that every feed (even pure control) advances the
         // counter — backspaces / Ctrl+U change the prefix the
         // popup is matching against just like a typed letter.
-        let cap = CommandCapture::new(None);
+        let cap = CommandCapture::new(None, "*".to_string());
         let g0 = cap.generation();
         cap.feed(b"a");
         let g1 = cap.generation();
@@ -516,7 +529,7 @@ mod tests {
 
     #[test]
     fn command_capture_current_input_through_wrapper() {
-        let cap = CommandCapture::new(None);
+        let cap = CommandCapture::new(None, "*".to_string());
         cap.feed(b"vim ~/.bashrc");
         assert_eq!(cap.current_input(), "vim ~/.bashrc");
         // Bare Ctrl+U clears the line — popup must see an empty
@@ -529,7 +542,7 @@ mod tests {
     fn command_capture_silent_when_history_disabled() {
         // `None` history disables capture entirely — feed should be
         // a no-op (no panic) even on large input.
-        let cap = CommandCapture::new(None);
+        let cap = CommandCapture::new(None, "*".to_string());
         cap.feed(b"any command\r");
         cap.feed(b"another\r");
         // No assertion needed beyond "no panic"; cap.history is None

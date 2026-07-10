@@ -21,13 +21,18 @@
 //!
 //! ```sql
 //! CREATE TABLE commands (
-//!     text       TEXT PRIMARY KEY NOT NULL,
+//!     text       TEXT NOT NULL,
 //!     count      INTEGER NOT NULL DEFAULT 1,
 //!     last_used  INTEGER NOT NULL,   -- unix seconds
 //!     first_used INTEGER NOT NULL,   -- unix seconds
-//!     context    TEXT NOT NULL DEFAULT '*'  -- per-host bucket (future)
+//!     context    TEXT NOT NULL DEFAULT '*',  -- per-profile / per-host bucket
+//!     PRIMARY KEY (text, context)
 //! );
 //! ```
+//! The composite key means the same command in two contexts (e.g. the
+//! local `*` bucket and an `ssh-prod` profile bucket) is two rows, so
+//! `suggest` can scope to a pane's context. Databases created by older
+//! versions (single `text` PK) are migrated in place on open.
 //!
 //! ## Operations
 //!
@@ -104,18 +109,52 @@ impl History {
         // returns SQLITE_BUSY immediately and the command record is
         // silently dropped; a short retry window absorbs the overlap.
         conn.busy_timeout(std::time::Duration::from_millis(250)).ok();
+        // Migrate an older single-`text`-PRIMARY-KEY table to the
+        // composite `(text, context)` key so per-context (per-profile /
+        // per-host) history buckets are distinct rows rather than one
+        // shared row whose context is overwritten on each record. Detected
+        // by the PK spanning exactly one column; the rebuild preserves all
+        // existing rows (their context stays `*`).
+        let old_single_pk = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('commands') WHERE pk > 0",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n == 1)
+            .unwrap_or(false);
+        if old_single_pk {
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE commands RENAME TO commands_old;
+                 CREATE TABLE commands (
+                     text       TEXT NOT NULL,
+                     count      INTEGER NOT NULL DEFAULT 1,
+                     last_used  INTEGER NOT NULL,
+                     first_used INTEGER NOT NULL,
+                     context    TEXT NOT NULL DEFAULT '*',
+                     PRIMARY KEY (text, context)
+                 );
+                 INSERT INTO commands (text, count, last_used, first_used, context)
+                     SELECT text, count, last_used, first_used, context FROM commands_old;
+                 DROP TABLE commands_old;
+                 COMMIT;",
+            )
+            .context("migrate history schema to composite key")?;
+        }
         conn.execute_batch(
             // No secondary indexes: the only query (`text LIKE ?
-            // ESCAPE '\\'`) can't use them (see the module doc), so the
-            // former `count`/`last_used` index pair only taxed every
-            // write. `DROP INDEX IF EXISTS` cleans them off DBs created
-            // by older versions.
+            // ESCAPE '\\'` scoped by context) can't use them (see the
+            // module doc), so the former `count`/`last_used` index pair
+            // only taxed every write. `DROP INDEX IF EXISTS` cleans them
+            // off DBs created by older versions.
             "CREATE TABLE IF NOT EXISTS commands (
-                 text       TEXT PRIMARY KEY NOT NULL,
+                 text       TEXT NOT NULL,
                  count      INTEGER NOT NULL DEFAULT 1,
                  last_used  INTEGER NOT NULL,
                  first_used INTEGER NOT NULL,
-                 context    TEXT NOT NULL DEFAULT '*'
+                 context    TEXT NOT NULL DEFAULT '*',
+                 PRIMARY KEY (text, context)
              );
              DROP INDEX IF EXISTS idx_commands_count;
              DROP INDEX IF EXISTS idx_commands_last_used;",
@@ -132,24 +171,25 @@ impl History {
     /// If the command already exists, `count` is incremented and
     /// `last_used` is bumped. The original `first_used` stays as-is,
     /// useful for "this command was first seen X months ago" stats.
-    pub fn record(&self, text: &str) -> Result<()> {
+    pub fn record(&self, text: &str, context: &str) -> Result<()> {
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return Ok(());
         }
+        let ctx = if context.is_empty() { "*" } else { context };
         let now = now_unix();
-        // `ON CONFLICT (text) DO UPDATE` is the canonical "upsert"
-        // SQLite spelling. It does the right thing even when the
-        // table is empty — INSERT first, then if PRIMARY KEY
-        // conflict, run the UPDATE clause. Atomic in one statement.
+        // `ON CONFLICT (text, context) DO UPDATE` is the canonical
+        // "upsert" SQLite spelling against the composite key — the same
+        // command in a different context (profile / host bucket) is a
+        // distinct row. Atomic in one statement.
         self.conn
             .execute(
-                "INSERT INTO commands (text, count, last_used, first_used)
-                 VALUES (?1, 1, ?2, ?2)
-                 ON CONFLICT(text) DO UPDATE SET
+                "INSERT INTO commands (text, count, last_used, first_used, context)
+                 VALUES (?1, 1, ?2, ?2, ?3)
+                 ON CONFLICT(text, context) DO UPDATE SET
                      count = count + 1,
                      last_used = excluded.last_used",
-                params![trimmed, now],
+                params![trimmed, now, ctx],
             )
             .context("record command")?;
         Ok(())
@@ -161,7 +201,7 @@ impl History {
     /// `count DESC, last_used DESC, text ASC` — frequency wins,
     /// recency breaks ties, alphabetical breaks the rest so the list
     /// is stable across queries.
-    pub fn suggest(&self, prefix: &str, limit: usize) -> Result<Vec<Suggestion>> {
+    pub fn suggest(&self, prefix: &str, limit: usize, context: &str) -> Result<Vec<Suggestion>> {
         // Cap the limit before it is used as an allocation hint and as
         // an SQL parameter: `Vec::with_capacity(usize::MAX)` aborts
         // with "capacity overflow", and `usize::MAX as i64` wraps to
@@ -173,18 +213,22 @@ impl History {
         // user typing `git_` doesn't suddenly match `git-status` /
         // `gita-status` / etc. ASCII `\` precedes the literal byte.
         let pattern = like_escape(prefix) + "%";
+        let ctx = if context.is_empty() { "*" } else { context };
+        // Scope suggestions to the pane's context bucket so a profile /
+        // SSH pane sees its own history, isolated from the local `*`
+        // bucket. A fresh bucket simply starts empty and fills up.
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT text, count, last_used
                  FROM commands
-                 WHERE text LIKE ?1 ESCAPE '\\'
+                 WHERE context = ?3 AND text LIKE ?1 ESCAPE '\\'
                  ORDER BY count DESC, last_used DESC, text ASC
                  LIMIT ?2",
             )
             .context("prepare suggest")?;
         let rows = stmt
-            .query_map(params![pattern, limit as i64], |row| {
+            .query_map(params![pattern, limit as i64, ctx], |row| {
                 Ok(Suggestion {
                     text: row.get(0)?,
                     count: row.get::<_, i64>(1)? as u32,
@@ -291,9 +335,82 @@ mod tests {
     }
 
     #[test]
+    fn suggest_is_scoped_by_context() {
+        let h = open_mem();
+        h.record("prod-cmd", "ssh-prod").unwrap();
+        h.record("local-cmd", "*").unwrap();
+        // The same text in two contexts is two distinct rows.
+        h.record("shared", "*").unwrap();
+        h.record("shared", "ssh-prod").unwrap();
+
+        let prod: Vec<String> = h
+            .suggest("", 10, "ssh-prod")
+            .unwrap()
+            .into_iter()
+            .map(|s| s.text)
+            .collect();
+        assert!(prod.contains(&"prod-cmd".to_string()));
+        assert!(prod.contains(&"shared".to_string()));
+        assert!(!prod.contains(&"local-cmd".to_string()), "local bucket stays isolated");
+
+        let local: Vec<String> = h
+            .suggest("", 10, "*")
+            .unwrap()
+            .into_iter()
+            .map(|s| s.text)
+            .collect();
+        assert!(local.contains(&"local-cmd".to_string()));
+        assert!(local.contains(&"shared".to_string()));
+        assert!(!local.contains(&"prod-cmd".to_string()));
+    }
+
+    #[test]
+    fn migrates_old_single_pk_schema_preserving_rows() {
+        let path = std::env::temp_dir().join(format!(
+            "rterm-hist-migrate-{}-{}.db",
+            std::process::id(),
+            "t"
+        ));
+        let _ = std::fs::remove_file(&path);
+        // Build a DB with the OLD single-`text`-PRIMARY-KEY schema + a row.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE commands (
+                     text       TEXT PRIMARY KEY NOT NULL,
+                     count      INTEGER NOT NULL DEFAULT 1,
+                     last_used  INTEGER NOT NULL,
+                     first_used INTEGER NOT NULL,
+                     context    TEXT NOT NULL DEFAULT '*'
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO commands (text, count, last_used, first_used, context)
+                 VALUES ('old cmd', 3, 100, 50, '*')",
+                [],
+            )
+            .unwrap();
+        }
+        // Opening via `History` migrates the schema in place.
+        let h = History::open(&path).unwrap();
+        let s = h.suggest("old", 10, "*").unwrap();
+        assert_eq!(s.len(), 1, "migrated row survives");
+        assert_eq!(s[0].text, "old cmd");
+        assert_eq!(s[0].count, 3);
+        // The composite key now works: same text, different context.
+        h.record("old cmd", "ssh-prod").unwrap();
+        assert_eq!(h.suggest("old", 10, "ssh-prod").unwrap().len(), 1);
+        // The original `*` bucket is untouched.
+        assert_eq!(h.suggest("old", 10, "*").unwrap()[0].count, 3);
+        drop(h);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn record_then_lookup_round_trips() {
         let h = open_mem();
-        h.record("ls -la").unwrap();
+        h.record("ls -la", "*").unwrap();
         let entry = h.lookup("ls -la").unwrap().expect("entry exists");
         assert_eq!(entry.text, "ls -la");
         assert_eq!(entry.count, 1);
@@ -307,19 +424,19 @@ mod tests {
         // aborted on `Vec::with_capacity(usize::MAX)` and the
         // `as i64` wrap turned the LIMIT into -1 (unbounded).
         let h = open_mem();
-        h.record("ls").unwrap();
-        h.record("ls -la").unwrap();
-        let out = h.suggest("ls", usize::MAX).expect("suggest");
+        h.record("ls", "*").unwrap();
+        h.record("ls -la", "*").unwrap();
+        let out = h.suggest("ls", usize::MAX, "*").expect("suggest");
         assert_eq!(out.len(), 2);
         // Zero limit stays zero rows, not "no limit".
-        assert!(h.suggest("ls", 0).expect("suggest").is_empty());
+        assert!(h.suggest("ls", 0, "*").expect("suggest").is_empty());
     }
 
     #[test]
     fn record_dedupes_and_increments_count() {
         let h = open_mem();
         for _ in 0..7 {
-            h.record("git status").unwrap();
+            h.record("git status", "*").unwrap();
         }
         let e = h.lookup("git status").unwrap().unwrap();
         assert_eq!(e.count, 7, "count should track all 7 submissions");
@@ -330,9 +447,9 @@ mod tests {
     #[test]
     fn record_ignores_empty_and_whitespace_only() {
         let h = open_mem();
-        h.record("").unwrap();
-        h.record("   ").unwrap();
-        h.record("\t\n  ").unwrap();
+        h.record("", "*").unwrap();
+        h.record("   ", "*").unwrap();
+        h.record("\t\n  ", "*").unwrap();
         assert!(h.is_empty().unwrap(), "no rows should land for empty inputs");
     }
 
@@ -341,8 +458,8 @@ mod tests {
         // Capture path strips outer whitespace before recording so
         // "  ls\n  " and "ls" collapse into one row.
         let h = open_mem();
-        h.record("  ls  ").unwrap();
-        h.record("ls").unwrap();
+        h.record("  ls  ", "*").unwrap();
+        h.record("ls", "*").unwrap();
         assert_eq!(h.len().unwrap(), 1);
         let e = h.lookup("ls").unwrap().unwrap();
         assert_eq!(e.count, 2);
@@ -353,13 +470,13 @@ mod tests {
         // Three commands, identical prefix, distinct frequencies.
         let h = open_mem();
         for _ in 0..3 {
-            h.record("git status").unwrap();
+            h.record("git status", "*").unwrap();
         }
         for _ in 0..7 {
-            h.record("git commit").unwrap();
+            h.record("git commit", "*").unwrap();
         }
-        h.record("git log").unwrap();
-        let s = h.suggest("git ", 10).unwrap();
+        h.record("git log", "*").unwrap();
+        let s = h.suggest("git ", 10, "*").unwrap();
         assert_eq!(s.len(), 3);
         // Highest count first.
         assert_eq!(s[0].text, "git commit");
@@ -371,9 +488,9 @@ mod tests {
     fn suggest_respects_limit() {
         let h = open_mem();
         for i in 0..50 {
-            h.record(&format!("cmd-{i}")).unwrap();
+            h.record(&format!("cmd-{i}"), "*").unwrap();
         }
-        let s = h.suggest("cmd-", 10).unwrap();
+        let s = h.suggest("cmd-", 10, "*").unwrap();
         assert_eq!(s.len(), 10, "limit should clamp the result set");
     }
 
@@ -381,12 +498,12 @@ mod tests {
     fn suggest_empty_prefix_returns_global_top_n() {
         let h = open_mem();
         for _ in 0..2 {
-            h.record("ls").unwrap();
+            h.record("ls", "*").unwrap();
         }
         for _ in 0..5 {
-            h.record("vim").unwrap();
+            h.record("vim", "*").unwrap();
         }
-        let s = h.suggest("", 10).unwrap();
+        let s = h.suggest("", 10, "*").unwrap();
         assert_eq!(s.len(), 2);
         // `vim` has count 5, `ls` has count 2.
         assert_eq!(s[0].text, "vim");
@@ -396,10 +513,10 @@ mod tests {
     #[test]
     fn suggest_returns_only_matching_prefix() {
         let h = open_mem();
-        h.record("ls").unwrap();
-        h.record("ls -la").unwrap();
-        h.record("vim").unwrap();
-        let s = h.suggest("ls", 10).unwrap();
+        h.record("ls", "*").unwrap();
+        h.record("ls -la", "*").unwrap();
+        h.record("vim", "*").unwrap();
+        let s = h.suggest("ls", 10, "*").unwrap();
         assert_eq!(s.len(), 2);
         for entry in &s {
             assert!(entry.text.starts_with("ls"), "{:?}", entry.text);
@@ -413,14 +530,14 @@ mod tests {
         // contract that LIKE special bytes are escaped so a user's
         // input is treated as a literal prefix.
         let h = open_mem();
-        h.record("git-status").unwrap();
-        h.record("git_alias").unwrap();
-        let s = h.suggest("git_", 10).unwrap();
+        h.record("git-status", "*").unwrap();
+        h.record("git_alias", "*").unwrap();
+        let s = h.suggest("git_", 10, "*").unwrap();
         assert_eq!(s.len(), 1, "underscore must be literal, not wildcard");
         assert_eq!(s[0].text, "git_alias");
         // `%` literal in user input must also stay literal.
-        h.record("100% done").unwrap();
-        let s = h.suggest("100%", 10).unwrap();
+        h.record("100% done", "*").unwrap();
+        let s = h.suggest("100%", 10, "*").unwrap();
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].text, "100% done");
     }
@@ -441,8 +558,8 @@ mod tests {
     #[test]
     fn clear_removes_every_row() {
         let h = open_mem();
-        h.record("a").unwrap();
-        h.record("b").unwrap();
+        h.record("a", "*").unwrap();
+        h.record("b", "*").unwrap();
         assert_eq!(h.len().unwrap(), 2);
         h.clear().unwrap();
         assert!(h.is_empty().unwrap());
@@ -451,8 +568,8 @@ mod tests {
     #[test]
     fn forget_drops_only_the_named_entry() {
         let h = open_mem();
-        h.record("keep").unwrap();
-        h.record("drop").unwrap();
+        h.record("keep", "*").unwrap();
+        h.record("drop", "*").unwrap();
         assert!(h.forget("drop").unwrap());
         assert_eq!(h.len().unwrap(), 1);
         assert!(h.lookup("drop").unwrap().is_none());
@@ -474,7 +591,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        h.record("cmd").unwrap();
+        h.record("cmd", "*").unwrap();
         let (count, first, last): (i64, i64, i64) = h
             .conn
             .query_row(
@@ -506,7 +623,7 @@ mod tests {
         tmp.push("nested");
         tmp.push("history.sqlite3");
         let h = History::open(&tmp).expect("open with auto-mkdir");
-        h.record("touch").unwrap();
+        h.record("touch", "*").unwrap();
         assert_eq!(h.len().unwrap(), 1);
         drop(h);
         // Clean up the tree.

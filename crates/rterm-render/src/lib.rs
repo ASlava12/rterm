@@ -1811,6 +1811,7 @@ impl Pane {
         last_output_ms: Arc<AtomicU64>,
         keepalive: Box<dyn std::any::Any + Send>,
         history: Option<Arc<Mutex<rterm_history::History>>>,
+        history_context: String,
     ) -> Self {
         let mut uid = PANE_UID_COUNTER.fetch_add(1, Ordering::Relaxed);
         if uid == 0 {
@@ -1842,8 +1843,15 @@ impl Pane {
             progress: Mutex::new(None),
             last_foreground_process: Mutex::new(None),
             keepalive,
-            command_capture: command_capture::CommandCapture::new(history),
+            command_capture: command_capture::CommandCapture::new(history, history_context),
         }
+    }
+
+    /// This pane's command-history context bucket (profile name, or `*`).
+    /// Suggestions are scoped to it so a profile / SSH pane sees its own
+    /// history.
+    pub(crate) fn history_context(&self) -> &str {
+        self.command_capture.context()
     }
 
     /// Write `bytes` to the pane's PTY *and* feed them through the
@@ -7622,6 +7630,9 @@ impl App {
         let pane_uid = pane.uid;
         let current_input = pane.command_capture.current_input();
         let generation = pane.command_capture.generation();
+        // Scope suggestions to the focused pane's history bucket (its
+        // profile context), so a profile / SSH pane sees its own history.
+        let history_context = pane.history_context().to_string();
         // Detect "did the user type something new?" by watching
         // the generation counter; bumps mean we should re-arm the
         // debouncer.
@@ -7639,6 +7650,7 @@ impl App {
             pane_uid,
             generation,
             &current_input,
+            &history_context,
             last_input_at,
             now,
         );
@@ -9962,6 +9974,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Box::new(()),
             None, // tests don't need a history store
+            "*".to_string(),
         )
     }
 

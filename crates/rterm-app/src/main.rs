@@ -206,7 +206,22 @@ impl GuiSpawner {
         let io: Arc<dyn TerminalIo> = Arc::new(PtyAdapter(control));
 
         let keepalive: Box<dyn std::any::Any + Send> = Box::new((pty, join, exit_watcher));
-        Ok(Pane::new(terminal, io, program, alive, activity, last_output_ms, keepalive, self.history.clone()))
+        // History bucket: the profile name isolates a profile / SSH pane's
+        // command history; a default-shell pane records under `*`.
+        let history_context = profile
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "*".to_string());
+        Ok(Pane::new(
+            terminal,
+            io,
+            program,
+            alive,
+            activity,
+            last_output_ms,
+            keepalive,
+            self.history.clone(),
+            history_context,
+        ))
     }
 }
 
@@ -279,7 +294,8 @@ fn run_history_subcommand<I: IntoIterator<Item = String>>(args: I) -> Result<()>
                     prefix = a;
                 }
             }
-            let rows = h.suggest(&prefix, limit).context("--history list")?;
+            // `--history list` inspects the default (local `*`) bucket.
+            let rows = h.suggest(&prefix, limit, "*").context("--history list")?;
             if rows.is_empty() {
                 if prefix.is_empty() {
                     eprintln!("--history: empty (capture is on but no commands have been submitted yet)");

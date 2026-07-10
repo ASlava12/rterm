@@ -149,6 +149,8 @@ pub(crate) fn compute(
     focused_pane_uid: u64,
     capture_generation: u64,
     current_input: &str,
+    // History bucket to query — the focused pane's profile context.
+    context: &str,
     last_input_at: Option<Instant>,
     now: Instant,
 ) -> StateTransition {
@@ -190,7 +192,7 @@ pub(crate) fn compute(
     // popup has scroll headroom without re-querying per nav.
     let query_limit = (cfg.popup_rows as usize * 3).max(15);
     let entries = match history.lock() {
-        Ok(h) => h.suggest(current_input, query_limit).unwrap_or_default(),
+        Ok(h) => h.suggest(current_input, query_limit, context).unwrap_or_default(),
         Err(_) => Vec::new(),
     };
     if entries.is_empty() {
@@ -318,7 +320,7 @@ mod tests {
         let h = Arc::new(Mutex::new(History::open(":memory:").unwrap()));
         let now = Instant::now();
         let recent = now - std::time::Duration::from_millis(50); // below 150ms
-        match compute(&cfg, &h, None, 1, 0, "gi", Some(recent), now) {
+        match compute(&cfg, &h, None, 1, 0, "gi", "*", Some(recent), now) {
             StateTransition::Keep => {}
             other => panic!("expected Keep, got {other:?}"),
         }
@@ -328,11 +330,11 @@ mod tests {
     fn compute_opens_popup_after_debounce() {
         let cfg = HistoryPopupConfig::default();
         let h = Arc::new(Mutex::new(History::open(":memory:").unwrap()));
-        h.lock().unwrap().record("git status").unwrap();
-        h.lock().unwrap().record("git commit").unwrap();
+        h.lock().unwrap().record("git status", "*").unwrap();
+        h.lock().unwrap().record("git commit", "*").unwrap();
         let now = Instant::now();
         let old = now - std::time::Duration::from_millis(300);
-        let res = compute(&cfg, &h, None, 1, 0, "git", Some(old), now);
+        let res = compute(&cfg, &h, None, 1, 0, "git", "*", Some(old), now);
         match res {
             StateTransition::Open(p) => {
                 assert_eq!(p.prefix, "git");
@@ -362,7 +364,7 @@ mod tests {
             scroll: 0,
             last_seen_generation: 0,
         };
-        match compute(&cfg, &h, Some(&existing), 1, 1, "gi", Some(old), now) {
+        match compute(&cfg, &h, Some(&existing), 1, 1, "gi", "*", Some(old), now) {
             StateTransition::Close => {}
             other => panic!("expected Close, got {other:?}"),
         }
@@ -381,7 +383,7 @@ mod tests {
             scroll: 0,
             last_seen_generation: 0,
         };
-        match compute(&cfg, &h, Some(&existing), 2, 0, "git", Some(now), now) {
+        match compute(&cfg, &h, Some(&existing), 2, 0, "git", "*", Some(now), now) {
             StateTransition::Close => {}
             other => panic!("expected Close on pane switch, got {other:?}"),
         }
@@ -402,7 +404,7 @@ mod tests {
             last_seen_generation: 0,
         };
         // Prefix changed; no matches in empty DB → close.
-        match compute(&cfg, &h, Some(&existing), 1, 1, "qweasdzxc", Some(old), now) {
+        match compute(&cfg, &h, Some(&existing), 1, 1, "qweasdzxc", "*", Some(old), now) {
             StateTransition::Close => {}
             other => panic!("expected Close, got {other:?}"),
         }
@@ -423,7 +425,7 @@ mod tests {
             last_seen_generation: 0,
         };
         // Same prefix and capture_generation → Keep.
-        match compute(&cfg, &h, Some(&existing), 1, 0, "git", Some(old), now) {
+        match compute(&cfg, &h, Some(&existing), 1, 0, "git", "*", Some(old), now) {
             StateTransition::Keep => {}
             other => panic!("expected Keep, got {other:?}"),
         }
@@ -437,7 +439,7 @@ mod tests {
         };
         let h = Arc::new(Mutex::new(History::open(":memory:").unwrap()));
         let now = Instant::now();
-        match compute(&cfg, &h, None, 1, 0, "git", Some(now), now) {
+        match compute(&cfg, &h, None, 1, 0, "git", "*", Some(now), now) {
             StateTransition::Close => {}
             other => panic!("expected Close, got {other:?}"),
         }

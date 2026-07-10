@@ -268,7 +268,7 @@
   ресайзе, P2-фон-режим (`?` background select), aspect-ratio из
   raster-атрибутов.
 
-- [~] **Профили и SSH-менеджер (WindTerm-режим).** (в работе, 2026-07)
+- [x] **Профили и SSH-менеджер (WindTerm-режим).** (2026-07)
   Сохранённые подключения: `[[profiles]]` в конфиге (имя, команда/
   `ssh host`, cwd, тема, env), палитра «New tab with profile…»,
   быстрое переключение. Колонка `context` в history.db — готовый
@@ -293,8 +293,16 @@
   4 сайта (count/filter/dispatch/render). Выбор → `new_tab_with_profile`
   → новый таб через профиль (общий `push_new_tab`). Тест на индекс-
   маппинг. Профиль-табы подсвечены accent-цветом.
-  **Stage 3 (далее):** `context`-колонка history.db → фильтр подсказок
-  по хосту; per-tab тема профиля (сейчас тема — только launch-time).
+  **Stage 3 (сделано):** per-context история подсказок. history.db —
+  композитный ключ `(text, context)` вместо `text PRIMARY KEY`
+  (+in-place миграция старых БД, сохраняет строки, тест); `record(text,
+  context)` / `suggest(prefix, limit, context)` бакетируют по контексту.
+  Проброс: `CommandCapture.context` → `Pane::new(.., history_context)` →
+  `GuiSpawner` ставит имя профиля (иначе `*`); `suggestion_popup::compute`
+  берёт контекст фокусной панели. Профиль/SSH-панель видит свою историю,
+  изолированную от локальной `*`. Тесты: изоляция + миграция.
+  DoD выполнен. Осталось опционально: per-tab тема профиля (сейчас тема —
+  только launch-time), `--history --context <name>` для инспекции бакетов.
 
 - [ ] **Лигатуры (Fira Code / JetBrains Mono).**
   Сейчас `set_monospace_width` + пер-ячеечная сетка разбивают
