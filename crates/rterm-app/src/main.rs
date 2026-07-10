@@ -2287,6 +2287,8 @@ const MAX_RESTORE_TABS: usize = 256;
 fn parse_session(body: &str) -> Option<(Vec<rterm_render::RestoredTab>, Option<usize>)> {
     #[derive(serde::Deserialize)]
     struct Saved {
+        // Legacy top-level active index (single-window format); newer
+        // multi-window sessions mark the focused tab per-block.
         #[serde(default)]
         active: Option<usize>,
         #[serde(default)]
@@ -2296,6 +2298,8 @@ fn parse_session(body: &str) -> Option<(Vec<rterm_render::RestoredTab>, Option<u
     struct SavedTab {
         cwd: Option<String>,
         title: Option<String>,
+        #[serde(default)]
+        active: Option<bool>,
     }
     let parsed: Saved = toml::from_str(body).ok()?;
     if parsed.tab.len() > MAX_RESTORE_TABS {
@@ -2305,6 +2309,14 @@ fn parse_session(body: &str) -> Option<(Vec<rterm_render::RestoredTab>, Option<u
             "session file claims more tabs than the restore cap; truncating",
         );
     }
+    // Prefer a per-tab `active = true` (the append format); fall back to
+    // the legacy top-level `active` index.
+    let active = parsed
+        .tab
+        .iter()
+        .take(MAX_RESTORE_TABS)
+        .position(|t| t.active == Some(true))
+        .or(parsed.active);
     let tabs: Vec<_> = parsed
         .tab
         .into_iter()
@@ -2314,14 +2326,24 @@ fn parse_session(body: &str) -> Option<(Vec<rterm_render::RestoredTab>, Option<u
             title: t.title,
         })
         .collect();
-    Some((tabs, parsed.active))
+    Some((tabs, active))
 }
 
 fn read_session(
     path: &std::path::Path,
 ) -> Option<(Vec<rterm_render::RestoredTab>, Option<usize>)> {
-    let body = std::fs::read_to_string(path).ok()?;
-    parse_session(&body)
+    // Claim the session atomically: rename it aside, then read + delete the
+    // copy. This clears the file so appended tabs don't restore on every
+    // future launch, and is race-safe against a concurrent window exit —
+    // its append lands in a fresh `session.toml` (preserved for next time)
+    // rather than being truncated away.
+    let tmp = path.with_extension(format!("restoring.{}", std::process::id()));
+    if std::fs::rename(path, &tmp).is_err() {
+        return None; // no session file, or another launch claimed it first
+    }
+    let body = std::fs::read_to_string(&tmp).ok();
+    let _ = std::fs::remove_file(&tmp);
+    parse_session(&body?)
 }
 
 #[cfg(test)]
@@ -3033,6 +3055,47 @@ mod tests {
         assert_eq!(tabs[0].title, None);
         assert_eq!(tabs[1].cwd.as_deref(), Some("/tmp/b"));
         assert_eq!(tabs[1].title.as_deref(), Some("build"));
+    }
+
+    #[test]
+    fn parse_session_prefers_per_tab_active_and_merges_appends() {
+        // Append format: no top-level `active`; each window marks its
+        // focused tab per-block. Two windows' blocks concatenated (as
+        // `append_user_private` would leave them) parse as one merged
+        // session, and the FIRST `active = true` wins.
+        let body = r#"
+            [[tab]]
+            cwd = "/w1/a"
+
+            [[tab]]
+            active = true
+            cwd = "/w1/b"
+
+            [[tab]]
+            active = true
+            cwd = "/w2/a"
+        "#;
+        let (tabs, active) = parse_session(body).expect("parses");
+        assert_eq!(tabs.len(), 3, "both windows' tabs merged");
+        assert_eq!(active, Some(1), "first per-tab active wins");
+        assert_eq!(tabs[2].cwd.as_deref(), Some("/w2/a"));
+    }
+
+    #[test]
+    fn read_session_reads_and_clears_the_file() {
+        // `read_session` must consume the file so appended tabs don't
+        // restore on every future launch.
+        let path = std::env::temp_dir().join(format!(
+            "rterm-session-test-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, "[[tab]]\ncwd = \"/tmp/x\"\n").unwrap();
+        let (tabs, _) = read_session(&path).expect("reads");
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0].cwd.as_deref(), Some("/tmp/x"));
+        // File is gone after the claim; a second read finds nothing.
+        assert!(!path.exists(), "session file cleared after restore");
+        assert!(read_session(&path).is_none());
     }
 
     #[test]

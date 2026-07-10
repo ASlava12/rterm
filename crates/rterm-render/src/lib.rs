@@ -7712,10 +7712,14 @@ impl App {
     fn write_session(&self) {
         let Some(path) = self.session_path.as_ref() else { return };
         let mut out = String::new();
-        out.push_str("# rterm session — generated on exit.\n");
-        out.push_str(&format!("active = {}\n\n", self.active_tab));
-        for tab in &self.tabs {
+        for (i, tab) in self.tabs.iter().enumerate() {
             out.push_str("[[tab]]\n");
+            // Mark the focused tab per-block (not a top-level `active = N`)
+            // so multiple windows can append without a key collision — the
+            // restore picks the first `active = true`.
+            if i == self.active_tab {
+                out.push_str("active = true\n");
+            }
             // Same fallback chain as the live snapshot: OSC 7-reported cwd
             // first, then `/proc/<pid>/cwd` on Linux for shells (dash, some
             // fish setups) that don't emit OSC 7. Without this, sessions
@@ -7735,11 +7739,18 @@ impl App {
             }
             out.push('\n');
         }
+        if out.is_empty() {
+            return; // no tabs to persist
+        }
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        match write_user_private(path, out.as_bytes()) {
-            Ok(()) => tracing::info!(path = %path.display(), "session saved"),
+        // Append rather than overwrite so a second window exiting doesn't
+        // clobber the first window's saved session — the launch-time
+        // restore reads-and-clears (rename) so appends don't accumulate
+        // across restarts. See `append_user_private` for the atomicity.
+        match append_user_private(path, out.as_bytes()) {
+            Ok(()) => tracing::info!(path = %path.display(), "session appended"),
             Err(e) => tracing::warn!("session save failed: {e}"),
         }
     }
@@ -8589,6 +8600,27 @@ fn write_user_private(
     {
         std::fs::write(path, contents)
     }
+}
+
+/// Append `contents` to `path` (creating it 0600 if new). A single
+/// `write_all` under `O_APPEND` is atomic on POSIX, so two processes
+/// appending their session concurrently concatenate cleanly rather than
+/// clobbering each other. Windows `FILE_APPEND_DATA` serialises likewise.
+fn append_user_private(
+    path: &std::path::Path,
+    contents: &[u8],
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(contents)?;
+    f.flush()
 }
 
 fn abbreviate_home(path: &str) -> String {

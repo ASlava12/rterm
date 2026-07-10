@@ -328,8 +328,16 @@
 
 ## P3 — Технический долг (низкий приоритет, по случаю)
 
-- [ ] Session-файл: межпроцессный лок или merge (сейчас две инстанции
-  затирают сессии друг друга, last-writer-wins).
+- [x] Session-файл: две инстанции больше не затирают сессии. (2026-07)
+  Merge вместо last-writer-wins, БЕЗ новой зависимости: `write_session`
+  теперь append (`append_user_private`, `O_APPEND` — конкурентные
+  аппенды атомарны на POSIX / `FILE_APPEND_DATA` на Windows), фокусный
+  таб помечается per-block `active = true` (нет racy top-level ключа).
+  `read_session` делает atomic-rename → read → delete: восстановление
+  race-safe (in-flight аппенд уходит в свежий `session.toml`, не
+  теряется) и чистит файл, чтобы табы не восстанавливались на каждом
+  запуске. Старый формат (top-level `active = N`) читается как fallback.
+  Тесты: per-tab active + merge аппендов + read-and-clear.
 - [x] Update-check: prerelease-тег больше не считается новее релиза. (2026-07)
   `parse_version` теперь возвращает `(release, Option<prerelease>)`
   (раньше складывал `-rc.N` в тот же вектор → `[0,0,13,1] > [0,0,13]`).
