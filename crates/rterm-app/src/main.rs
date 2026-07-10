@@ -81,6 +81,26 @@ impl PaneSpawner for GuiSpawner {
     }
 
     fn spawn_pane(&self, cwd: Option<&str>) -> Result<Pane> {
+        self.spawn_with_profile(cwd, self.active_profile.as_ref())
+    }
+
+    fn spawn_pane_with_profile(&self, cwd: Option<&str>, profile: &str) -> Result<Pane> {
+        // Resolve the named profile; an unknown name falls back to the
+        // session's launch profile (or the default shell).
+        let resolved = self.config.profile(profile).or(self.active_profile.as_ref());
+        if self.config.profile(profile).is_none() {
+            tracing::warn!(profile, "unknown profile; using default");
+        }
+        self.spawn_with_profile(cwd, resolved)
+    }
+}
+
+impl GuiSpawner {
+    fn spawn_with_profile(
+        &self,
+        cwd: Option<&str>,
+        profile: Option<&rterm_config::ProfileConfig>,
+    ) -> Result<Pane> {
         // Start with a generous default; the renderer will resize to fit on
         // first sync_terminal_size pass.
         let initial = Size { cols: 100, rows: 32 };
@@ -133,9 +153,8 @@ impl PaneSpawner for GuiSpawner {
         )));
         let terminal: SharedTerminal = Arc::new(Mutex::new(term));
 
-        // A launch profile (`--profile`) overrides the command when it
-        // names one; otherwise fall back to the default `[shell]`.
-        let profile = self.active_profile.as_ref();
+        // The profile (launch `--profile` or a palette pick) overrides
+        // the command when it names one; otherwise the default `[shell]`.
         let (program, args) = match profile.and_then(|p| p.program.as_deref()) {
             Some(prog) => (
                 prog.to_string(),
@@ -2061,6 +2080,7 @@ fn run_gui(
         session_active,
         render_test_only,
         active_theme: initial_theme,
+        profile_names: config.profiles.iter().map(|p| p.name.clone()).collect(),
         on_theme_change,
         on_image_auto_detect_change,
         on_highlight_change,

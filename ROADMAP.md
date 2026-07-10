@@ -283,10 +283,18 @@
   `[appearance].theme`. CLI `--list-profiles [--json]`. Доки в обоих
   шаблонах + `--help`. Тесты: парсинг+резолв профилей. Проверено:
   GUI-запуск с профилем спавнит его команду.
-  **Stage 2 (далее):** палитра «New tab with profile: X» (динамические
-  entry из `config.profiles` → per-tab профиль через
-  `PaneSpawner::spawn_with_profile(name)`), быстрое переключение.
-  **Stage 3:** `context`-колонка history.db → фильтр подсказок по хосту.
+  **Stage 2 (сделано):** палитра «New tab with profile: X». `PaneSpawner`
+  расширен `spawn_pane_with_profile(cwd, name)` (default → `spawn_pane`);
+  `GuiSpawner` рефакторен — общий inherent `spawn_with_profile(cwd,
+  profile)`, оба trait-метода делегируют. App держит `profile_names`
+  (из `RunConfig`), палитра рендерит entry после builtins+plugin;
+  индекс-маппинг `[builtins][custom][profiles]` централизован в
+  `PaletteState::entry/label/len` (+`PaletteEntry` enum), обновлены все
+  4 сайта (count/filter/dispatch/render). Выбор → `new_tab_with_profile`
+  → новый таб через профиль (общий `push_new_tab`). Тест на индекс-
+  маппинг. Профиль-табы подсвечены accent-цветом.
+  **Stage 3 (далее):** `context`-колонка history.db → фильтр подсказок
+  по хосту; per-tab тема профиля (сейчас тема — только launch-time).
 
 - [ ] **Лигатуры (Fira Code / JetBrains Mono).**
   Сейчас `set_monospace_width` + пер-ячеечная сетка разбивают

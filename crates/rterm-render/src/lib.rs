@@ -1893,6 +1893,15 @@ pub trait PaneSpawner: Send + Sync {
     /// (typically the parent process's current dir).
     fn spawn_pane(&self, cwd: Option<&str>) -> Result<Pane>;
 
+    /// Spawn a pane running a saved `[[profiles]]` preset by name (command
+    /// / cwd / env). Used by the "New tab with profile…" palette entry. An
+    /// unknown name should fall back to the default shell. The default impl
+    /// ignores the profile and delegates to [`spawn_pane`] so spawners that
+    /// don't support profiles still work.
+    fn spawn_pane_with_profile(&self, cwd: Option<&str>, _profile: &str) -> Result<Pane> {
+        self.spawn_pane(cwd)
+    }
+
     /// Hand the spawner a [`Waker`] so the PTY reader threads it
     /// creates can ask the (otherwise idle) event loop to repaint when
     /// the shell produces output. Called once after the event loop
@@ -2034,13 +2043,25 @@ enum ScrollNav {
 }
 
 
+/// One entry in the merged command-palette list, resolved from a flat
+/// index by [`PaletteState::entry`]. The index layout is:
+/// `[built-ins][plugin actions][profile new-tabs]`.
+enum PaletteEntry<'a> {
+    Builtin(AppAction),
+    Custom(&'a str),
+    Profile(&'a str),
+}
+
 #[derive(Debug, Clone)]
 struct PaletteState {
     query: String,
     /// Plugin-registered action names (in addition to `AppAction::ALL`).
     custom: Vec<String>,
+    /// Configured profile names — each becomes a "New tab with profile:
+    /// <name>" entry after the built-ins and plugin actions.
+    profiles: Vec<String>,
     /// Indices into the merged action list. 0..ALL.len() = built-ins;
-    /// ALL.len()..ALL.len()+custom.len() = plugin actions.
+    /// then plugin actions, then profile new-tabs.
     filtered: Vec<usize>,
     selected: usize,
     /// Top of the visible window into `filtered` — pulled along when
@@ -2048,6 +2069,45 @@ struct PaletteState {
     /// always on screen. With `PALETTE_VISIBLE_ROWS` items rendered
     /// per frame, the viewport is `scroll_offset..scroll_offset+N`.
     scroll_offset: usize,
+}
+
+impl PaletteState {
+    /// Total palette entries: built-ins + plugin actions + profile tabs.
+    fn len(&self) -> usize {
+        AppAction::ALL.len() + self.custom.len() + self.profiles.len()
+    }
+
+    /// Resolve a flat index into its palette entry, or `None` when out of
+    /// range. Single source of truth for the `[built-ins][custom][profiles]`
+    /// index layout used by filtering, rendering and dispatch.
+    fn entry(&self, idx: usize) -> Option<PaletteEntry<'_>> {
+        let n_builtin = AppAction::ALL.len();
+        let n_custom = self.custom.len();
+        if idx < n_builtin {
+            Some(PaletteEntry::Builtin(AppAction::ALL[idx].0))
+        } else if idx < n_builtin + n_custom {
+            Some(PaletteEntry::Custom(&self.custom[idx - n_builtin]))
+        } else {
+            self.profiles
+                .get(idx - n_builtin - n_custom)
+                .map(|s| PaletteEntry::Profile(s))
+        }
+    }
+
+    /// Human-readable label for the entry at `idx` (as shown / searched).
+    fn label(&self, idx: usize) -> String {
+        let n_builtin = AppAction::ALL.len();
+        let n_custom = self.custom.len();
+        if idx < n_builtin {
+            AppAction::ALL[idx].1.to_string()
+        } else if idx < n_builtin + n_custom {
+            format!("⚙ {}", self.custom[idx - n_builtin])
+        } else if let Some(name) = self.profiles.get(idx - n_builtin - n_custom) {
+            format!("New tab with profile: {name}")
+        } else {
+            String::new()
+        }
+    }
 }
 
 const PALETTE_VISIBLE_ROWS: usize = 20;
@@ -2657,6 +2717,12 @@ pub struct RunConfig {
     /// the App treats this as the implicit `default`. Used by the
     /// settings overlay's selection marker and as the cycle anchor.
     pub active_theme: String,
+    /// Names of the configured `[[profiles]]` presets, in config order.
+    /// Populate the "New tab with profile: <name>" command-palette
+    /// entries; selecting one spawns a tab via
+    /// [`PaneSpawner::spawn_pane_with_profile`]. Empty when no profiles
+    /// are defined.
+    pub profile_names: Vec<String>,
     /// Callback the App invokes when the user picks a new theme via
     /// `cycle_theme` / settings UI. Receives the canonical theme name
     /// (e.g. `"dracula"`). rterm-app uses this to persist the choice
@@ -2855,6 +2921,9 @@ pub struct App {
     /// `cycle_theme` to find the next entry and by the settings overlay
     /// to show what's selected.
     active_theme: String,
+    /// Configured profile names, for the "New tab with profile…" palette
+    /// entries (see [`RunConfig::profile_names`]).
+    profile_names: Vec<String>,
     /// Persistence hook: called with the canonical theme name whenever
     /// the user switches via `cycle_theme` / settings UI / Lua
     /// `set_theme`. `None` means "don't persist" (e.g. tests).
@@ -3098,6 +3167,7 @@ impl App {
             session_active,
             render_test_only,
             active_theme,
+            profile_names,
             on_theme_change,
             on_image_auto_detect_change,
             on_highlight_change,
@@ -3186,6 +3256,7 @@ impl App {
             } else {
                 active_theme
             },
+            profile_names,
             on_theme_change,
             on_image_auto_detect_change,
             on_highlight_change,
@@ -4927,6 +4998,16 @@ impl App {
         }
     }
 
+    fn spawn_pane_with_profile(&self, cwd: Option<&str>, profile: &str) -> Option<Pane> {
+        match self.spawner.spawn_pane_with_profile(cwd, profile) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!(profile, "spawn pane with profile failed: {e:#}");
+                None
+            }
+        }
+    }
+
     /// Snapshot the focused pane's last-known cwd (from OSC 7), if any.
     fn focused_cwd(&self) -> Option<String> {
         let pane = self.focused_pane()?;
@@ -4952,6 +5033,24 @@ impl App {
     /// `cwd` is `None`.
     fn new_tab_in(&mut self, cwd: Option<&str>) {
         let Some(pane) = self.spawn_pane(cwd) else { return };
+        self.push_new_tab(pane, cwd);
+    }
+
+    /// Open a new tab whose pane runs the named `[[profiles]]` preset
+    /// (command / cwd / env). Driven by the "New tab with profile…"
+    /// palette entries. Inherits the focused pane's cwd unless the profile
+    /// pins one (the spawner decides).
+    fn new_tab_with_profile(&mut self, profile: &str) {
+        let cwd = self.focused_cwd();
+        let Some(pane) = self.spawn_pane_with_profile(cwd.as_deref(), profile) else {
+            return;
+        };
+        self.push_new_tab(pane, cwd.as_deref());
+    }
+
+    /// Append `pane` as a fresh tab, focus it, and fire `tab.new`. Shared
+    /// by the plain and profile new-tab paths.
+    fn push_new_tab(&mut self, pane: Pane, cwd: Option<&str>) {
         // Remember where the user came from so Ctrl+Shift+Tab toggles
         // back to it. Without this, opening a new tab strands the
         // previous focus until the user manually navigates back.
@@ -6737,10 +6836,12 @@ impl App {
 
     fn open_palette(&mut self) {
         let custom = self.events.list_actions();
-        let total = AppAction::ALL.len() + custom.len();
+        let profiles = self.profile_names.clone();
+        let total = AppAction::ALL.len() + custom.len() + profiles.len();
         self.palette = Some(PaletteState {
             query: String::new(),
             custom,
+            profiles,
             filtered: (0..total).collect(),
             selected: 0,
             scroll_offset: 0,
@@ -6748,9 +6849,9 @@ impl App {
         self.events.emit("palette.open", "");
     }
 
-    /// Total number of palette items: built-ins + plugin actions.
+    /// Total number of palette items: built-ins + plugin actions + profiles.
     fn palette_action_count(palette: &PaletteState) -> usize {
-        AppAction::ALL.len() + palette.custom.len()
+        palette.len()
     }
 
 
@@ -6772,11 +6873,7 @@ impl App {
             } else {
                 let mut scored: Vec<(usize, i32)> = (0..total)
                     .filter_map(|idx| {
-                        let label = if idx < AppAction::ALL.len() {
-                            AppAction::ALL[idx].1.to_lowercase()
-                        } else {
-                            p.custom[idx - AppAction::ALL.len()].to_lowercase()
-                        };
+                        let label = p.label(idx).to_lowercase();
                         fuzzy_score(&label, &q).map(|s| (idx, s))
                     })
                     .collect();
@@ -6820,23 +6917,34 @@ impl App {
     fn execute_palette_selection(&mut self) -> bool {
         // Pull resolution out of the palette before closing — close_palette
         // takes ownership.
-        let resolved: Option<(Option<AppAction>, Option<String>)> = self.palette.as_ref().and_then(|p| {
+        // Resolve to a concrete action BEFORE close_palette (which drops
+        // the state). `Builtin` → typed dispatch, `Custom` → plugin action
+        // by name, `Profile` → new tab running that profile.
+        enum Resolved {
+            Builtin(AppAction),
+            Custom(String),
+            Profile(String),
+        }
+        let resolved: Option<Resolved> = self.palette.as_ref().and_then(|p| {
             let idx = *p.filtered.get(p.selected)?;
-            if idx < AppAction::ALL.len() {
-                Some((Some(AppAction::ALL[idx].0), None))
-            } else {
-                let name = p.custom[idx - AppAction::ALL.len()].clone();
-                Some((None, Some(name)))
+            match p.entry(idx)? {
+                PaletteEntry::Builtin(a) => Some(Resolved::Builtin(a)),
+                PaletteEntry::Custom(name) => Some(Resolved::Custom(name.to_string())),
+                PaletteEntry::Profile(name) => Some(Resolved::Profile(name.to_string())),
             }
         });
         self.close_palette();
         match resolved {
-            Some((Some(a), _)) => self.dispatch_action(a),
-            Some((None, Some(name))) => {
+            Some(Resolved::Builtin(a)) => self.dispatch_action(a),
+            Some(Resolved::Custom(name)) => {
                 self.events.run_action(&name);
                 false
             }
-            _ => false,
+            Some(Resolved::Profile(name)) => {
+                self.new_tab_with_profile(&name);
+                false
+            }
+            None => false,
         }
     }
 
@@ -8546,6 +8654,29 @@ mod tests {
     /// output, which lives in absolute coords now.
     fn ap(row: i64, col: u16) -> AbsPoint {
         AbsPoint { abs_row: row, col }
+    }
+
+    #[test]
+    fn palette_entry_index_layout() {
+        // The merged palette index space is [built-ins][plugin][profiles];
+        // pin that `entry` / `label` / `len` resolve each range correctly,
+        // since dispatch keys off it (a wrong split fires the wrong action).
+        let p = PaletteState {
+            query: String::new(),
+            custom: vec!["plug_a".into(), "plug_b".into()],
+            profiles: vec!["ssh".into()],
+            filtered: Vec::new(),
+            selected: 0,
+            scroll_offset: 0,
+        };
+        let n = AppAction::ALL.len();
+        assert_eq!(p.len(), n + 3);
+        assert!(matches!(p.entry(0), Some(PaletteEntry::Builtin(_))));
+        assert!(matches!(p.entry(n), Some(PaletteEntry::Custom("plug_a"))));
+        assert!(matches!(p.entry(n + 1), Some(PaletteEntry::Custom("plug_b"))));
+        assert!(matches!(p.entry(n + 2), Some(PaletteEntry::Profile("ssh"))));
+        assert_eq!(p.label(n + 2), "New tab with profile: ssh");
+        assert!(p.entry(n + 3).is_none());
     }
 
     #[test]

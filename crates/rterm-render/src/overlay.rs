@@ -64,14 +64,11 @@ impl App {
             }
             for cmd_idx_pos in start..end {
                 let cmd_idx = p.filtered[cmd_idx_pos];
-                let (label, is_custom) = if cmd_idx < AppAction::ALL.len() {
-                    (AppAction::ALL[cmd_idx].1.to_string(), false)
-                } else {
-                    (
-                        format!("⚙ {}", p.custom[cmd_idx - AppAction::ALL.len()]),
-                        true,
-                    )
-                };
+                let label = p.label(cmd_idx);
+                // Built-ins render muted; plugin actions AND profile
+                // new-tabs (everything past the built-in range) get the
+                // accent colour so they stand out.
+                let is_custom = cmd_idx >= AppAction::ALL.len();
                 let selected = cmd_idx_pos == p.selected;
                 let line = if selected {
                     format!("  ► {}\n", label)
