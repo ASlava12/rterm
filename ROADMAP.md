@@ -248,8 +248,14 @@
   per-frame `render` со сшивкой bg→image→glyph→overlay пассов). Поля
   `window`/`config` подняты до `pub(crate)` (читаются снаружи); GpuState
   реэкспортится `pub use gpu::GpuState`. `lib.rs` 11.4k → 10.8k.
+  Затем `payload.rs` — 18 чистых `String`-билдеров payload'ов плагинных
+  событий (`pane_*_payload` / `tab_*_payload` / `progress_*` /
+  `pane_exit_payload` / `pane_split_payload`) + текст-снапшоты
+  (`scrollback_text_snapshot(_capped)` / `grid_text_snapshot`) + мапы
+  имя→код (`cursor_shape_code` / `mouse_mode_code`). Реэкспорт
+  `pub(crate) use payload::*` — вызовы из `event_loop.rs` и тесты в
+  `lib.rs` резолвятся без правок. `lib.rs` 10.8k → 10.5k.
   Осталось (по желанию): распилить сам `window_event` на per-arm методы;
-  вынести payload-фнки плагинных событий в `payload.rs`;
   input-кодировщики (`named_key_bytes`/`encode_mouse`/…) — в `input.rs`
   вместе с их тестами. (2) чистая математика (геометрия, хит-тесты,
   кодирование) — в свободные функции ради юнит-тестов; (3) убрать
