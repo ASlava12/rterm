@@ -1812,6 +1812,7 @@ impl Pane {
         keepalive: Box<dyn std::any::Any + Send>,
         history: Option<Arc<Mutex<rterm_history::History>>>,
         history_context: String,
+        redact_pasted: bool,
     ) -> Self {
         let mut uid = PANE_UID_COUNTER.fetch_add(1, Ordering::Relaxed);
         if uid == 0 {
@@ -1843,7 +1844,11 @@ impl Pane {
             progress: Mutex::new(None),
             last_foreground_process: Mutex::new(None),
             keepalive,
-            command_capture: command_capture::CommandCapture::new(history, history_context),
+            command_capture: command_capture::CommandCapture::new(
+                history,
+                history_context,
+                redact_pasted,
+            ),
         }
     }
 
@@ -9975,6 +9980,7 @@ mod tests {
             Box::new(()),
             None, // tests don't need a history store
             "*".to_string(),
+            false,
         )
     }
 

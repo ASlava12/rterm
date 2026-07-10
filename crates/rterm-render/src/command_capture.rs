@@ -50,6 +50,15 @@ pub(crate) struct CommandBuffer {
     /// `\x1b` and are dropping bytes until a terminator. `None` =
     /// normal byte-by-byte path.
     state: EscapeState,
+    /// CSI parameter bytes accumulated in the `Csi` state, used only to
+    /// recognise the bracketed-paste markers `CSI 200 ~` / `CSI 201 ~`.
+    /// Capped so a long CSI can't grow it.
+    csi_params: Vec<u8>,
+    /// `true` once the current line has absorbed any bracketed-paste
+    /// content (a `CSI 200 ~` was seen). Lets the recorder redact
+    /// pasted secrets from history. Reset when the line is submitted or
+    /// killed (Ctrl+U / Ctrl+C).
+    line_has_paste: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +86,8 @@ impl CommandBuffer {
         Self {
             raw: Vec::with_capacity(128),
             state: EscapeState::Normal,
+            csi_params: Vec::new(),
+            line_has_paste: false,
         }
     }
 
@@ -84,7 +95,7 @@ impl CommandBuffer {
     /// every `\r` / `\n` encountered (in submission order). Empty
     /// commands are filtered. The internal buffer continues to
     /// accumulate post-submit bytes for the next command line.
-    pub(crate) fn feed(&mut self, bytes: &[u8]) -> Vec<String> {
+    pub(crate) fn feed(&mut self, bytes: &[u8]) -> Vec<(String, bool)> {
         let mut out = Vec::new();
         for &b in bytes {
             match self.state {
@@ -103,9 +114,17 @@ impl CommandBuffer {
                         // boundary.
                         self.pop_char();
                     }
-                    0x15 => self.raw.clear(), // Ctrl+U
+                    0x15 => {
+                        // Ctrl+U — kill line, so the paste taint clears too.
+                        self.raw.clear();
+                        self.line_has_paste = false;
+                    }
                     0x17 => self.kill_word(), // Ctrl+W
-                    0x03 => self.raw.clear(), // Ctrl+C
+                    0x03 => {
+                        // Ctrl+C — cancel line, clear paste taint.
+                        self.raw.clear();
+                        self.line_has_paste = false;
+                    }
                     0x09 => {}                // TAB — see module doc
                     0x00..=0x1f => {
                         // Drop any other C0 control byte silently.
@@ -113,7 +132,10 @@ impl CommandBuffer {
                     _ => self.raw.push(b),
                 },
                 EscapeState::EscSeen => match b {
-                    b'[' => self.state = EscapeState::Csi,
+                    b'[' => {
+                        self.state = EscapeState::Csi;
+                        self.csi_params.clear();
+                    }
                     b']' => self.state = EscapeState::Osc,
                     b'P' | b'X' | b'_' | b'^' => self.state = EscapeState::Dcs,
                     _ => {
@@ -125,7 +147,15 @@ impl CommandBuffer {
                 EscapeState::Csi => {
                     // CSI terminator: any byte in 0x40..=0x7e.
                     if (0x40..=0x7e).contains(&b) {
+                        // Recognise bracketed-paste start (`CSI 200 ~`) so
+                        // the recorder can redact the pasted secret. The
+                        // markers themselves are dropped either way.
+                        if b == b'~' && self.csi_params == b"200" {
+                            self.line_has_paste = true;
+                        }
                         self.state = EscapeState::Normal;
+                    } else if self.csi_params.len() < 8 {
+                        self.csi_params.push(b);
                     }
                 }
                 EscapeState::Osc => {
@@ -185,14 +215,19 @@ impl CommandBuffer {
     /// Take whatever's currently in the buffer as a UTF-8 string,
     /// trim outer whitespace, return `Some` if non-empty. Resets
     /// the buffer.
-    fn take_command(&mut self) -> Option<String> {
+    /// Take the current line as `(command, had_paste)` and reset the
+    /// line's paste taint. `had_paste` is `true` when the line included
+    /// any bracketed-paste content — the caller redacts it from history
+    /// when `[history] redact_pasted` is on.
+    fn take_command(&mut self) -> Option<(String, bool)> {
         let bytes = std::mem::take(&mut self.raw);
+        let had_paste = std::mem::replace(&mut self.line_has_paste, false);
         let s = String::from_utf8(bytes).ok()?;
         let trimmed = s.trim();
         if trimmed.is_empty() {
             None
         } else {
-            Some(trimmed.to_string())
+            Some((trimmed.to_string(), had_paste))
         }
     }
 
@@ -232,6 +267,10 @@ pub(crate) struct CommandCapture {
     /// `*` for a default-shell pane. Keeps a profile / SSH pane's command
     /// history separate from the local one (see `rterm_history`).
     context: String,
+    /// When true, commands that included bracketed-paste content are NOT
+    /// recorded to history — so a pasted password / token doesn't end up
+    /// in the suggestion store. Config `[history] redact_pasted`.
+    redact_pasted: bool,
     /// Monotonic counter bumped every time `feed` mutates the
     /// buffer (i.e. on a non-empty, non-pure-control input).
     /// The renderer polls this to detect "did the user just
@@ -244,11 +283,13 @@ impl CommandCapture {
     pub(crate) fn new(
         history: Option<Arc<Mutex<rterm_history::History>>>,
         context: String,
+        redact_pasted: bool,
     ) -> Self {
         Self {
             buffer: Mutex::new(CommandBuffer::new()),
             history,
             context: if context.is_empty() { "*".to_string() } else { context },
+            redact_pasted,
             generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -273,7 +314,11 @@ impl CommandCapture {
         drop(buf);
         let Some(history) = self.history.as_ref() else { return };
         let Ok(history) = history.lock() else { return };
-        for cmd in commands {
+        for (cmd, had_paste) in commands {
+            // Redact pasted secrets from history when the option is on.
+            if self.redact_pasted && had_paste {
+                continue;
+            }
             if let Err(e) = history.record(&cmd, &self.context) {
                 tracing::debug!(error = %e, "history record failed");
             }
@@ -303,7 +348,7 @@ mod tests {
     use super::*;
 
     fn one(buf: &mut CommandBuffer, input: &[u8]) -> Vec<String> {
-        buf.feed(input)
+        buf.feed(input).into_iter().map(|(c, _)| c).collect()
     }
 
     #[test]
@@ -436,7 +481,7 @@ mod tests {
         out.extend(b.feed(b"[A\r"));
         // The `\x1b[A` is dropped; only "ls" remains, submitted on
         // the `\r`.
-        assert_eq!(out, vec!["ls".to_string()]);
+        assert_eq!(out, vec![("ls".to_string(), false)]);
     }
 
     #[test]
@@ -464,7 +509,7 @@ mod tests {
         let history = Arc::new(Mutex::new(
             rterm_history::History::open(":memory:").unwrap(),
         ));
-        let cap = CommandCapture::new(Some(history.clone()), "*".to_string());
+        let cap = CommandCapture::new(Some(history.clone()), "*".to_string(), false);
         cap.feed(b"ls -la\r");
         cap.feed(b"git status\r");
         cap.feed(b"ls -la\r"); // duplicate
@@ -472,6 +517,39 @@ mod tests {
         assert_eq!(h.len().unwrap(), 2);
         let entry = h.lookup("ls -la").unwrap().unwrap();
         assert_eq!(entry.count, 2, "ls -la submitted twice");
+    }
+
+    #[test]
+    fn bracketed_paste_marks_the_line() {
+        // A command assembled from a bracketed paste is flagged so the
+        // recorder can redact it; a typed one is not.
+        let mut b = CommandBuffer::new();
+        let out = b.feed(b"\x1b[200~secret-token\x1b[201~\r");
+        assert_eq!(out, vec![("secret-token".to_string(), true)]);
+        // Markers themselves never leak into the command text.
+        let typed = b.feed(b"ls -la\r");
+        assert_eq!(typed, vec![("ls -la".to_string(), false)]);
+        // A `CSI 200 ~`-lookalike that isn't the paste marker (e.g. an
+        // arrow key `CSI A`) does not flag the line.
+        let arrows = b.feed(b"\x1b[Aecho hi\r");
+        assert_eq!(arrows, vec![("echo hi".to_string(), false)]);
+    }
+
+    #[test]
+    fn redact_pasted_skips_pasted_commands_only() {
+        let history = Arc::new(Mutex::new(
+            rterm_history::History::open(":memory:").unwrap(),
+        ));
+        // redact_pasted = true → pasted commands are not recorded.
+        let cap = CommandCapture::new(Some(history.clone()), "*".to_string(), true);
+        cap.feed(b"typed-cmd\r");
+        cap.feed(b"\x1b[200~pasted-secret\x1b[201~\r");
+        let h = history.lock().unwrap();
+        assert!(h.lookup("typed-cmd").unwrap().is_some(), "typed recorded");
+        assert!(
+            h.lookup("pasted-secret").unwrap().is_none(),
+            "pasted command redacted from history"
+        );
     }
 
     #[test]
@@ -486,7 +564,7 @@ mod tests {
         assert_eq!(b.current_input(), "git stat");
         // Buffer survives the read.
         let out = b.feed(b"us\r");
-        assert_eq!(out, vec!["git status".to_string()]);
+        assert_eq!(out, vec![("git status".to_string(), false)]);
         // After submit the buffer is empty.
         assert_eq!(b.current_input(), "");
     }
@@ -514,7 +592,7 @@ mod tests {
         // Pin that every feed (even pure control) advances the
         // counter — backspaces / Ctrl+U change the prefix the
         // popup is matching against just like a typed letter.
-        let cap = CommandCapture::new(None, "*".to_string());
+        let cap = CommandCapture::new(None, "*".to_string(), false);
         let g0 = cap.generation();
         cap.feed(b"a");
         let g1 = cap.generation();
@@ -529,7 +607,7 @@ mod tests {
 
     #[test]
     fn command_capture_current_input_through_wrapper() {
-        let cap = CommandCapture::new(None, "*".to_string());
+        let cap = CommandCapture::new(None, "*".to_string(), false);
         cap.feed(b"vim ~/.bashrc");
         assert_eq!(cap.current_input(), "vim ~/.bashrc");
         // Bare Ctrl+U clears the line — popup must see an empty
@@ -542,7 +620,7 @@ mod tests {
     fn command_capture_silent_when_history_disabled() {
         // `None` history disables capture entirely — feed should be
         // a no-op (no panic) even on large input.
-        let cap = CommandCapture::new(None, "*".to_string());
+        let cap = CommandCapture::new(None, "*".to_string(), false);
         cap.feed(b"any command\r");
         cap.feed(b"another\r");
         // No assertion needed beyond "no panic"; cap.history is None

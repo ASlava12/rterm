@@ -122,6 +122,12 @@ pub struct HistoryConfig {
     /// to silence the popup on single-letter commands like `ls`
     /// or `vi` where users rarely want a dropdown.
     pub min_prefix_len: u8,
+    /// When `true`, a command line that included any bracketed-paste
+    /// content is NOT written to history — so a pasted password / API
+    /// token doesn't linger in the suggestion store. `false` (default)
+    /// records pasted commands like any other. Off by default to keep
+    /// history complete; privacy-conscious users opt in.
+    pub redact_pasted: bool,
 }
 
 impl Default for HistoryConfig {
@@ -131,6 +137,7 @@ impl Default for HistoryConfig {
             popup_rows: 5,
             popup_debounce_ms: 150,
             min_prefix_len: 1,
+            redact_pasted: false,
         }
     }
 }

@@ -338,8 +338,14 @@
 - [ ] Единый `enum ActiveOverlay` для клавиатуры/мыши/рендера
   (сейчас три рукописных порядка приоритета; расхождения закрыты
   точечными фиксами, но инвариант не enforced).
-- [ ] Паста-секреты в history.db: опция redaction/opt-out для
-  bracketed-paste payload'ов в `CommandCapture`.
+- [x] Паста-секреты в history.db: опция redaction. (2026-07)
+  `[history] redact_pasted` (дефолт false). `CommandBuffer` детектит
+  bracketed-paste (`CSI 200 ~`) и метит строку; `take_command`/`feed`
+  отдают `(cmd, had_paste)`; `CommandCapture` пропускает запись
+  paste-команд при флаге. Проброс: `Pane::new(redact_pasted)` ←
+  `GuiSpawner` ← `config.history.redact_pasted`. Ctrl+U/C сбрасывают
+  taint. Тесты: детект paste (+ arrow-key ≠ paste) и пропуск записи.
+  Discovery через `--print-config`.
 - [ ] `[highlight]`: колонка `context`-стиль правил per-profile, когда
   появятся профили.
 - [x] Минорные VT-моды (из sweep). (2026-07)

@@ -221,6 +221,7 @@ impl GuiSpawner {
             keepalive,
             self.history.clone(),
             history_context,
+            self.config.history.redact_pasted,
         ))
     }
 }
