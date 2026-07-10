@@ -384,9 +384,9 @@ pub struct ShellConfig {
 
 /// A saved connection / launch preset — a named shell command plus its
 /// working directory, environment and theme. Declared as repeated
-/// `[[profiles]]` blocks. Opened via `rterm --profile <name>` (and, once
-/// wired, the "New tab with profile…" palette entry). The classic SSH
-/// case is `program = "ssh"`, `args = ["user@host"]`.
+/// `[[profiles]]` blocks. Opened via `rterm --profile <name>` or the
+/// "New tab with profile…" command-palette entry. The classic SSH case
+/// is `program = "ssh"`, `args = ["user@host"]`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProfileConfig {

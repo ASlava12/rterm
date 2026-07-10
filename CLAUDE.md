@@ -6,12 +6,13 @@ Cross-platform GPU-accelerated terminal emulator written in Rust with Lua plugin
 
 Cargo workspace at the repo root. Crates under `crates/`:
 
-- **rterm-core** — VT/ANSI state machine. Cell grid, scrollback ring, alt-screen, scroll region, full SGR (16/256/RGB), cursor motion (CUU/CUD/CUF/CUB/CUP/HVP/CHA/VPA/CNL/CPL), erase (ED/EL/ICH/DCH/IL/DL/ECH), scroll (SU/SD/RI/IND/NEL), save/restore (DECSC/DECRC + CSI s/u), DECSET/DECRST for ?25/?47/?1047/?1049/?1000/?1002/?1003/?1006/?2004, OSC 0/2 (window title), OSC 8 (hyperlinks), BEL flag, URL auto-detect. Pure data; no I/O.
-- **rterm-pty** — `portable-pty` wrapper. Exposes `Pty` (owner) and `PtyControl` (Send+Sync clonable handle for write/resize).
-- **rterm-config** — TOML config: `font.{family,size}`, `window.{width,height,opacity}`, `shell.{program,args}`, `keybindings`. Hot-reload of `init.lua` and `plugins/*.lua` is watched by `rterm-app`.
+- **rterm-core** — VT/ANSI state machine. Cell grid, scrollback ring, alt-screen, scroll region, full SGR (16/256/RGB), cursor motion (CUU/CUD/CUF/CUB/CUP/HVP/CHA/VPA/CNL/CPL), erase (ED/EL/ICH/DCH/IL/DL/ECH), scroll (SU/SD/RI/IND/NEL), save/restore (DECSC/DECRC + CSI s/u), DECSET/DECRST for ?25/?47/?1047/?1049/?1000/?1002/?1003/?1006/?1007/?1016/?1048/?2004/?2026/?5, many OSC (0/1/2 title, 4/104 palette, 7 cwd, 8 hyperlinks, 9/99/777 notify, 10/11/12 colors, 52 clipboard, 133/633 shell-integration, 1337 iTerm2), Kitty keyboard protocol (CSI u, per-screen flag stack, `kitty_kbd_stack`), inline images (iTerm2 `OSC 1337 File=`, Kitty graphics `APC G` — see `image.rs`; Sixel `DCS q` — see `sixel.rs`, with decode caps), BEL flag, URL auto-detect. Pure data; no I/O.
+- **rterm-pty** — `portable-pty` wrapper (vendored as `portable-pty-rterm`). Exposes `Pty` (owner) and `PtyControl` (Send+Sync clonable handle for write/resize).
+- **rterm-history** — bundled SQLite (`rusqlite`) command-history store. `record(text, context)` / `suggest(prefix, limit, context)`; composite `PRIMARY KEY (text, context)` isolates per shell-integration context; in-place migration of old single-`text`-PK DBs.
+- **rterm-config** — TOML config: `font.{family,size,bold_is_bright}`, `window.{width,height,opacity,os_decorations}`, `shell.{program,args,env}`, `keybindings`, `[highlight]`, `[history]` (popup + `redact_pasted`), `[[profiles]]` (SSH/launch presets, `Config::profile(name)`). Hot-reload of `init.lua` and `plugins/*.lua` is watched by `rterm-app`.
 - **rterm-plugin** — Lua 5.4 host (`mlua` vendored). `rterm.log`, `rterm.on(event, fn)`, `rterm.add_match(name, pattern, opts)` (substring or regex → fires `match` event). Events: `startup`, `ready`, `key`, `resize`, `reload`, `bell`, `tab.new`, `tab.close`, `tab.switch`, `pane.split`, `pane.close`, `pane.focus`, `pane.exit`, `pane.swap`, `scroll`, `paste`, `copy`, `link.open`, `search.start`, `search.end`, `match`.
-- **rterm-render** — winit + wgpu + glyphon (cosmic-text). Tabs with a BSP tree of horizontal **and** vertical split panes (`Tab { tree: Tree<Pane>, focus_path }`), background-quad pass (alpha-blended cell backgrounds + cursor block + hyperlink underline + search match highlight), per-cell colour rich text, mouse reporting (X10/SGR), bracketed paste detection, scrollback view via `Terminal::visible_row(offset, r)`, drag/word/line selection, clipboard via `arboard`, URL open via `open` crate, search overlay, WindTerm-style client-side syntax highlighting (`highlight.rs` — global regex rule set applied in `build_spans` to default-fg cells only; config `[highlight]`).
-- **rterm-app** — `rterm` binary. Glues the above. `--smoke` runs a headless PTY+parser pipeline; default is GUI.
+- **rterm-render** — winit + wgpu + glyphon (cosmic-text). Tabs with a BSP tree of horizontal **and** vertical split panes (`Tab { tree: Tree<Pane>, focus_path }`), background-quad pass (alpha-blended cell backgrounds + cursor block + hyperlink underline + search match highlight), per-cell colour rich text, mouse reporting (X10/SGR/SGR-pixel + alternate scroll), bracketed paste detection, scrollback view via `Terminal::visible_row(offset, r)`, drag/word/line selection, clipboard via `arboard`, URL open via `open` crate, search overlay, command palette (built-ins + custom actions + profiles), fish-style history-suggestion popup (`command_capture.rs` → rterm-history), inline image pass (`image_pass.rs`/`image_decode.rs`, animated GIF playback on an event-driven timer), session save/restore (merge-on-append), WindTerm-style client-side syntax highlighting (`highlight.rs` — global regex rule set applied in `build_spans` to default-fg cells only; config `[highlight]`). `lib.rs` is split into `input.rs` (key/mouse/paste + encoders), `event_loop.rs` (`ApplicationHandler` + redraw), `gpu.rs` (`GpuState`).
+- **rterm-app** — `rterm` binary. Glues the above. `--smoke` runs a headless PTY+parser pipeline; `--render-test` presents one clear frame; `--profile <name>` / `--list-profiles`, `--check-update`; default is GUI.
 
 ## Keybindings
 
@@ -30,7 +31,7 @@ Cargo workspace at the repo root. Crates under `crates/`:
 
 ```bash
 cargo build                       # full workspace
-cargo test --workspace            # ~251 unit tests as of writing
+cargo test --workspace            # ~647 unit tests as of writing
 cargo run -p rterm-app -- --smoke # headless CI/sanity
 cargo run -p rterm-app            # GUI (needs a display)
 ```

@@ -7,7 +7,7 @@ plugin host.
 
 Working MVP. The full pipeline runs end-to-end: PTY → ANSI/VT state machine →
 GPU renderer → window. Tabs and BSP-split panes are wired. Lua plugins observe
-~70 events and call ~50 actions. Workspace ships **400+ unit tests**,
+~70 events and call ~50 actions. Workspace ships **640+ unit tests**,
 `cargo clippy -- -D warnings` is clean.
 
 ## Target platforms
@@ -43,8 +43,18 @@ GPU renderer → window. Tabs and BSP-split panes are wired. Lua plugins observe
 - **Renderer**: winit + wgpu + glyphon (cosmic-text). Background quad pass for
   per-cell colour + cursor block + hyperlink underline + search-match
   highlight. Truecolor everywhere; bold-brightens-base-16 follows xterm.
+- **Inline images**: iTerm2 (`OSC 1337 ;File=`), Kitty graphics (`APC G`)
+  and Sixel (`DCS q`) protocols — PNG / JPEG / GIF decoded and drawn over
+  the cell grid with placement scaling and z-order. **Animated GIFs play
+  back** frame-by-frame on an event-driven timer (the loop stays idle when
+  nothing is animating). Decode caps refuse memory-bomb payloads.
 - **Tabs + BSP-split panes**: horizontal and vertical splits, zoom (tmux-style),
   swap, spatial focus, drag-reorder of tabs.
+- **Profiles / SSH**: `[[profiles]]` presets bundle a `program` + `args`
+  (the classic case being `ssh user@host`), `cwd`, `env` and `theme`.
+  Launch one with `rterm --profile <name>`, enumerate them with
+  `--list-profiles`, or pick "New tab with profile…" from the command
+  palette.
 - **Selection**: drag / double-click word / triple-click line, clipboard
   copy via `Ctrl+Shift+C` (no auto-copy).
 - **Search overlay**: literal + regex, forward / backward, `Esc` exits.
@@ -59,6 +69,11 @@ GPU renderer → window. Tabs and BSP-split panes are wired. Lua plugins observe
 - **Scrollback**: bounded ring per pane, viewport navigation with
   `Shift+PgUp/PgDn/Home/End`, single-line and half-page actions, programmatic
   scroll-to-line via plugins, scrollback save.
+- **Command history**: commands are captured per shell-integration context
+  into a bundled SQLite store and offered back as a fish-style suggestion
+  popup — debounced, scrollable, tunable via `[history]` (`popup_rows`,
+  `popup_debounce_ms`, `min_prefix_len`). Opt-in `redact_pasted` keeps
+  pasted secrets (passwords, tokens) out of the store.
 - **Hot-reload**: `config.toml`, `init.lua`, `plugins/*.lua` all watched.
   Changes are picked up without restart; plugins receive a `reload` event.
 - **Session restore**: optional `restore_session = true` writes
@@ -193,13 +208,13 @@ crates/
 
 ## Roadmap
 
-The live, prioritized work plan lives in [ROADMAP.md](ROADMAP.md) —
-quick wins (settings toggle for highlighting, Kitty placement offsets,
-CLI/panic-hook fixes), medium items (IME input, Kitty keyboard
-protocol, incremental search, broadcast input, GIF animation), and the
-headline features (Sixel graphics, profiles/SSH manager, ligatures,
-damage tracking). Items previously listed here (absolute-line
-selection, right-click context menu, tab-drag ghost label) shipped.
+The live, prioritized work plan lives in [ROADMAP.md](ROADMAP.md). What
+remains is the hard tail: font ligatures (glyph shaping), damage-tracking
+render invalidation, and detach/attach over IPC. Items previously listed
+here as future work have shipped — Kitty keyboard protocol, GIF animation,
+Sixel graphics, profiles/SSH manager, per-context command history,
+absolute-line selection, right-click context menu, and the tab-drag ghost
+label.
 
 ## License
 
