@@ -217,10 +217,15 @@
   клавиатура/мышь, `frame.rs` пайплайн RedrawRequested, `snapshot.rs`
   сбор состояния для плагинов), как уже вынесены `overlay`, `layout`,
   `window_ops`;
-  Прогресс: `input.rs` — вынесен PTY-путь ввода (`paste_clipboard` /
-  `paste_primary` / `write_paste` / `commit_paste_now` /
-  `dispatch_input_bytes` / `forward_key_to_pty`) как `impl App`; далее
-  докинуть `handle_scroll` + key-хендлеры туда же. (2) чистая математика (геометрия, хит-тесты,
+  Прогресс: `input.rs` (~690 строк) — вынесен весь горячий путь ввода
+  как `impl App`: PTY-паста (`paste_clipboard` / `paste_primary` /
+  `write_paste` / `commit_paste_now`), key→байты (`dispatch_input_bytes`
+  / `forward_key_to_pty`), колесо (`handle_scroll`) и key-диспетчеры
+  (`handle_key` / `handle_palette_key` / `handle_search_key`). `lib.rs`
+  16.0k → 15.4k. Далее: собрать оставшиеся key-хендлеры
+  (`handle_settings_key` / `handle_rename_key` / `handle_scroll_key` /
+  paste-confirm) и мышиные press/move-хендлеры в `input.rs`; затем
+  `frame.rs` (RedrawRequested-пайплайн) и `snapshot.rs`. (2) чистая математика (геометрия, хит-тесты,
   кодирование) — в свободные функции ради юнит-тестов; (3) убрать
   дублирование (инлайн-копии `close_tab_at` и т.п.), стейл-комментарии,
   мёртвый код; (4) единообразить идиомы (poison-tolerant локи,

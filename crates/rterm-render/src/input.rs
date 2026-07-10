@@ -10,12 +10,13 @@
 
 use std::sync::atomic::Ordering;
 
-use winit::event::{KeyEvent, MouseScrollDelta};
-use winit::keyboard::{Key, ModifiersState};
+use winit::event::{ElementState, KeyEvent, MouseScrollDelta};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 use crate::{
-    clamp_scroll_offset, ctrl_byte, encode_mouse, mouse_mode_for,
-    named_key_bytes, paste_confirm, App, SelectionPoint,
+    clamp_scroll_offset, ctrl_byte, encode_mouse, is_bare_modifier_key,
+    mouse_mode_for,
+    named_key_bytes, paste_confirm, word_back_delete_index, App, SelectionPoint,
 };
 
 impl App {
@@ -363,6 +364,329 @@ impl App {
                 self.dispatch_input_bytes(&out);
             } else {
                 self.dispatch_input_bytes(text.as_bytes());
+            }
+        }
+    }
+
+    /// Top-level keyboard entry. Returns `true` if the window should exit.
+    pub(crate) fn handle_key(&mut self, event: &KeyEvent) -> bool {
+        if event.state != ElementState::Pressed {
+            return false;
+        }
+        // Paste-confirmation modal owns the keyboard. It either
+        // resolves the paste (Paste / Apply / Cancel) and clears
+        // itself, or stays open absorbing every keystroke.
+        if self.paste_confirmation.is_some() {
+            self.handle_paste_confirmation_key(event);
+            return false;
+        }
+        // Suggestion popup gets first dibs on ↓ / ↑ / TAB / Esc /
+        // Enter so a popup-driven nav doesn't accidentally also
+        // walk the cursor in the shell. Returns `true` when the
+        // popup handled the key (no further forwarding); falls
+        // through otherwise. GATED on no modal overlay being up: the
+        // popup has the LOWEST render precedence (any overlay hides
+        // it), so without this guard an invisible popup would steal
+        // Esc / Tab from the visible palette / search / help / menu.
+        let modal_overlay_up = self.rename_tab.is_some()
+            || self.context_menu.is_some()
+            || self.palette.is_some()
+            || self.show_help
+            || self.show_settings
+            || self.search.is_some();
+        if !modal_overlay_up
+            && self.suggestion_popup.is_some()
+            && self.handle_suggestion_popup_key(event)
+        {
+            return false;
+        }
+        // Rename tab overlay owns the keyboard while editing.
+        if self.rename_tab.is_some() {
+            return self.handle_rename_key(event);
+        }
+        // Context menu absorbs all keys until closed.
+        if self.context_menu.is_some() {
+            return self.handle_context_menu_key(event);
+        }
+        // Command palette hijacks the keyboard.
+        if self.palette.is_some() {
+            return self.handle_palette_key(event);
+        }
+        // Help overlay swallows almost all input — toggle, Esc, and
+        // scroll keys (↑/↓/PgUp/PgDn/Home/End) to move through the
+        // keybinding cheat-sheet when it overflows.
+        if self.show_help {
+            if matches!(&event.logical_key, Key::Named(NamedKey::Escape)) {
+                self.show_help = false;
+                self.help_scroll = 0;
+                self.reset_cursor_blink();
+                return false;
+            }
+            match &event.logical_key {
+                Key::Named(NamedKey::ArrowDown) => {
+                    self.help_scroll = self.help_scroll.saturating_add(1);
+                    if let Some(state) = self.state.as_ref() {
+                        state.window.request_redraw();
+                    }
+                    return false;
+                }
+                Key::Named(NamedKey::ArrowUp) => {
+                    self.help_scroll = self.help_scroll.saturating_sub(1);
+                    if let Some(state) = self.state.as_ref() {
+                        state.window.request_redraw();
+                    }
+                    return false;
+                }
+                Key::Named(NamedKey::PageDown) => {
+                    let page = self.help_visible_lines();
+                    self.help_scroll = self.help_scroll.saturating_add(page);
+                    if let Some(state) = self.state.as_ref() {
+                        state.window.request_redraw();
+                    }
+                    return false;
+                }
+                Key::Named(NamedKey::PageUp) => {
+                    let page = self.help_visible_lines();
+                    self.help_scroll = self.help_scroll.saturating_sub(page);
+                    if let Some(state) = self.state.as_ref() {
+                        state.window.request_redraw();
+                    }
+                    return false;
+                }
+                Key::Named(NamedKey::Home) => {
+                    self.help_scroll = 0;
+                    if let Some(state) = self.state.as_ref() {
+                        state.window.request_redraw();
+                    }
+                    return false;
+                }
+                Key::Named(NamedKey::End) => {
+                    // Clamp happens in `help_spans`; an absurdly large
+                    // value here is fine.
+                    self.help_scroll = usize::MAX / 2;
+                    if let Some(state) = self.state.as_ref() {
+                        state.window.request_redraw();
+                    }
+                    return false;
+                }
+                _ => {}
+            }
+            // Allow Ctrl+Shift+H to toggle off too.
+            if self.handle_app_shortcut(event).is_some() {
+                return false;
+            }
+            return false;
+        }
+        // Settings overlay also hijacks the keyboard. Single-letter keys
+        // adjust live settings; Esc / Ctrl+Shift+, exit. See
+        // `handle_settings_key` for the active bindings.
+        if self.show_settings {
+            return self.handle_settings_key(event);
+        }
+        // Search mode hijacks the keyboard.
+        if self.search.is_some() {
+            self.handle_search_key(event);
+            return false;
+        }
+        // User-defined bindings take precedence over built-ins.
+        if let Some(exit) = self.check_user_bindings(event) {
+            return exit;
+        }
+        if let Some(exit) = self.handle_app_shortcut(event) {
+            return exit;
+        }
+        if self.handle_scroll_key(event) {
+            return false;
+        }
+        // Bare modifier keypresses (Ctrl, Shift, Alt, Super pressed by
+        // themselves) must NOT clear the on-screen selection — otherwise
+        // the very act of pressing `Ctrl+Shift+C` to copy nukes the
+        // selection mid-chord. Modifiers also can't be forwarded as PTY
+        // bytes on their own, so just return.
+        if is_bare_modifier_key(&event.logical_key) {
+            return false;
+        }
+        // Any forwarded key clears the on-screen selection and resets the
+        // cursor blink so the cursor is visible right after typing.
+        self.selection = None;
+        self.reset_cursor_blink();
+        self.forward_key_to_pty(event);
+        false
+    }
+
+    /// Returns `true` if the action selected via the palette wants the
+    /// window to exit (e.g. closing the last pane).
+    pub(crate) fn handle_palette_key(&mut self, event: &KeyEvent) -> bool {
+        // Readline-style word/line edits on the query.
+        if self.modifiers.contains(ModifiersState::CONTROL) {
+            if let Key::Character(c) = &event.logical_key {
+                match c.as_str().to_ascii_lowercase().as_str() {
+                    "w" => {
+                        if let Some(p) = self.palette.as_mut() {
+                            // `word_back_delete_index` returns a char-
+                            // boundary-safe byte index. The previous
+                            // inline `rfind(..).map(|i| i + 1)` copy
+                            // panicked in `truncate` on multi-byte
+                            // whitespace (NBSP / U+3000) — the same bug
+                            // the search overlay already fixed.
+                            let drop_from = word_back_delete_index(&p.query);
+                            p.query.truncate(drop_from);
+                        }
+                        self.refresh_palette();
+                        return false;
+                    }
+                    "u" => {
+                        if let Some(p) = self.palette.as_mut() {
+                            p.query.clear();
+                        }
+                        self.refresh_palette();
+                        return false;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Key::Named(named) = &event.logical_key {
+            match named {
+                NamedKey::Escape => {
+                    self.close_palette();
+                    return false;
+                }
+                NamedKey::Enter => {
+                    return self.execute_palette_selection();
+                }
+                NamedKey::Backspace => {
+                    if let Some(p) = self.palette.as_mut() {
+                        p.query.pop();
+                    }
+                    self.refresh_palette();
+                    return false;
+                }
+                NamedKey::ArrowDown => {
+                    self.palette_step(1);
+                    return false;
+                }
+                NamedKey::ArrowUp => {
+                    self.palette_step(-1);
+                    return false;
+                }
+                NamedKey::PageDown => {
+                    let page = self.palette_visible_rows().max(1) as isize;
+                    self.palette_step(page);
+                    return false;
+                }
+                NamedKey::PageUp => {
+                    let page = self.palette_visible_rows().max(1) as isize;
+                    self.palette_step(-page);
+                    return false;
+                }
+                NamedKey::Home => {
+                    if let Some(p) = self.palette.as_mut() {
+                        p.selected = 0;
+                        p.scroll_offset = 0;
+                    }
+                    return false;
+                }
+                NamedKey::End => {
+                    let visible = self.palette_visible_rows();
+                    if let Some(p) = self.palette.as_mut() {
+                        if !p.filtered.is_empty() {
+                            p.selected = p.filtered.len() - 1;
+                            p.scroll_offset = p.filtered.len().saturating_sub(visible);
+                        }
+                    }
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        if let Some(text) = event.text.as_ref() {
+            if let Some(c) = text.chars().next() {
+                if !c.is_control() {
+                    if let Some(p) = self.palette.as_mut() {
+                        p.query.push_str(text);
+                    }
+                    self.refresh_palette();
+                }
+            }
+        }
+        false
+    }
+
+
+    pub(crate) fn handle_search_key(&mut self, event: &KeyEvent) {
+        // Ctrl+R toggles regex mode (re-runs the query). Ctrl+W deletes the
+        // previous word from the query (readline-style).
+        if self.modifiers.contains(ModifiersState::CONTROL) {
+            if let Key::Character(c) = &event.logical_key {
+                match c.as_str().to_ascii_lowercase().as_str() {
+                    "r" => {
+                        if let Some(s) = self.search.as_mut() {
+                            s.regex_mode = !s.regex_mode;
+                        }
+                        self.refresh_matches();
+                        return;
+                    }
+                    "w" => {
+                        if let Some(s) = self.search.as_mut() {
+                            s.query.truncate(word_back_delete_index(&s.query));
+                        }
+                        self.refresh_matches();
+                        return;
+                    }
+                    "u" => {
+                        // Ctrl+U: clear the entire query (also readline-style).
+                        if let Some(s) = self.search.as_mut() {
+                            s.query.clear();
+                        }
+                        self.refresh_matches();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Key::Named(named) = &event.logical_key {
+            match named {
+                NamedKey::Escape => {
+                    self.end_search();
+                    return;
+                }
+                NamedKey::Enter => {
+                    let delta = if self.modifiers.contains(ModifiersState::SHIFT) {
+                        -1
+                    } else {
+                        1
+                    };
+                    self.search_step(delta);
+                    return;
+                }
+                NamedKey::Backspace => {
+                    if let Some(s) = self.search.as_mut() {
+                        s.query.pop();
+                    }
+                    self.refresh_matches();
+                    return;
+                }
+                NamedKey::ArrowDown => {
+                    self.search_step(1);
+                    return;
+                }
+                NamedKey::ArrowUp => {
+                    self.search_step(-1);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if let Some(text) = event.text.as_ref() {
+            if let Some(c) = text.chars().next() {
+                if !c.is_control() {
+                    if let Some(s) = self.search.as_mut() {
+                        s.query.push_str(text);
+                    }
+                    self.refresh_matches();
+                }
             }
         }
     }
