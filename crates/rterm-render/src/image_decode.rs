@@ -137,12 +137,25 @@ pub fn decode(image: &Image) -> Option<DecodedImage> {
 fn decode_gif_animation(data: &[u8]) -> Option<(u32, u32, Vec<AnimFrame>)> {
     use image::AnimationDecoder;
     const MAX_DECODE_DIM: u32 = 8192;
-    let decoder =
+    const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
+    let mut decoder =
         image::codecs::gif::GifDecoder::new(std::io::Cursor::new(data)).ok()?;
     let (w, h) = image::ImageDecoder::dimensions(&decoder);
     if w == 0 || h == 0 || w > MAX_DECODE_DIM || h > MAX_DECODE_DIM {
         return None;
     }
+    // Bound the PER-FRAME allocation, mirroring `decode_still`. A GIF frame
+    // carries its own Image-Descriptor width/height (u16, up to 65535²)
+    // that is independent of the logical screen checked above — without
+    // limits, a tiny-canvas GIF declaring a 65535×65535 frame makes the
+    // iterator alloc ~16 GiB (OOM-abort, or a 32-bit overflow panic) before
+    // any rterm cap runs. With limits set, `reserve_buffer` rejects the
+    // frame → `Err` → the `let Ok(frame) else break` below bails cleanly.
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_DECODE_DIM);
+    limits.max_image_height = Some(MAX_DECODE_DIM);
+    limits.max_alloc = Some(MAX_DECODE_ALLOC);
+    image::ImageDecoder::set_limits(&mut decoder, limits).ok()?;
     let mut frames = Vec::new();
     let mut total_bytes: u64 = 0;
     for frame in decoder.into_frames() {
