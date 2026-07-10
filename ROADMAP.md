@@ -330,9 +330,13 @@
 
 - [ ] Session-файл: межпроцессный лок или merge (сейчас две инстанции
   затирают сессии друг друга, last-writer-wins).
-- [ ] Update-check: prerelease-тег, помеченный «latest», считается
-  новее релиза (`parse_version` складывает `-rc.N` в число) —
-  ужесточить при первом же rc-релизе.
+- [x] Update-check: prerelease-тег больше не считается новее релиза. (2026-07)
+  `parse_version` теперь возвращает `(release, Option<prerelease>)`
+  (раньше складывал `-rc.N` в тот же вектор → `[0,0,13,1] > [0,0,13]`).
+  `is_newer` сравнивает release-ядро, затем по semver трактует
+  prerelease < release (`v0.0.13-rc.1` НЕ новее `0.0.13`; стабильный
+  релиз новее running prerelease; два rc — по номеру). Тесты на все
+  случаи.
 - [ ] `PluginCmd`-канал: домигрировать легаси-очереди `pending_*`
   (архитектурная заметка в `rterm-plugin/src/lib.rs` у `cmd_tx`).
 - [ ] Единый `enum ActiveOverlay` для клавиатуры/мыши/рендера

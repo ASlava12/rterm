@@ -103,20 +103,43 @@ pub fn check_in_background() {
 }
 
 fn is_newer(latest: &str, current: &str) -> bool {
-    parse_version(latest) > parse_version(current)
+    use std::cmp::Ordering;
+    let (lr, lp) = parse_version(latest);
+    let (cr, cp) = parse_version(current);
+    match lr.cmp(&cr) {
+        Ordering::Greater => true,
+        Ordering::Less => false,
+        // Same release core (X.Y.Z). SemVer: a version WITH a
+        // pre-release is OLDER than the same release without one, so a
+        // prerelease tag must NOT read as "newer" than the current
+        // stable build (the bug this guards against).
+        Ordering::Equal => match (lp, cp) {
+            (None, None) => false,       // identical stable
+            (None, Some(_)) => true,     // stable release > pre-release
+            (Some(_), None) => false,    // pre-release < stable release
+            (Some(a), Some(b)) => a > b, // both pre-release: compare nums
+        },
+    }
 }
 
-/// Split a tag into its numeric components. `v0.0.3` → `[0, 0, 3]`.
-/// Pre-release suffixes (`-rc.1`, `+build.7`) get their digits
-/// folded in too: `v0.1.0-rc.2` → `[0, 1, 0, 2]`. Not a strict
-/// SemVer parser — strict ordering of pre-release identifiers is
-/// out of scope for a one-shot freshness check.
-fn parse_version(s: &str) -> Vec<u32> {
-    s.trim_start_matches('v')
-        .split(|c: char| !c.is_ascii_digit())
-        .filter(|s| !s.is_empty())
-        .filter_map(|s| s.parse().ok())
-        .collect()
+/// Split a tag into `(release, pre_release)` numeric components.
+/// `v0.0.3` → `([0, 0, 3], None)`; `v0.1.0-rc.2` → `([0, 1, 0], Some
+/// ([2]))`; `+build.7` metadata is treated like a pre-release suffix.
+/// Not a strict SemVer parser — strict ordering of textual pre-release
+/// identifiers is out of scope — but it gets the release-vs-prerelease
+/// precedence right, which a one-shot freshness check needs.
+fn parse_version(s: &str) -> (Vec<u32>, Option<Vec<u32>>) {
+    let s = s.trim_start_matches('v');
+    let nums = |x: &str| -> Vec<u32> {
+        x.split(|c: char| !c.is_ascii_digit())
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse().ok())
+            .collect()
+    };
+    match s.find(['-', '+']) {
+        Some(i) => (nums(&s[..i]), Some(nums(&s[i + 1..]))),
+        None => (nums(s), None),
+    }
 }
 
 #[cfg(test)]
@@ -124,11 +147,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_version_strips_v_and_splits_on_punctuation() {
-        assert_eq!(parse_version("v0.0.3"), vec![0, 0, 3]);
-        assert_eq!(parse_version("0.0.3"), vec![0, 0, 3]);
-        assert_eq!(parse_version("v1.2.3-rc.4"), vec![1, 2, 3, 4]);
-        assert_eq!(parse_version(""), Vec::<u32>::new());
+    fn parse_version_splits_release_from_prerelease() {
+        assert_eq!(parse_version("v0.0.3"), (vec![0, 0, 3], None));
+        assert_eq!(parse_version("0.0.3"), (vec![0, 0, 3], None));
+        assert_eq!(parse_version("v1.2.3-rc.4"), (vec![1, 2, 3], Some(vec![4])));
+        assert_eq!(parse_version("v1.2.3+build.7"), (vec![1, 2, 3], Some(vec![7])));
+        assert_eq!(parse_version(""), (Vec::<u32>::new(), None));
     }
 
     #[test]
@@ -137,5 +161,20 @@ mod tests {
         assert!(is_newer("v0.1.0", "0.0.99"));
         assert!(!is_newer("v0.0.1", "0.0.1"));
         assert!(!is_newer("v0.0.1", "0.0.2"));
+    }
+
+    #[test]
+    fn prerelease_is_not_newer_than_its_release() {
+        // The bug: a `-rc.N` tag marked "latest" must NOT read as newer
+        // than the released stable — SemVer says pre-release < release.
+        assert!(!is_newer("v0.0.13-rc.1", "0.0.13"));
+        assert!(!is_newer("v0.0.13-rc.5", "0.0.13"));
+        // A stable release IS newer than a running pre-release of it.
+        assert!(is_newer("v0.0.13", "0.0.13-rc.1"));
+        // Higher release core still wins regardless of pre-release.
+        assert!(is_newer("v0.1.0-rc.1", "0.0.13"));
+        // Two pre-releases of the same core order by their number.
+        assert!(is_newer("v0.0.13-rc.2", "0.0.13-rc.1"));
+        assert!(!is_newer("v0.0.13-rc.1", "0.0.13-rc.2"));
     }
 }
