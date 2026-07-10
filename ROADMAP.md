@@ -102,17 +102,15 @@
 
 <!-- Пункты ниже (2026-07) — из feature-gap sweep (P4). -->
 
-- [ ] **Alt-scroll mode (DECSET `?1007`): «мёртвое колесо» в pager'ах.**
-  Самая заметная UX-дыра из sweep'а. На alt-screen без mouse-tracking
-  колесо мыши должно транслироваться в стрелки курсора (или SS3 A/B при
-  app-cursor), чтобы `less`/`man`/`git log`/`git diff`/`systemctl`
-  скроллились. Сейчас `?1007` падает в `_ => {}` парсера
-  (`rterm-core/src/terminal.rs:~3169`), а render на alt без mouse-режима
-  делает no-op (`rterm-render/src/input.rs:~174`). DoD: трекать
-  `alternate_scroll: bool` (дефолт on) по `?1007`; в alt-ветке колеса
-  при выключенном mouse-режиме слать N×`\x1bOA`/`\x1bOB` (или
-  `\x1b[A`/`\x1b[B` по `app_cursor_keys`) в панель вместо возврата;
-  юнит-тест на трансляцию.
+- [x] **Alt-scroll mode (DECSET `?1007`): «мёртвое колесо» в pager'ах.** (2026-07)
+  Ядро: поле `Terminal.alternate_scroll` (дефолт on, xterm-конвенция) —
+  DECSET/DECRST `?1007` + DECRQM-запрос + сброс на RIS, аксессор
+  `alternate_scroll()`. Render: в alt-ветке `handle_scroll` при
+  выключенном mouse-режиме и включённом `?1007` колесо транслируется в
+  стрелки через чистую `alt_scroll_bytes(step, app_cursor)` — CSI
+  (`\x1b[A/B`) или SS3 (`\x1bOA/OB`) по `app_cursor_keys`, N раз по
+  величине шага. `less`/`man`/`git log`/`systemctl` скроллятся колесом.
+  Тесты: core-toggle+DECRQM, render-трансляция.
 
 - [ ] **Кастомные plugin-действия в `[[keybindings]]`.**
   `docs/plugins.md:140` обещает бинд зарегистрированного действия через

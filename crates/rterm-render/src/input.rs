@@ -163,15 +163,28 @@ impl App {
             }
             return;
         }
-        // Else: scroll the local scrollback view. No-op when on alt screen
-        // since `visible_row` pins the viewport to the alt grid there —
-        // updating `scroll_offset` would just be dead state.
-        let (max_offset, on_alt) = if let Ok(term) = pane.terminal.lock() {
-            (term.scrollback_len() as i32, term.is_on_alt_screen())
+        // Else: no mouse reporting. On the alt-screen, translate the wheel
+        // into cursor up/down keys when alternate-scroll (DECSET ?1007) is
+        // on, so pagers (`less` / `man` / `git log` / `systemctl`) that
+        // enter the alt-screen but never enable mouse tracking still
+        // scroll. Off the alt-screen, drive the local scrollback view —
+        // no-op on alt since `visible_row` pins the viewport to the alt
+        // grid there, so updating `scroll_offset` would be dead state.
+        let (max_offset, on_alt, alt_scroll, app_cursor) = if let Ok(term) = pane.terminal.lock() {
+            (
+                term.scrollback_len() as i32,
+                term.is_on_alt_screen(),
+                term.alternate_scroll(),
+                term.app_cursor_keys(),
+            )
         } else {
-            (0, false)
+            (0, false, false, false)
         };
         if on_alt {
+            if alt_scroll {
+                let bytes = alt_scroll_bytes(step, app_cursor);
+                pane.send_input(&bytes);
+            }
             return;
         }
         let cur = pane.scroll_offset.load(Ordering::Relaxed) as i32;
@@ -1921,6 +1934,28 @@ fn ctrl_byte(b: u8) -> Option<u8> {
     }
 }
 
+/// Alternate-scroll (DECSET ?1007): translate a wheel `step` into repeated
+/// cursor-key bytes for the focused pager. `step > 0` is wheel-up → cursor
+/// Up; `step < 0` → cursor Down. `app_cursor` picks the SS3 (`ESC O …`)
+/// form over CSI (`ESC [ …`) per DECCKM. Returns empty for `step == 0`.
+fn alt_scroll_bytes(step: i32, app_cursor: bool) -> Vec<u8> {
+    if step == 0 {
+        return Vec::new();
+    }
+    let seq: &[u8] = match (step > 0, app_cursor) {
+        (true, false) => b"\x1b[A",
+        (false, false) => b"\x1b[B",
+        (true, true) => b"\x1bOA",
+        (false, true) => b"\x1bOB",
+    };
+    let n = step.unsigned_abs() as usize;
+    let mut out = Vec::with_capacity(seq.len() * n);
+    for _ in 0..n {
+        out.extend_from_slice(seq);
+    }
+    out
+}
+
 
 fn xterm_mod_code(mods: ModifiersState) -> u8 {
     let mut m = 0u8;
@@ -1994,6 +2029,19 @@ fn f1_f4_letter(k: NamedKey) -> Option<char> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alt_scroll_translates_wheel_to_cursor_keys() {
+        // Wheel up (step > 0) → Up; down → Down. CSI form by default.
+        assert_eq!(alt_scroll_bytes(1, false), b"\x1b[A".to_vec());
+        assert_eq!(alt_scroll_bytes(-1, false), b"\x1b[B".to_vec());
+        // App-cursor (DECCKM) → SS3 form.
+        assert_eq!(alt_scroll_bytes(1, true), b"\x1bOA".to_vec());
+        assert_eq!(alt_scroll_bytes(-1, true), b"\x1bOB".to_vec());
+        // Magnitude repeats the key; zero yields nothing.
+        assert_eq!(alt_scroll_bytes(3, false), b"\x1b[A\x1b[A\x1b[A".to_vec());
+        assert!(alt_scroll_bytes(0, false).is_empty());
+    }
 
     #[test]
     fn named_key_bytes_shift_tab_sends_cbt() {

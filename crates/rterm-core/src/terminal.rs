@@ -231,6 +231,13 @@ pub struct Terminal {
     mouse_tracking: MouseTracking,
     sgr_mouse: bool,
     bracketed_paste: bool,
+    /// DECSET ?1007 — alternate scroll mode. When on the alt-screen and
+    /// no mouse tracking is active, the renderer translates wheel
+    /// notches into cursor up/down keys so pagers (`less` / `man` /
+    /// `git log`) scroll even though they never enable mouse reporting.
+    /// On by default (xterm convention); toggled by `CSI ? 1007 h/l`.
+    /// The renderer reads it via `alternate_scroll()`.
+    alternate_scroll: bool,
     /// DECSET ?5 — DECSCNM "reverse screen": invert default-fg /
     /// default-bg for the whole grid. Some legacy apps toggle this
     /// for a brief "flash" effect during attention prompts. Off
@@ -723,6 +730,7 @@ impl Terminal {
             mouse_tracking: MouseTracking::Off,
             sgr_mouse: false,
             bracketed_paste: false,
+            alternate_scroll: true,
             reverse_screen: false,
             focus_tracking: false,
             sync_output: false,
@@ -1079,6 +1087,12 @@ impl Terminal {
     }
     pub fn bracketed_paste(&self) -> bool {
         self.bracketed_paste
+    }
+    /// DECSET ?1007 — whether the renderer should translate a mouse-wheel
+    /// notch on the alt-screen (with mouse tracking off) into cursor
+    /// up/down keys. See the field docs. On by default.
+    pub fn alternate_scroll(&self) -> bool {
+        self.alternate_scroll
     }
     pub fn focus_tracking(&self) -> bool {
         self.focus_tracking
@@ -1634,6 +1648,7 @@ impl Terminal {
             mouse_tracking: &mut self.mouse_tracking,
             sgr_mouse: &mut self.sgr_mouse,
             bracketed_paste: &mut self.bracketed_paste,
+            alternate_scroll: &mut self.alternate_scroll,
             reverse_screen: &mut self.reverse_screen,
             focus_tracking: &mut self.focus_tracking,
             sync_output: &mut self.sync_output,
@@ -2072,6 +2087,7 @@ impl Terminal {
             mouse_tracking: &mut self.mouse_tracking,
             sgr_mouse: &mut self.sgr_mouse,
             bracketed_paste: &mut self.bracketed_paste,
+            alternate_scroll: &mut self.alternate_scroll,
             reverse_screen: &mut self.reverse_screen,
             focus_tracking: &mut self.focus_tracking,
             sync_output: &mut self.sync_output,
@@ -2144,6 +2160,7 @@ struct TerminalPerform<'a> {
     mouse_tracking: &'a mut MouseTracking,
     sgr_mouse: &'a mut bool,
     bracketed_paste: &'a mut bool,
+    alternate_scroll: &'a mut bool,
     reverse_screen: &'a mut bool,
     focus_tracking: &'a mut bool,
     sync_output: &'a mut bool,
@@ -3102,6 +3119,7 @@ impl<'a> TerminalPerform<'a> {
             1003 => Some(*self.mouse_tracking == MouseTracking::AnyEvent),
             1004 => Some(*self.focus_tracking),
             1006 => Some(*self.sgr_mouse),
+            1007 => Some(*self.alternate_scroll),
             2004 => Some(*self.bracketed_paste),
             2026 => Some(*self.sync_output),
             _ => None,
@@ -3161,6 +3179,9 @@ impl<'a> TerminalPerform<'a> {
                 }
                 1004 => *self.focus_tracking = set,
                 1006 => *self.sgr_mouse = set,
+                // DECSET ?1007 — alternate scroll mode (wheel→cursor keys
+                // on the alt-screen when mouse tracking is off).
+                1007 => *self.alternate_scroll = set,
                 2004 => *self.bracketed_paste = set,
                 // DECSET ?2026 — Synchronized Output Mode. Apps (neovim,
                 // kakoune, helix) bracket a multi-segment frame with
@@ -4486,6 +4507,7 @@ impl<'a> Perform for TerminalPerform<'a> {
             *self.mouse_tracking = MouseTracking::Off;
             *self.sgr_mouse = false;
             *self.bracketed_paste = false;
+            *self.alternate_scroll = true;
             *self.focus_tracking = false;
             *self.sync_output = false;
             *self.insert_mode = false;
@@ -6548,6 +6570,24 @@ mod tests {
         assert!(t.bracketed_paste());
         t.advance(b"\x1b[?2004l");
         assert!(!t.bracketed_paste());
+    }
+
+    #[test]
+    fn alternate_scroll_mode_defaults_on_and_toggles() {
+        // ?1007 is on by default (xterm convention) so pagers scroll
+        // without opting in; apps can disable it with ?1007l.
+        let mut t = term(4, 1);
+        assert!(t.alternate_scroll());
+        t.advance(b"\x1b[?1007l");
+        assert!(!t.alternate_scroll());
+        t.advance(b"\x1b[?1007h");
+        assert!(t.alternate_scroll());
+        // DECRQM (CSI ? 1007 $ p) reports "set" (1) when enabled...
+        t.advance(b"\x1b[?1007$p");
+        assert_eq!(t.take_osc_responses(), vec!["\x1b[?1007;1$y".to_string()]);
+        // ...and "reset" (2) when disabled.
+        t.advance(b"\x1b[?1007l\x1b[?1007$p");
+        assert_eq!(t.take_osc_responses(), vec!["\x1b[?1007;2$y".to_string()]);
     }
 
     #[test]
