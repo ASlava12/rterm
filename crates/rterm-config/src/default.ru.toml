@@ -85,6 +85,31 @@ os_decorations = false
 # RUST_BACKTRACE = "1"
 # LANG = "ru_RU.UTF-8"
 
+# ── [[profiles]] ──────────────────────────────────────────────────────
+# Сохранённые пресеты подключений / запуска. Открыть: `rterm --profile
+# <name>`; список — `rterm --list-profiles`. Каждый блок `[[profiles]]`
+# переопределяет команду / cwd / env / тему для этого запуска. Классика
+# SSH — `program = "ssh"`. Поля:
+#   name    — ключ для `--profile <name>` (обязательно).
+#   program — команда вместо `[shell] program` (опц.; профиль может
+#             переопределить только cwd/theme/env, оставив шелл).
+#   args    — аргументы для `program` (массив строк).
+#   cwd     — стартовый каталог (`~` → $HOME).
+#   theme   — имя встроенной темы, применяемой при запуске.
+#   [profiles.env] — доп. переменные окружения (аддитивно).
+#
+# [[profiles]]
+# name = "prod"
+# program = "ssh"
+# args = ["deploy@prod.example.com"]
+# theme = "solarized-dark"
+#
+# [[profiles]]
+# name = "logs"
+# cwd = "~/logs"
+# [profiles.env]
+# PAGER = "less -R"
+
 # ── [terminal] ────────────────────────────────────────────────────────
 # Поведение терминала: scrollback, курсор, звуковые сигналы, OSC-политика.
 [terminal]

@@ -80,6 +80,31 @@ os_decorations = false
 # RUST_BACKTRACE = "1"
 # LANG = "en_US.UTF-8"
 
+# ── [[profiles]] ──────────────────────────────────────────────────────
+# Saved connection / launch presets. Open one with `rterm --profile
+# <name>`; `rterm --list-profiles` shows what's defined. Each `[[profiles]]`
+# block overrides the command / cwd / env / theme for that launch. The
+# classic SSH case sets `program = "ssh"`. Fields:
+#   name    — key for `--profile <name>` (required).
+#   program — command to run instead of `[shell] program` (optional; a
+#             profile may override only cwd/theme/env and keep the shell).
+#   args    — arguments for `program` (array of strings).
+#   cwd     — starting directory (`~` expands to $HOME).
+#   theme   — built-in theme name applied on launch.
+#   [profiles.env] — extra environment variables (additive).
+#
+# [[profiles]]
+# name = "prod"
+# program = "ssh"
+# args = ["deploy@prod.example.com"]
+# theme = "solarized-dark"
+#
+# [[profiles]]
+# name = "logs"
+# cwd = "~/logs"
+# [profiles.env]
+# PAGER = "less -R"
+
 # ── [terminal] ────────────────────────────────────────────────────────
 # Per-pane terminal behaviour: scrollback, cursor, bells, OSC policy.
 [terminal]

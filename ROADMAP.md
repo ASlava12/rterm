@@ -268,13 +268,25 @@
   ресайзе, P2-фон-режим (`?` background select), aspect-ratio из
   raster-атрибутов.
 
-- [ ] **Профили и SSH-менеджер (WindTerm-режим).**
+- [~] **Профили и SSH-менеджер (WindTerm-режим).** (в работе, 2026-07)
   Сохранённые подключения: `[[profiles]]` в конфиге (имя, команда/
   `ssh host`, cwd, тема, env), палитра «New tab with profile…»,
   быстрое переключение. Колонка `context` в history.db — готовый
   задел под per-host историю.
   DoD: профиль открывает таб с нужной командой/темой; история
   подсказок фильтруется по контексту хоста.
+  **Stage 1 (сделано):** схема `ProfileConfig` + `Config.profiles:
+  Vec<ProfileConfig>` (name/program/args/cwd/env/theme) + `Config::
+  profile(name)`. Запуск `rterm --profile <name>`: `GuiSpawner` держит
+  `active_profile`, `spawn_pane` переопределяет program/args/cwd
+  (`~`-expand)/env (поверх `[shell.env]`); тема профиля перебивает
+  `[appearance].theme`. CLI `--list-profiles [--json]`. Доки в обоих
+  шаблонах + `--help`. Тесты: парсинг+резолв профилей. Проверено:
+  GUI-запуск с профилем спавнит его команду.
+  **Stage 2 (далее):** палитра «New tab with profile: X» (динамические
+  entry из `config.profiles` → per-tab профиль через
+  `PaneSpawner::spawn_with_profile(name)`), быстрое переключение.
+  **Stage 3:** `context`-колонка history.db → фильтр подсказок по хосту.
 
 - [ ] **Лигатуры (Fira Code / JetBrains Mono).**
   Сейчас `set_monospace_width` + пер-ячеечная сетка разбивают

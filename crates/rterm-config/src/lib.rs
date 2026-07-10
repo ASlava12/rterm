@@ -27,6 +27,16 @@ pub struct Config {
     pub paste: PasteConfig,
     pub image: ImageConfig,
     pub highlight: HighlightConfig,
+    /// Saved connection / launch presets (`[[profiles]]`). Empty by
+    /// default. Selected with `rterm --profile <name>`.
+    pub profiles: Vec<ProfileConfig>,
+}
+
+impl Config {
+    /// Look up a profile by `name` (case-sensitive, first match).
+    pub fn profile(&self, name: &str) -> Option<&ProfileConfig> {
+        self.profiles.iter().find(|p| p.name == name)
+    }
 }
 
 /// Inline-image protocol toggles. When `enabled = false`, both
@@ -363,6 +373,31 @@ pub struct ShellConfig {
     /// `LANG = "en_US.UTF-8"`, `EDITOR = "nvim"`. Inherited parent env
     /// stays intact — these are additive overrides, not a replacement.
     pub env: std::collections::BTreeMap<String, String>,
+}
+
+/// A saved connection / launch preset — a named shell command plus its
+/// working directory, environment and theme. Declared as repeated
+/// `[[profiles]]` blocks. Opened via `rterm --profile <name>` (and, once
+/// wired, the "New tab with profile…" palette entry). The classic SSH
+/// case is `program = "ssh"`, `args = ["user@host"]`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProfileConfig {
+    /// Unique key used to select the profile (`--profile <name>`).
+    pub name: String,
+    /// Command to run instead of the default `[shell] program`. When
+    /// unset, the profile reuses the default shell (useful for a profile
+    /// that only overrides `cwd` / `theme` / `env`).
+    pub program: Option<String>,
+    /// Arguments for `program` (e.g. `["user@host"]` for an SSH profile).
+    pub args: Vec<String>,
+    /// Working directory to start in. `~` is expanded by the app.
+    pub cwd: Option<String>,
+    /// Extra environment variables (additive, like `[shell] env`).
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Built-in theme name to apply when the profile opens (e.g.
+    /// `"dark"`, `"solarized-light"`). `None` keeps the current theme.
+    pub theme: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -899,6 +934,36 @@ mod tests {
         let baseline = Config::default();
         assert_eq!(cfg.font.size, baseline.font.size);
         assert_eq!(cfg.window.width, baseline.window.width);
+    }
+
+    #[test]
+    fn profiles_parse_and_resolve() {
+        let toml = r#"
+[[profiles]]
+name = "myssh"
+program = "ssh"
+args = ["user@host"]
+theme = "dark"
+
+[profiles.env]
+LANG = "en_US.UTF-8"
+
+[[profiles]]
+name = "logs"
+cwd = "/var/log"
+"#;
+        let cfg = Config::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.profiles.len(), 2);
+        let ssh = cfg.profile("myssh").expect("myssh profile");
+        assert_eq!(ssh.program.as_deref(), Some("ssh"));
+        assert_eq!(ssh.args, vec!["user@host".to_string()]);
+        assert_eq!(ssh.theme.as_deref(), Some("dark"));
+        assert_eq!(ssh.env.get("LANG").map(String::as_str), Some("en_US.UTF-8"));
+        // A profile that only overrides cwd keeps program unset.
+        let logs = cfg.profile("logs").expect("logs profile");
+        assert_eq!(logs.cwd.as_deref(), Some("/var/log"));
+        assert!(logs.program.is_none());
+        assert!(cfg.profile("nope").is_none());
     }
 
     #[test]

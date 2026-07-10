@@ -59,6 +59,10 @@ impl TerminalIo for PtyAdapter {
 
 struct GuiSpawner {
     config: Config,
+    /// Active launch profile (`--profile <name>`). When set, every pane
+    /// this session spawns runs the profile's command / cwd / env instead
+    /// of the default shell. `None` = default shell.
+    active_profile: Option<rterm_config::ProfileConfig>,
     /// Shared history sink — same Arc the App holds, so every pane
     /// records into one SQLite file. `None` when history is disabled
     /// (open-failure or `--smoke`).
@@ -129,17 +133,33 @@ impl PaneSpawner for GuiSpawner {
         )));
         let terminal: SharedTerminal = Arc::new(Mutex::new(term));
 
-        let (program, args) = resolve_shell(&self.config);
-        let cwd_path = cwd.map(std::path::Path::new);
-        // User-supplied `[shell.env]` entries are forwarded to every
-        // spawned pane. Empty in the default config.
-        let env_extra: Vec<(String, String)> = self
-            .config
-            .shell
-            .env
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        // A launch profile (`--profile`) overrides the command when it
+        // names one; otherwise fall back to the default `[shell]`.
+        let profile = self.active_profile.as_ref();
+        let (program, args) = match profile.and_then(|p| p.program.as_deref()) {
+            Some(prog) => (
+                prog.to_string(),
+                profile.map(|p| p.args.clone()).unwrap_or_default(),
+            ),
+            None => resolve_shell(&self.config),
+        };
+        // Caller-supplied cwd (splits inherit the focused pane's dir) wins;
+        // else the profile's cwd, with `~` expanded to $HOME.
+        let profile_cwd = profile.and_then(|p| p.cwd.as_deref()).map(expand_tilde);
+        let effective_cwd: Option<String> = cwd
+            .map(str::to_string)
+            .or(profile_cwd);
+        let cwd_path = effective_cwd.as_deref().map(std::path::Path::new);
+        // `[shell.env]` for every pane, plus the profile's env layered on
+        // top (profile wins on key collision).
+        let mut env_map: std::collections::BTreeMap<String, String> =
+            self.config.shell.env.clone();
+        if let Some(p) = profile {
+            for (k, v) in &p.env {
+                env_map.insert(k.clone(), v.clone());
+            }
+        }
+        let env_extra: Vec<(String, String)> = env_map.into_iter().collect();
         let pty = Pty::spawn_with_env(&program, &args, initial, cwd_path, &env_extra)?;
         let reader = pty.try_clone_reader()?;
         let control = pty.control();
@@ -880,6 +900,9 @@ fn main() -> Result<()> {
                        --list-fonts [substr] [--json]  Print installed monospace families\n  \
                                        (case-insensitive substring filter; --json emits\n  \
                                        `{{\"default\":\"...\",\"families\":[...]}}`)\n  \
+                       --list-profiles [--json]  Print the [[profiles]] presets\n  \
+                       --profile <name>  Launch with a saved [[profiles]] preset\n  \
+                                       (command / cwd / env / theme)\n  \
                        --print-config  Print resolved config as TOML and exit\n  \
                        --print-default-config [--lang en|ru]  Print the bundled\n  \
                                        default config template (annotated with\n  \
@@ -1083,6 +1106,59 @@ fn main() -> Result<()> {
                             Some(_) => "",
                         };
                         println!("{:<24} {}{}", kb.keys, kb.action, tag);
+                    }
+                }
+                return Ok(());
+            }
+            "--list-profiles" => {
+                // Resolve the same config the GUI would (honours
+                // `--config`) and dump the `[[profiles]]` presets, so a
+                // user can confirm `--profile <name>` will resolve.
+                let mut path: Option<std::path::PathBuf> = None;
+                let mut iter = std::env::args().skip(1);
+                while let Some(a) = iter.next() {
+                    if a == "--config" {
+                        if let Some(p) = iter.next() {
+                            path = Some(std::path::PathBuf::from(p));
+                        }
+                    } else if let Some(p) = a.strip_prefix("--config=") {
+                        path = Some(std::path::PathBuf::from(p));
+                    }
+                }
+                let path = path.or_else(Config::default_path);
+                let cfg = match path.as_ref() {
+                    Some(p) => Config::load_from(p).unwrap_or_default(),
+                    None => Config::default(),
+                };
+                let json = std::env::args().any(|a| a == "--json");
+                if json {
+                    let arr: Vec<_> = cfg
+                        .profiles
+                        .iter()
+                        .map(|p| {
+                            serde_json::json!({
+                                "name": p.name,
+                                "program": p.program,
+                                "args": p.args,
+                                "cwd": p.cwd,
+                                "theme": p.theme,
+                            })
+                        })
+                        .collect();
+                    println!("{}", serde_json::Value::Array(arr));
+                } else if cfg.profiles.is_empty() {
+                    println!("(no [[profiles]] in config)");
+                } else {
+                    for p in &cfg.profiles {
+                        let cmd = match &p.program {
+                            Some(prog) if !p.args.is_empty() => {
+                                format!("{} {}", prog, p.args.join(" "))
+                            }
+                            Some(prog) => prog.clone(),
+                            None => "(default shell)".to_string(),
+                        };
+                        let theme = p.theme.as_deref().unwrap_or("-");
+                        println!("{:<20} {:<32} theme={}", p.name, cmd, theme);
                     }
                 }
                 return Ok(());
@@ -1517,6 +1593,24 @@ fn main() -> Result<()> {
         }
     };
 
+    // `--profile <name>` selects a saved `[[profiles]]` preset for this
+    // session's panes (command / cwd / env / theme). An unknown name
+    // warns and falls back to the default shell.
+    let active_profile: Option<rterm_config::ProfileConfig> =
+        arg_after_flag("--profile").and_then(|name| match config.profile(&name) {
+            Some(p) => {
+                tracing::info!(profile = %name, "launching with profile");
+                Some(p.clone())
+            }
+            None => {
+                tracing::warn!(
+                    profile = %name,
+                    "profile not found in config; using default shell"
+                );
+                None
+            }
+        });
+
     // `--smoke` is a headless PTY+parser sanity run. Check it HERE,
     // before any plugin setup: `run_smoke` only needs `config` (it
     // drives a Pty + Terminal directly), and running the user's
@@ -1603,6 +1697,7 @@ fn main() -> Result<()> {
             explicit_font_family,
             render_test_only,
             config_path,
+            active_profile,
         )
     }
 }
@@ -1777,6 +1872,7 @@ fn run_gui(
     font_family_override: Option<String>,
     render_test_only: bool,
     config_path: Option<PathBuf>,
+    active_profile: Option<rterm_config::ProfileConfig>,
 ) -> Result<()> {
     // Fire-and-forget update probe against the GitHub releases API.
     // Runs on a detached thread so it never blocks startup; the
@@ -1790,7 +1886,14 @@ fn run_gui(
     // Theme order: 1) built-in by name from `[appearance] theme = "..."`,
     // 2) explicit `[colors]` overrides on top. This lets a user pick a
     // ready-made theme and still tweak individual cells.
-    let initial_theme = config.appearance.theme.trim().to_string();
+    // A profile's `theme` takes precedence over `[appearance] theme` for
+    // this launch.
+    let initial_theme = active_profile
+        .as_ref()
+        .and_then(|p| p.theme.clone())
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| config.appearance.theme.trim().to_string());
     if !initial_theme.is_empty() {
         if let Some((_, pal)) = rterm_render::palette::theme_by_name(&initial_theme) {
             rterm_render::palette::init_palette(pal);
@@ -1866,6 +1969,7 @@ fn run_gui(
     };
     let spawner: Arc<dyn PaneSpawner> = Arc::new(GuiSpawner {
         config: config.clone(),
+        active_profile: active_profile.clone(),
         history: history.clone(),
         waker: Mutex::new(None),
     });
@@ -2410,6 +2514,23 @@ fn parse_lang_flag<I: IntoIterator<Item = String>>(args: I) -> Option<rterm_conf
         }
     }
     None
+}
+
+/// Expand a leading `~` / `~/` to the home directory (`$HOME`, or
+/// `%USERPROFILE%` on Windows). Anything else passes through. Used for a
+/// profile's `cwd`.
+fn expand_tilde(path: &str) -> String {
+    let home = || std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok();
+    if path == "~" {
+        home().unwrap_or_else(|| path.to_string())
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        match home() {
+            Some(h) => format!("{}/{}", h.trim_end_matches('/'), rest),
+            None => path.to_string(),
+        }
+    } else {
+        path.to_string()
+    }
 }
 
 fn resolve_shell(config: &Config) -> (String, Vec<String>) {
