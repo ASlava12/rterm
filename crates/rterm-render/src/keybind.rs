@@ -28,7 +28,12 @@ pub(crate) enum KeyMatch {
 pub struct UserBinding {
     pub(crate) mods: ModifiersState,
     pub(crate) key: KeyMatch,
-    pub(crate) action: AppAction,
+    /// The resolved built-in action, or `None` when `action_name` is a
+    /// custom action registered by a Lua plugin (`rterm.register_action`).
+    /// Custom actions can't be resolved at config-parse time — the plugin
+    /// host registers them at runtime — so the binding carries the name
+    /// and dispatches it through `EventSink::run_action` when it fires.
+    pub(crate) action: Option<AppAction>,
     /// Original key spec from config (`"Ctrl+Shift+T"`). Preserved
     /// verbatim for the help-overlay listing so the user sees the
     /// exact text they wrote rather than a normalised form.
@@ -133,16 +138,30 @@ pub(crate) fn parse_key_spec(s: &str) -> Option<(ModifiersState, KeyMatch)> {
 
 impl UserBinding {
     /// Try to build a binding from a (keys, action) config entry.
+    ///
+    /// Returns `None` only when the *key spec* is unparseable — that is a
+    /// real config error. The action name is accepted even when it is not
+    /// a built-in: it is then treated as a custom plugin action
+    /// (`action` = `None`) and dispatched by name at runtime. Custom
+    /// action names cannot be validated here because plugins register
+    /// them after config load; an unregistered name simply no-ops when
+    /// the key fires (same as the command palette).
     pub fn from_config(keys: &str, action: &str) -> Option<Self> {
         let (mods, key) = parse_key_spec(keys)?;
-        let parsed = AppAction::from_name(action)?;
         Some(Self {
             mods,
             key,
-            action: parsed,
+            action: AppAction::from_name(action),
             spec: keys.to_string(),
             action_name: action.to_string(),
         })
+    }
+
+    /// `true` when the bound action is not a built-in — i.e. a custom
+    /// plugin action dispatched by name. Used by `--check` /
+    /// `--list-keybindings` to report it distinctly from a bad key spec.
+    pub fn is_custom(&self) -> bool {
+        self.action.is_none()
     }
 
     /// Human-readable action label for the help overlay. Falls back to

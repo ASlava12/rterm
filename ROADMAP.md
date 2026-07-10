@@ -22,12 +22,11 @@
   (`Config::default_path`); вставка — `Shift+Insert`, не `Insert`. Правки
   только в доках/комментах.
 
-- [ ] **Плагины: `run_action("custom")` из Lua не работает для кастомных.**
-  `PluginCmd::RunAction` в `event_loop.rs:~1253` резолвит только
-  билтины через `AppAction::from_name`; кастомное имя уходит в `else` с
-  логом `"run_action: unknown"`. Способность есть
-  (`PluginHost::run_action`, `rterm-plugin/src/lib.rs:~4447`), но
-  недостижима. DoD: в `else`-ветке звать `self.events.run_action(&name)`.
+- [x] **Плагины: `run_action("custom")` из Lua теперь работает.** (2026-07)
+  `PluginCmd::RunAction`-хендлер (`event_loop.rs`) в `else`-ветке (не-
+  билтин) теперь зовёт `self.events.run_action(&name)` — тот же путь,
+  что у палитры. `rterm.run_action("my_custom")` диспетчеризует
+  действие, зарегистрированное через `rterm.register_action`.
 
 - [ ] **Плагины: событие `attention` документировано, но не эмитится.**
   `docs/plugins.md:118` перечисляет `attention`; `emit("attention")`
@@ -112,15 +111,16 @@
   величине шага. `less`/`man`/`git log`/`systemctl` скроллятся колесом.
   Тесты: core-toggle+DECRQM, render-трансляция.
 
-- [ ] **Кастомные plugin-действия в `[[keybindings]]`.**
-  `docs/plugins.md:140` обещает бинд зарегистрированного действия через
-  `[[keybindings]] action = "name"`; `UserBinding.action` — enum
-  `AppAction`, `UserBinding::from_config` (`keybind.rs:136`) возвращает
-  `None` для не-билтинов, `main.rs:~1821` дропает с варнингом, `--check`
-  зовёт «unknown action». Достижимо только из палитры. DoD: вариант
-  `UserBinding` с именем кастомного действия; при промахе
-  `AppAction::from_name` — фолбэк в `self.events.run_action(name)` в
-  `check_user_bindings`. Связано с P0 «run_action custom».
+- [x] **Кастомные plugin-действия в `[[keybindings]]`.** (2026-07)
+  `UserBinding.action` теперь `Option<AppAction>` (`None` = кастомное имя,
+  резолвится в рантайме). `from_config` возвращает `None` только при
+  непарсящемся key-spec, а не-билтин-имя принимает как кастомное
+  (плагины регистрируют действия после загрузки конфига, поэтому
+  провалидировать имя нельзя — незарегистрированное просто no-op, как в
+  палитре). `check_user_bindings`: `Some(a)` → `dispatch_action`, `None`
+  → `self.events.run_action(name)`. `--list-keybindings`/`--check`
+  различают «(invalid key)» / «(custom action)» / builtin (+ поле
+  `"custom"` в JSON). Тест на приём кастомного имени.
 
 - [ ] **SGR-Pixels mouse (DECSET `?1016`).**
   Репорт координат мыши в пикселях (SGR-фрейминг), запрашивают neovim/

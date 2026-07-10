@@ -1016,8 +1016,9 @@ fn main() -> Result<()> {
             "--list-keybindings" => {
                 // Resolve the same config the GUI would (so `--config
                 // path` is honoured) and dump every `[[keybindings]]`
-                // entry, alongside a "(invalid)" tag for entries whose
-                // spec or action wouldn't survive `UserBinding::from_config`.
+                // entry, tagging entries with an unparseable key spec
+                // "(invalid key)" and non-built-in actions "(custom
+                // action)" (dispatched by name at runtime via a plugin).
                 // Optional substring filter matches the *action* name
                 // (case-insensitive, contains) — power users with 30+
                 // bindings find a specific entry without `grep`.
@@ -1052,12 +1053,15 @@ fn main() -> Result<()> {
                     let arr: Vec<_> = matches
                         .iter()
                         .map(|kb| {
-                            let valid =
-                                UserBinding::from_config(&kb.keys, &kb.action).is_some();
+                            let binding = UserBinding::from_config(&kb.keys, &kb.action);
+                            // `valid` = key spec parses; `custom` = the action
+                            // is a plugin action (not a built-in), resolved at
+                            // runtime rather than config-parse time.
                             serde_json::json!({
                                 "keys": kb.keys,
                                 "action": kb.action,
-                                "valid": valid,
+                                "valid": binding.is_some(),
+                                "custom": binding.as_ref().map(|b| b.is_custom()).unwrap_or(false),
                             })
                         })
                         .collect();
@@ -1073,8 +1077,11 @@ fn main() -> Result<()> {
                     );
                 } else {
                     for kb in &matches {
-                        let ok = UserBinding::from_config(&kb.keys, &kb.action).is_some();
-                        let tag = if ok { "" } else { "  (invalid)" };
+                        let tag = match UserBinding::from_config(&kb.keys, &kb.action) {
+                            None => "  (invalid key)",
+                            Some(b) if b.is_custom() => "  (custom action)",
+                            Some(_) => "",
+                        };
                         println!("{:<24} {}{}", kb.keys, kb.action, tag);
                     }
                 }
@@ -1181,7 +1188,7 @@ fn main() -> Result<()> {
                                 if UserBinding::from_config(&kb.keys, &kb.action).is_none() {
                                     eprintln!(
                                         "warning: keybinding {:?} → action {:?} ignored \
-                                         (unparseable key spec or unknown action)",
+                                         (unparseable key spec)",
                                         kb.keys, kb.action,
                                     );
                                     warnings += 1;

@@ -1256,7 +1256,12 @@ impl App {
                             plugin_exit = true;
                         }
                     } else {
-                        tracing::debug!(action = %name, "run_action: unknown");
+                        // Not a built-in — route to the plugin host's custom
+                        // action registry, matching the command palette's
+                        // dispatch (lib.rs `execute_palette_selection`). Lets
+                        // `rterm.run_action("my_custom")` fire actions declared
+                        // via `rterm.register_action`.
+                        self.events.run_action(&name);
                     }
                 }
                 rterm_core::PluginCmd::OpenUrl(url) => {

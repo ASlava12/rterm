@@ -5809,8 +5809,10 @@ impl App {
         let mods = self.modifiers;
         // Collect first to avoid borrowing `self.user_bindings` across the
         // dispatch_action call below.
-        let action = {
-            let mut hit: Option<AppAction> = None;
+        let hit = {
+            // `(Some(builtin), _)` → typed dispatch; `(None, name)` → a
+            // custom plugin action dispatched by name via the EventSink.
+            let mut hit: Option<(Option<AppAction>, String)> = None;
             for b in &self.user_bindings {
                 if b.mods != mods {
                     continue;
@@ -5832,13 +5834,22 @@ impl App {
                     KeyMatch::Named(n) => matches!(&event.logical_key, Key::Named(k) if k == n),
                 };
                 if matches {
-                    hit = Some(b.action);
+                    hit = Some((b.action, b.action_name.clone()));
                     break;
                 }
             }
             hit
         };
-        action.map(|a| self.dispatch_action(a))
+        hit.map(|(builtin, name)| match builtin {
+            Some(a) => self.dispatch_action(a),
+            None => {
+                // Custom plugin action (registered via rterm.register_action).
+                // Routes through the same EventSink path as the palette; a
+                // name with no registered handler simply no-ops.
+                self.events.run_action(&name);
+                false
+            }
+        })
     }
 
     /// App-level key handling. Returns `Some(true)` to request window exit,
@@ -9230,13 +9241,21 @@ mod tests {
     fn user_binding_from_config() {
         let b = UserBinding::from_config("Ctrl+Shift+T", "new_tab").unwrap();
         assert!(b.mods.contains(ModifiersState::CONTROL | ModifiersState::SHIFT));
-        assert!(matches!(b.action, AppAction::NewTab));
+        assert!(matches!(b.action, Some(AppAction::NewTab)));
+        assert!(!b.is_custom());
         // Spec + action_name are preserved verbatim from config so the
         // help overlay can show what the user actually wrote.
         assert_eq!(b.spec, "Ctrl+Shift+T");
         assert_eq!(b.action_name(), "new_tab");
-        // Unknown action returns None.
-        assert!(UserBinding::from_config("Ctrl+X", "this_action_does_not_exist").is_none());
+        // A non-built-in action name is NOT an error — it's a custom
+        // plugin action (registered via rterm.register_action at runtime),
+        // kept as a binding with action = None and dispatched by name.
+        let custom = UserBinding::from_config("Ctrl+X", "my_plugin_action").unwrap();
+        assert!(custom.action.is_none());
+        assert!(custom.is_custom());
+        assert_eq!(custom.action_name(), "my_plugin_action");
+        // Only an unparseable KEY spec is rejected.
+        assert!(UserBinding::from_config("", "new_tab").is_none());
     }
 
     #[test]
