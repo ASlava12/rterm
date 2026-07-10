@@ -28,12 +28,11 @@
   что у палитры. `rterm.run_action("my_custom")` диспетчеризует
   действие, зарегистрированное через `rterm.register_action`.
 
-- [ ] **Плагины: событие `attention` документировано, но не эмитится.**
-  `docs/plugins.md:118` перечисляет `attention`; `emit("attention")`
-  нет нигде, `rterm.attention()` лишь ставит `pending_attention`-флаг.
-  DoD: эмитить `"attention"` там, где дренируется `take_pending_attention()`,
-  и добавить в `builtin_event_names()` (`rterm-app/src/main.rs:~2691`) —
-  либо убрать из списка событий в доках.
+- [x] **Плагины: событие `attention` теперь эмитится.** (2026-07)
+  `emit("attention", "")` при дренаже `pending_attention` (до
+  focus-gated taskbar-пинга, событие идёт независимо от фокуса).
+  Добавлено в `builtin_event_names()` + закреплено в anchor-тесте.
+  `rterm.on("attention", ...)` теперь срабатывает.
 
 - [ ] **Плагины: `add_match` `opts.on` колбэк игнорируется.**
   Доки (`docs/plugins-api.md:140`, `docs/plugins.md:169`) показывают
@@ -42,13 +41,13 @@
   `opts.on` как `RegistryKey` в `MatchRule` и звать на сайте
   `emit("match")` (`event_loop.rs:~888`) — либо убрать `on` из доков.
 
-- [ ] **Плагины: нет bare/`_of`-форм части panel-аксессоров.**
-  `docs/plugins-api.md:63-69` обещает 3 формы; `rterm.idle()` /
-  `scrollback_len()` / `foreground_process()` / `foreground_pgid()` /
-  `bell_muted()` / `progress()` (bare) и `terminal_text_of()` /
-  `copy_pane_of()` не зарегистрированы → индексация в `nil`. DoD:
-  зарегистрировать недостающие формы (делегируя в `_of` с активными
-  индексами) — либо поправить доки на «две формы».
+- [x] **Плагины: bare/`_of`-формы panel-аксессоров.** (2026-07)
+  Зарегистрированы 6 недостающих bare-форм (`idle` / `scrollback_len` /
+  `foreground_process` / `foreground_pgid` / `bell_muted` / `progress`)
+  — читают фокусную панель (`find(|p| p.focused)`, зеркало `_of`-тела),
+  и 2 `_of`-алиаса (`terminal_text_of` / `copy_pane_of`) по 1-based
+  индексам. Обещанный доками трио `X()`/`X_of`/`X_by_uid` теперь
+  реально покрыт. Тест на резолв bare→фокусная + `_of`→индекс.
 
 - [x] **Тумблер подсветки синтаксиса в Settings-оверлее.** (2026-07)
   Чекбокс `[x] Syntax highlighting` + клавиша `Y`; рантайм-флип через

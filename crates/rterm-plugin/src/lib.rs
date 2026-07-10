@@ -3843,6 +3843,120 @@ impl PluginHost {
             })?,
         )?;
 
+        // Focused-pane bare forms + `_of` aliases. The docs advertise a
+        // uniform `X()` / `X_of(tab, pane)` / `X_by_uid(uid)` trio, but a
+        // handful of accessors had only two of the three registered. These
+        // fill the gaps: the bare form reads the focused pane (mirroring
+        // the `_of` body with `find(|p| p.focused)`); `terminal_text_of` /
+        // `copy_pane_of` are the documented `_of` names for the existing
+        // index-addressed forms.
+        let state_for_idle_bare = Arc::clone(&state);
+        rterm.set(
+            "idle",
+            lua.create_function(move |_, ()| {
+                Ok(state_for_idle_bare
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.panes.iter().find(|p| p.focused).map(|p| p.idle_ms)))
+            })?,
+        )?;
+        let state_for_sblen_bare = Arc::clone(&state);
+        rterm.set(
+            "scrollback_len",
+            lua.create_function(move |_, ()| {
+                Ok(state_for_sblen_bare.lock().ok().and_then(|g| {
+                    g.panes.iter().find(|p| p.focused).map(|p| p.scrollback_len as u64)
+                }))
+            })?,
+        )?;
+        let state_for_fp_bare = Arc::clone(&state);
+        rterm.set(
+            "foreground_process",
+            lua.create_function(move |_, ()| {
+                Ok(state_for_fp_bare.lock().ok().and_then(|g| {
+                    g.panes
+                        .iter()
+                        .find(|p| p.focused)
+                        .and_then(|p| p.foreground_process.clone())
+                }))
+            })?,
+        )?;
+        let state_for_fpg_bare = Arc::clone(&state);
+        rterm.set(
+            "foreground_pgid",
+            lua.create_function(move |_, ()| {
+                Ok(state_for_fpg_bare.lock().ok().and_then(|g| {
+                    g.panes.iter().find(|p| p.focused).and_then(|p| p.foreground_pgid)
+                }))
+            })?,
+        )?;
+        let state_for_bm_bare = Arc::clone(&state);
+        rterm.set(
+            "bell_muted",
+            lua.create_function(move |_, ()| {
+                Ok(state_for_bm_bare
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.panes.iter().find(|p| p.focused).map(|p| p.bell_muted)))
+            })?,
+        )?;
+        let state_for_prog_bare = Arc::clone(&state);
+        rterm.set(
+            "progress",
+            lua.create_function(move |lua, ()| {
+                let Ok(state) = state_for_prog_bare.lock() else {
+                    return Ok(None);
+                };
+                let Some((s, pct)) =
+                    state.panes.iter().find(|p| p.focused).and_then(|p| p.progress)
+                else {
+                    return Ok(None);
+                };
+                let t = lua.create_table()?;
+                t.set("state", s)?;
+                t.set("state_name", progress_state_name(s))?;
+                t.set("percent", pct)?;
+                Ok(Some(t))
+            })?,
+        )?;
+        let state_for_text_of = Arc::clone(&state);
+        rterm.set(
+            "terminal_text_of",
+            lua.create_function(move |_, (tab, pane): (u32, u32)| {
+                let tab = tab.saturating_sub(1) as usize;
+                let pane = pane.saturating_sub(1) as usize;
+                Ok(state_for_text_of.lock().ok().and_then(|g| {
+                    g.panes
+                        .iter()
+                        .find(|p| p.tab == tab && p.pane == pane)
+                        .map(|p| p.text.clone())
+                }))
+            })?,
+        )?;
+        let copy_for_pane_of = Arc::clone(&pending_copy);
+        let state_for_copy_of = Arc::clone(&state);
+        rterm.set(
+            "copy_pane_of",
+            lua.create_function(move |_, (tab, pane): (u32, u32)| {
+                let tab = tab.saturating_sub(1) as usize;
+                let pane = pane.saturating_sub(1) as usize;
+                let text = state_for_copy_of.lock().ok().and_then(|g| {
+                    g.panes
+                        .iter()
+                        .find(|p| p.tab == tab && p.pane == pane)
+                        .map(|p| p.text.clone())
+                });
+                let Some(t) = text else { return Ok(false) };
+                if t.is_empty() {
+                    return Ok(false);
+                }
+                if let Ok(mut slot) = copy_for_pane_of.lock() {
+                    *slot = Some(t);
+                }
+                Ok(true)
+            })?,
+        )?;
+
         let state_for_panes = Arc::clone(&state);
         rterm.set(
             "list_panes",
@@ -8234,6 +8348,68 @@ mod tests {
             .eval()
             .unwrap();
         assert!(misses);
+    }
+
+    #[test]
+    fn rterm_bare_pane_accessors_resolve_to_focused_pane() {
+        // The docs advertise a uniform `X()` / `X_of` / `X_by_uid` trio;
+        // the bare `X()` forms were previously missing for these
+        // accessors. Pin that they now resolve to the FOCUSED pane (the
+        // second pane here) and that the `_of` aliases address by index.
+        let host = PluginHost::new().expect("host inits");
+        let snapshot = TerminalState {
+            panes: vec![
+                PaneInfo {
+                    tab: 0,
+                    pane: 0,
+                    uid: 101,
+                    focused: false,
+                    idle_ms: 10,
+                    scrollback_len: 111,
+                    foreground_process: Some("bash".into()),
+                    foreground_pgid: Some(1111),
+                    bell_muted: false,
+                    text: "first-pane".into(),
+                    ..Default::default()
+                },
+                PaneInfo {
+                    tab: 1,
+                    pane: 2,
+                    uid: 202,
+                    focused: true,
+                    idle_ms: 42,
+                    scrollback_len: 999,
+                    foreground_process: Some("vim".into()),
+                    foreground_pgid: Some(2222),
+                    bell_muted: true,
+                    progress: Some((1, 50)),
+                    ..Default::default()
+                },
+            ],
+            ..TerminalState::default()
+        };
+        host.set_state(snapshot);
+
+        let idle: u64 = host.lua.load("return rterm.idle()").eval().unwrap();
+        assert_eq!(idle, 42);
+        let sblen: u64 = host.lua.load("return rterm.scrollback_len()").eval().unwrap();
+        assert_eq!(sblen, 999);
+        let fp: String = host.lua.load("return rterm.foreground_process()").eval().unwrap();
+        assert_eq!(fp, "vim");
+        let fpg: u32 = host.lua.load("return rterm.foreground_pgid()").eval().unwrap();
+        assert_eq!(fpg, 2222);
+        let bm: bool = host.lua.load("return rterm.bell_muted()").eval().unwrap();
+        assert!(bm);
+        let pct: u8 = host.lua.load("return rterm.progress().percent").eval().unwrap();
+        assert_eq!(pct, 50);
+        // `_of` aliases address by 1-based (tab, pane) — pane (1,1) is the
+        // first, unfocused pane.
+        let text_of: String =
+            host.lua.load("return rterm.terminal_text_of(1, 1)").eval().unwrap();
+        assert_eq!(text_of, "first-pane");
+        let copied: bool =
+            host.lua.load("return rterm.copy_pane_of(1, 1)").eval().unwrap();
+        assert!(copied);
     }
 
     #[test]
