@@ -26,10 +26,14 @@ pub struct SixelImage {
 }
 
 /// Hard caps: refuse a Sixel that would exceed these so a crafted body
-/// can't pin unbounded RAM. 4096² is comfortably past any real terminal
-/// image and well under the decoder's 8192² texture ceiling.
+/// can't pin unbounded RAM. 4096 is comfortably past any real terminal
+/// image's single dimension. `MAX_PIXELS` is aligned to the downstream
+/// image-store cap (`IMAGE_MAX_PAYLOAD_BYTES` = 16 MiB, i.e. 4 Mpx of
+/// RGBA8) so `decode` never zero-fills a large buffer only for
+/// `register_image_inline` to reject it — a tiny `"1;1;4000;4000` raster
+/// header would otherwise force a 64 MiB alloc/free churn per call.
 const MAX_DIM: usize = 4096;
-const MAX_PIXELS: usize = 4096 * 4096;
+const MAX_PIXELS: usize = 4 * 1024 * 1024;
 
 /// Decode a Sixel data body into an RGBA image. `None` when the body is
 /// empty, paints nothing, or would exceed the size caps. Never panics on
@@ -227,15 +231,18 @@ fn pct_to_255(p: u32) -> u8 {
     ((p.min(100) * 255 + 50) / 100) as u8
 }
 
-/// HLS → RGB per the Sixel spec: H 0–360 (with 0 = blue, offset by 120°
-/// from the usual convention), L 0–100, S 0–100.
+/// HLS → RGB per the Sixel spec: H 0–360 (with 0 = blue, rotated -120°
+/// from the usual "0 = red" convention), L 0–100, S 0–100.
 fn hls_to_rgb(h: u32, l: u32, s: u32) -> [u8; 3] {
     let h = (h % 360) as f32;
     let l = (l.min(100) as f32) / 100.0;
     let s = (s.min(100) as f32) / 100.0;
-    // Sixel's hue is shifted: 0° is blue. Rotate so the maths below use
-    // the standard "0° = red" wheel.
-    let h = (h + 120.0) % 360.0;
+    // Sixel's hue ring is rotated -120° from the usual one (0° = blue,
+    // 120° = red, 240° = green). Add 240° (≡ -120° mod 360) so the sector
+    // maths below can use the standard "0° = red" wheel: sixel 0 (blue) →
+    // 240 (blue), sixel 120 (red) → 0 (red), sixel 240 (green) → 120.
+    // Matches the canonical xterm/libsixel `hls_to_rgb`.
+    let h = (h + 240.0) % 360.0;
     let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
     let hp = h / 60.0;
     let xc = c * (1.0 - (hp % 2.0 - 1.0).abs());
@@ -347,6 +354,32 @@ mod tests {
         // 1×6 column.
         let img = decode(b"\"1;1;10;8#1~").expect("decodes");
         assert_eq!((img.width, img.height), (10, 8));
+    }
+
+    #[test]
+    fn hls_color_definition_maps_hue_ring() {
+        // Sixel HLS hue is rotated -120° from the standard wheel: 0=blue,
+        // 120=red, 240=green. Define three registers via HLS (Pu=1) at
+        // L=50 S=100 and paint one full column each (x auto-advances, no
+        // `$`), then verify each lands on the right primary. Regression
+        // guard for the hue offset (must be +240°, not +120°).
+        let img = decode(b"#0;1;0;50;100~#1;1;120;50;100~#2;1;240;50;100~")
+            .expect("decodes");
+        assert_eq!(img.width, 3);
+        assert_eq!(rgb_at(&img, 0, 0), [0, 0, 255, 255], "sixel hue 0 = blue");
+        assert_eq!(rgb_at(&img, 1, 0), [255, 0, 0, 255], "sixel hue 120 = red");
+        assert_eq!(rgb_at(&img, 2, 0), [0, 255, 0, 255], "sixel hue 240 = green");
+    }
+
+    #[test]
+    fn oversized_declared_raster_is_rejected_before_allocating() {
+        // A raster header larger than the downstream image cap (4 Mpx of
+        // RGBA8 = IMAGE_MAX_PAYLOAD_BYTES) must be rejected up front, not
+        // zero-filled into a huge buffer only to be dropped downstream.
+        // 4000×4000 = 16 Mpx > MAX_PIXELS.
+        assert!(decode(b"\"1;1;4000;4000#1~").is_none());
+        // A raster comfortably within the cap still decodes.
+        assert!(decode(b"\"1;1;100;100#1~").is_some());
     }
 
     #[test]
