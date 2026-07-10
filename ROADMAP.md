@@ -243,9 +243,15 @@
   снапшота для плагинов и GPU prepare/render). `lib.rs` 14.2k → 11.4k.
   Этим закрыты оба кандидата `frame.rs` (RedrawRequested сидит в
   `window_event`) и `snapshot.rs` (снапшот строится там же инлайн).
-  Осталось (по желанию): распилить сам `window_event` на per-arm
-  методы; вынести GPU-пайплайн (`prepare`/`render*` у `GpuState`) в
-  `gpu.rs`. (2) чистая математика (геометрия, хит-тесты,
+  Затем `gpu.rs` — `struct GpuState` + весь его `impl` (~620 стр: wgpu
+  surface/device/queue init с WSL2-оверрайдами, resize, opacity,
+  per-frame `render` со сшивкой bg→image→glyph→overlay пассов). Поля
+  `window`/`config` подняты до `pub(crate)` (читаются снаружи); GpuState
+  реэкспортится `pub use gpu::GpuState`. `lib.rs` 11.4k → 10.8k.
+  Осталось (по желанию): распилить сам `window_event` на per-arm методы;
+  вынести payload-фнки плагинных событий в `payload.rs`;
+  input-кодировщики (`named_key_bytes`/`encode_mouse`/…) — в `input.rs`
+  вместе с их тестами. (2) чистая математика (геометрия, хит-тесты,
   кодирование) — в свободные функции ради юнит-тестов; (3) убрать
   дублирование (инлайн-копии `close_tab_at` и т.п.), стейл-комментарии,
   мёртвый код; (4) единообразить идиомы (poison-tolerant локи,
