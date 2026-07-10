@@ -40,7 +40,7 @@ use keybind::KeyMatch;
 #[cfg(test)]
 use keybind::parse_key_spec;
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -195,7 +195,7 @@ fn brighten_named(n: rterm_core::NamedColor) -> rterm_core::NamedColor {
 
 fn build_spans(
     terminal: &Terminal,
-    offset: u16,
+    offset: u32,
     focused: bool,
     blink_on: bool,
     selection: Option<&NormSelection>,
@@ -502,7 +502,7 @@ pub struct PaneSnapshotInfo {
     /// `0` means output happened this frame or the reader hasn't started.
     pub idle_ms: u64,
     /// Lines scrolled up into scrollback (0 = following the live grid).
-    pub scroll_offset: u16,
+    pub scroll_offset: u32,
     /// True when the pane is currently on the alternate screen (vim, less,
     /// htop, etc.). Plugins can use it to gate output-capture features.
     pub alt_screen: bool,
@@ -622,7 +622,7 @@ impl NormSelection {
 
 pub struct PaneDraw<'a> {
     pub terminal: &'a Terminal,
-    pub scroll_offset: u16,
+    pub scroll_offset: u32,
     pub focused: bool,
     pub rect: PaneRect,
     pub selection: Option<NormSelection>,
@@ -2329,7 +2329,7 @@ pub struct Pane {
     /// `list_panes` so they can detect silence.
     pub last_output_ms: Arc<AtomicU64>,
     /// Lines scrolled up into scrollback view (0 = follow live grid).
-    pub scroll_offset: AtomicU16,
+    pub scroll_offset: AtomicU32,
     /// Last observed `scrollback_len` — used by the renderer to compensate
     /// `scroll_offset` when new lines push into scrollback so the user
     /// stays anchored to the content they were reading.
@@ -2444,7 +2444,7 @@ impl Pane {
             alive,
             activity,
             last_output_ms,
-            scroll_offset: AtomicU16::new(0),
+            scroll_offset: AtomicU32::new(0),
             last_sb_len: AtomicUsize::new(0),
             last_alt_screen: AtomicBool::new(false),
             last_reverse_screen: AtomicBool::new(false),
@@ -2980,7 +2980,7 @@ impl AbsPoint {
     /// the absolute coordinate via the same `sb_len - offset +
     /// viewport_row` mapping used everywhere else for the visible
     /// <-> logical translation.
-    fn from_viewport(sp: SelectionPoint, sb_len: usize, offset: u16) -> Self {
+    fn from_viewport(sp: SelectionPoint, sb_len: usize, offset: u32) -> Self {
         let abs_row = sb_len as i64 - offset as i64 + sp.row as i64;
         Self { abs_row, col: sp.col }
     }
@@ -2988,7 +2988,7 @@ impl AbsPoint {
     /// Project back to a viewport row given the CURRENT scroll
     /// state. May fall outside `[0, rows)` when the selection has
     /// been scrolled off-screen — callers clip.
-    fn to_viewport_row(self, sb_len: usize, offset: u16) -> i64 {
+    fn to_viewport_row(self, sb_len: usize, offset: u32) -> i64 {
         self.abs_row - sb_len as i64 + offset as i64
     }
 }
@@ -3018,7 +3018,7 @@ impl ActiveSelection {
     fn to_visible_norm(
         self,
         sb_len: usize,
-        offset: u16,
+        offset: u32,
         rows: u16,
     ) -> Option<NormSelection> {
         let anchor_r = self.anchor.to_viewport_row(sb_len, offset);
@@ -6318,7 +6318,7 @@ impl App {
         };
         drop(term);
         let Some(m) = target else { return };
-        let new_off = sb_len.saturating_sub(m).min(u16::MAX as usize) as u16;
+        let new_off = sb_len.saturating_sub(m).min(u32::MAX as usize) as u32;
         pane.scroll_offset.store(new_off, Ordering::Relaxed);
         let event = match kind {
             MarkKind::Prompt => "prompt.jump",
@@ -7762,7 +7762,7 @@ impl App {
                 // `Terminal::visible_row` does internally — fewer
                 // surprises than reaching into private state.
                 let row_opt = if (abs_r as usize) < sb_len {
-                    let off = (sb_len - abs_r as usize).min(u16::MAX as usize) as u16;
+                    let off = (sb_len - abs_r as usize).min(u32::MAX as usize) as u32;
                     term.visible_row(off, 0)
                 } else {
                     let g_row = (abs_r as usize - sb_len) as u16;
@@ -7804,7 +7804,7 @@ impl App {
                     let soft_wrapped = !block && {
                         if (abs_r as usize) < sb_len {
                             let off =
-                                (sb_len - abs_r as usize).min(u16::MAX as usize) as u16;
+                                (sb_len - abs_r as usize).min(u32::MAX as usize) as u32;
                             term.row_wrapped(off, 0)
                         } else {
                             let g_row = (abs_r as usize - sb_len) as u16;
@@ -10956,8 +10956,8 @@ fn ime_cursor_rect(
 /// representable maximum instead. (The tail past 65 535 stays
 /// unreachable until the atomic is widened — a separate, larger
 /// change; this only kills the wrap bug.)
-fn clamp_scroll_offset(value: i64) -> u16 {
-    value.clamp(0, u16::MAX as i64) as u16
+fn clamp_scroll_offset(value: i64) -> u32 {
+    value.clamp(0, u32::MAX as i64) as u32
 }
 
 /// Format the payload for the OSC 9;4 `progress` event:
@@ -11862,8 +11862,8 @@ impl ApplicationHandler<UserEvent> for App {
                             } else {
                                 let cur_off = pane.scroll_offset.load(Ordering::Relaxed);
                                 if cur_off > 0 {
-                                    let next = (cur_off as usize + grew).min(cur_sb).min(u16::MAX as usize);
-                                    pane.scroll_offset.store(next as u16, Ordering::Relaxed);
+                                    let next = (cur_off as usize + grew).min(cur_sb).min(u32::MAX as usize);
+                                    pane.scroll_offset.store(next as u32, Ordering::Relaxed);
                                 }
                             }
                         }
@@ -12295,7 +12295,7 @@ impl ApplicationHandler<UserEvent> for App {
                             let cur = pane.scroll_offset.load(Ordering::Relaxed) as usize;
                             if cur > new_len {
                                 pane.scroll_offset
-                                    .store(new_len.min(u16::MAX as usize) as u16, Ordering::Relaxed);
+                                    .store(new_len.min(u32::MAX as usize) as u32, Ordering::Relaxed);
                             }
                         }
                     }
@@ -12707,7 +12707,7 @@ impl ApplicationHandler<UserEvent> for App {
                             .map(|t| t.scrollback_len())
                             .unwrap_or(0);
                         let new_off =
-                            sb_len.saturating_sub(line).min(u16::MAX as usize) as u16;
+                            sb_len.saturating_sub(line).min(u32::MAX as usize) as u32;
                         pane.scroll_offset.store(new_off, Ordering::Relaxed);
                         self.events.emit("scroll", &new_off.to_string());
                     }
@@ -15248,13 +15248,15 @@ mod tests {
     }
 
     #[test]
-    fn clamp_scroll_offset_saturates_past_u16() {
-        // Scrollback can exceed 65 535 lines; a bare `as u16` wrapped
-        // (100_000 → 34_464), flinging the viewport to a wrong line.
+    fn clamp_scroll_offset_saturates_into_u32() {
+        // scroll_offset is u32 (was u16); 100k lines now round-trips
+        // instead of wrapping, and the tail past 65 535 is reachable.
         assert_eq!(clamp_scroll_offset(0), 0);
         assert_eq!(clamp_scroll_offset(500), 500);
-        assert_eq!(clamp_scroll_offset(u16::MAX as i64), u16::MAX);
-        assert_eq!(clamp_scroll_offset(100_000), u16::MAX);
+        assert_eq!(clamp_scroll_offset(100_000), 100_000);
+        assert_eq!(clamp_scroll_offset(u32::MAX as i64), u32::MAX);
+        // Beyond u32 saturates rather than wrapping.
+        assert_eq!(clamp_scroll_offset(u32::MAX as i64 + 10), u32::MAX);
         // Negatives (shouldn't occur, but the math is signed) clamp to 0.
         assert_eq!(clamp_scroll_offset(-5), 0);
     }

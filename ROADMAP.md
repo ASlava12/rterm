@@ -105,13 +105,14 @@
   DoD: анимированный GIF через iTerm2-протокол крутится; CPU в
   простое без анимаций не растёт.
 
-- [ ] **`scroll_offset` u16 → u32.**
-  Wrap починен (сатурация в `clamp_scroll_offset`), но хвост
-  scrollback > 65 535 строк недостижим. Затрагивает
-  `Pane.scroll_offset: AtomicU16`, плагинный снапшот
-  (`PaneSnapshotInfo.scroll_offset`) и ~74 обращения.
-  DoD: Shift+Home на 100k-строчном scrollback достигает верха;
-  сатурация больше не нужна.
+- [x] **`scroll_offset` u16 → u32.** (2026-07)
+  `Pane.scroll_offset` → `AtomicU32`; core API (`visible_row` /
+  `row_wrapped` / `hyperlink_at` / `detect_url_at`), `build_spans`,
+  селекшн (`to_viewport_row` / `to_visible_norm` / `from_viewport`),
+  снапшоты (`PaneSnapshotInfo` / `PaneDraw` / plugin `PaneInfo`) и все
+  store/сатурация-сайты расширены. Хвост scrollback до потолка 1M
+  строк теперь достижим (раньше > 65 535 недостижим). Тип-only,
+  без изменения логики; `clamp_scroll_offset` сатурирует у u32::MAX.
 
 - [x] **Хит-тест Confirm-кнопок paste-модалки без «бэндейджа».** (2026-07)
   Confirm-режим теперь рендерится wrap-off (как Edit/settings) —

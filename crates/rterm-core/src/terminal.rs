@@ -1034,7 +1034,7 @@ impl Terminal {
     }
 
     /// Hyperlink at the given visible cell, accounting for scrollback `offset`.
-    pub fn hyperlink_at(&self, offset: u16, row: u16, col: u16) -> Option<&str> {
+    pub fn hyperlink_at(&self, offset: u32, row: u16, col: u16) -> Option<&str> {
         let cell = self.visible_row(offset, row)?.get(col as usize)?;
         self.hyperlink_uri(cell.hyperlink)
     }
@@ -1042,7 +1042,7 @@ impl Terminal {
     /// Detect an http/https/file/ftp/mailto/ssh URL in the visible row that
     /// contains `col`. Walks outward from `col` while characters look
     /// URL-ish, then validates the slice has a recognised scheme.
-    pub fn detect_url_at(&self, offset: u16, row: u16, col: u16) -> Option<String> {
+    pub fn detect_url_at(&self, offset: u32, row: u16, col: u16) -> Option<String> {
         let cells = self.visible_row(offset, row)?;
         if (col as usize) >= cells.len() {
             return None;
@@ -1148,7 +1148,7 @@ impl Terminal {
     /// fills the viewport regardless of any leftover primary-screen scroll
     /// position. Otherwise scrolling up in bash, then `vim`-ing, would
     /// render bash's scrollback as the top rows of vim.
-    pub fn visible_row(&self, offset: u16, r: u16) -> Option<&[Cell]> {
+    pub fn visible_row(&self, offset: u32, r: u16) -> Option<&[Cell]> {
         let rows = self.size().rows;
         if r >= rows {
             return None;
@@ -1171,7 +1171,7 @@ impl Terminal {
     /// scrollback/grid mapping of [`Terminal::visible_row`]. `true` means
     /// this visible row continues onto the next one via autowrap (no hard
     /// newline). Copy uses it to avoid inserting a `\n` at the boundary.
-    pub fn row_wrapped(&self, offset: u16, r: u16) -> bool {
+    pub fn row_wrapped(&self, offset: u32, r: u16) -> bool {
         let rows = self.size().rows;
         if r >= rows {
             return false;
@@ -6458,7 +6458,7 @@ mod tests {
         t.advance(b"\r\nghij\r\nklmn"); // push more lines, scroll row0 out
         // Row 0 ("abcd") now lives in scrollback at offset reaching it.
         // Find it: scroll back far enough that visible row 0 == "abcd".
-        let sb = t.scrollback_len() as u16;
+        let sb = t.scrollback_len() as u32;
         assert!(sb >= 1, "wrapped line evicted to scrollback");
         // The oldest scrollback line is the wrapped "abcd".
         assert!(t.row_wrapped(sb, 0), "wrapped flag preserved in scrollback");

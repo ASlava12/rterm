@@ -252,7 +252,7 @@ pub struct PaneInfo {
     /// it for "monitor-silence"-style features.
     pub idle_ms: u64,
     /// Lines scrolled up into scrollback (0 = live).
-    pub scroll_offset: u16,
+    pub scroll_offset: u32,
     /// True if the pane is currently on the alternate screen.
     pub alt_screen: bool,
     /// True when DECSCNM (?5) is set — renderer is drawing the
@@ -2730,7 +2730,7 @@ impl PluginHost {
                     .ok()
                     .and_then(|g| g.panes.iter().find(|p| p.focused).map(|p| p.scroll_offset))
                     .unwrap_or(0);
-                Ok(off as u32)
+                Ok(off)
             })?,
         )?;
         // `rterm.scroll_offset_of(tab, pane)` — per-pane variant,
@@ -2752,7 +2752,7 @@ impl PluginHost {
                     .panes
                     .iter()
                     .find(|p| p.tab == tab_idx && p.pane == pane_idx)
-                    .map(|p| p.scroll_offset as u32))
+                    .map(|p| p.scroll_offset))
             })?,
         )?;
         // `rterm.scroll_offset_by_uid(uid)` — stable-id sibling.
@@ -2767,7 +2767,7 @@ impl PluginHost {
                     .panes
                     .iter()
                     .find(|p| p.uid == uid)
-                    .map(|p| p.scroll_offset as u32))
+                    .map(|p| p.scroll_offset))
             })?,
         )?;
         // `rterm.scrollback_len_of(tab, pane)` — per-pane line count
