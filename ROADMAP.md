@@ -12,6 +12,45 @@
 
 ## P0 — Быстрые победы (≤ 1 день каждая)
 
+<!-- Пункты ниже (2026-07) — из feature-gap sweep (P4). Привязки к коду
+     проверены чтением; DoD у каждого. -->
+
+- [x] **Доки: три вводящих в заблуждение утверждения.** (2026-07)
+  `open_settings` не имеет дефолтной клавиши (шаблоны EN+RU и 2 стейл-
+  комментария врали про `Ctrl+Shift+,`, забинженный на move-tab); macOS-
+  путь конфига `~/.config/rterm/`, а не `~/Library/Application Support`
+  (`Config::default_path`); вставка — `Shift+Insert`, не `Insert`. Правки
+  только в доках/комментах.
+
+- [ ] **Плагины: `run_action("custom")` из Lua не работает для кастомных.**
+  `PluginCmd::RunAction` в `event_loop.rs:~1253` резолвит только
+  билтины через `AppAction::from_name`; кастомное имя уходит в `else` с
+  логом `"run_action: unknown"`. Способность есть
+  (`PluginHost::run_action`, `rterm-plugin/src/lib.rs:~4447`), но
+  недостижима. DoD: в `else`-ветке звать `self.events.run_action(&name)`.
+
+- [ ] **Плагины: событие `attention` документировано, но не эмитится.**
+  `docs/plugins.md:118` перечисляет `attention`; `emit("attention")`
+  нет нигде, `rterm.attention()` лишь ставит `pending_attention`-флаг.
+  DoD: эмитить `"attention"` там, где дренируется `take_pending_attention()`,
+  и добавить в `builtin_event_names()` (`rterm-app/src/main.rs:~2691`) —
+  либо убрать из списка событий в доках.
+
+- [ ] **Плагины: `add_match` `opts.on` колбэк игнорируется.**
+  Доки (`docs/plugins-api.md:140`, `docs/plugins.md:169`) показывают
+  per-rule `on=function(text,row,col)`; `rterm-plugin/src/lib.rs:1094`
+  читает только `opts.regex`, `MatchRule` не хранит колбэк. DoD: хранить
+  `opts.on` как `RegistryKey` в `MatchRule` и звать на сайте
+  `emit("match")` (`event_loop.rs:~888`) — либо убрать `on` из доков.
+
+- [ ] **Плагины: нет bare/`_of`-форм части panel-аксессоров.**
+  `docs/plugins-api.md:63-69` обещает 3 формы; `rterm.idle()` /
+  `scrollback_len()` / `foreground_process()` / `foreground_pgid()` /
+  `bell_muted()` / `progress()` (bare) и `terminal_text_of()` /
+  `copy_pane_of()` не зарегистрированы → индексация в `nil`. DoD:
+  зарегистрировать недостающие формы (делегируя в `_of` с активными
+  индексами) — либо поправить доки на «две формы».
+
 - [x] **Тумблер подсветки синтаксиса в Settings-оверлее.** (2026-07)
   Чекбокс `[x] Syntax highlighting` + клавиша `Y`; рантайм-флип через
   `highlight::set_enabled`/`is_enabled`, persist `[highlight].enabled`
@@ -60,6 +99,37 @@
   «O(log N)». Всё зелёное, GUI рендерит.
 
 ## P1 — Средние (несколько дней каждая)
+
+<!-- Пункты ниже (2026-07) — из feature-gap sweep (P4). -->
+
+- [ ] **Alt-scroll mode (DECSET `?1007`): «мёртвое колесо» в pager'ах.**
+  Самая заметная UX-дыра из sweep'а. На alt-screen без mouse-tracking
+  колесо мыши должно транслироваться в стрелки курсора (или SS3 A/B при
+  app-cursor), чтобы `less`/`man`/`git log`/`git diff`/`systemctl`
+  скроллились. Сейчас `?1007` падает в `_ => {}` парсера
+  (`rterm-core/src/terminal.rs:~3169`), а render на alt без mouse-режима
+  делает no-op (`rterm-render/src/input.rs:~174`). DoD: трекать
+  `alternate_scroll: bool` (дефолт on) по `?1007`; в alt-ветке колеса
+  при выключенном mouse-режиме слать N×`\x1bOA`/`\x1bOB` (или
+  `\x1b[A`/`\x1b[B` по `app_cursor_keys`) в панель вместо возврата;
+  юнит-тест на трансляцию.
+
+- [ ] **Кастомные plugin-действия в `[[keybindings]]`.**
+  `docs/plugins.md:140` обещает бинд зарегистрированного действия через
+  `[[keybindings]] action = "name"`; `UserBinding.action` — enum
+  `AppAction`, `UserBinding::from_config` (`keybind.rs:136`) возвращает
+  `None` для не-билтинов, `main.rs:~1821` дропает с варнингом, `--check`
+  зовёт «unknown action». Достижимо только из палитры. DoD: вариант
+  `UserBinding` с именем кастомного действия; при промахе
+  `AppAction::from_name` — фолбэк в `self.events.run_action(name)` в
+  `check_user_bindings`. Связано с P0 «run_action custom».
+
+- [ ] **SGR-Pixels mouse (DECSET `?1016`).**
+  Репорт координат мыши в пикселях (SGR-фрейминг), запрашивают neovim/
+  notcurses вместе с `?1006`. Нет арма в `handle_private_mode`
+  (`terminal.rs:~3169`), `decrqm_value` (`~3107`) возвращает 0. DoD:
+  обрабатывать `?1016` (флаг pixel-report), масштабировать col/row в
+  пиксели в `encode_mouse`, отразить в `decrqm_value`.
 
 - [x] **IME: ввод CJK / dead keys / long-press macOS.** (2026-07)
   `set_ime_allowed(true)` при создании окна; `WindowEvent::Ime` arm —
@@ -132,6 +202,16 @@
 
 ## P2 — Крупные (недели)
 
+- [ ] **Глобальный хоткей: бэкенды macOS/Linux.** (из sweep, 2026-07)
+  Сейчас реализован только Windows; `#[cfg(not(windows))]`-ветка
+  (`rterm-render/src/global_hotkey.rs:11,91`) делает `let _ = (...)`,
+  один `warn!` и отдаёт no-op-хендл. Конфиг `[guake].global_hotkey`
+  (`rterm-config/src/lib.rs:175`) парсится, но молча не работает вне
+  Windows — актуально: разработка на macOS. DoD: macOS-бэкенд через
+  Carbon `RegisterEventHotKey`, Linux — X11 `XGrabKey` (+ путь под
+  Wayland-протокол); либо, если вне скоупа, явно задокументировать
+  «Windows-only», чтобы не читалось как тихий no-op.
+
 - [ ] **Sixel-графика.** Главный пункт роадмапа.
   План (из CLAUDE.md): DCS-расширение парсера в rterm-core (Sixel идёт
   как `DCS P1;P2;P3 q ... ST`), потоковый декодер палитро-строк в
@@ -188,6 +268,16 @@
   bracketed-paste payload'ов в `CommandCapture`.
 - [ ] `[highlight]`: колонка `context`-стиль правил per-profile, когда
   появятся профили.
+- [ ] Минорные VT-моды (из sweep, редкие/почти вымершие; парсер иначе
+  исчерпывающий). `?1048` save/restore курсора → `save_cursor`/
+  `restore_cursor`; `?1005`/`?1015` легаси mouse-кодировки (почти
+  вымерли, apps обычно шлют и `?1006`); `?3` DECCOLM (многие терминалы
+  игнорят намеренно — решить явно). Все падают в `_ => {}`
+  (`terminal.rs:~3169`).
+- [ ] OSC 133 `;B`/`;C` шелл-интеграция: сейчас приняты молча
+  (`terminal.rs:~3998`, только `;A`/`;D` обрабатываются). Захватывать
+  границы command-input/output только если появится фича (фолдинг вывода
+  по командам, точное выделение command-region).
 
 ## P4 — Рекуррентные процессы (повторять периодически)
 
@@ -196,7 +286,7 @@
 нечего — улучшай»). Отмечать `[x]` по факту последнего прогона с датой,
 затем снова `[ ]` на следующем цикле.
 
-- [ ] **Сверка фич: искать нереализованное.**
+- [x] **Сверка фич: искать нереализованное.** (прогон 2026-07)
   Пройтись по заявленным возможностям и найти дыры: (1) фичи из
   README / docs / `--help` / шаблонов конфига, не работающие или
   работающие частично; (2) VT/ANSI-последовательности, которые
@@ -209,6 +299,16 @@
   пунктами в P0–P2 этого файла с привязкой к коду и DoD.
   Метод: `grep` маркеров + прогон vttest/`show-key` + сверка
   README↔код; при масштабе — параллельные агенты-ревьюеры по зонам.
+  Прогон 2026-07 (4 параллельных агента по зонам): docs↔код, VT/ANSI-
+  полнота ядра, plugin API, code-стабы. Итог: ядро/доки/плагины в
+  основном исчерпывающе подключены. Заведены новые пункты — P0: 3 doc-
+  фикса (сделаны) + 4 мелких plugin-фикса (`run_action` custom,
+  `attention`-эмит, `add_match` on-колбэк, bare-аксессоры); P1: alt-
+  scroll `?1007` (мёртвое колесо в pager'ах), кастомные действия в
+  `[[keybindings]]`, `?1016` pixel-mouse; P2: глобальный хоткей
+  macOS/Linux; P3: минорные VT-моды (`?1048`/`?1005`/`?1015`/`?3`),
+  OSC 133 `;B`/`;C`. Мёртвого кода нет (все `#[allow(dead_code)]`
+  легитимны). Сбросить в `[ ]` на следующем крупном цикле.
 
 - [~] **Рефакторинг-проход по коду.** (текущий цикл: 2026-07)
   Пройтись по кодовой базе и снизить долг БЕЗ смены поведения:
