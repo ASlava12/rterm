@@ -7933,151 +7933,6 @@ fn is_window_switch_chord(key: &Key, alt: bool, ctrl: bool) -> bool {
     alt && !ctrl && matches!(key, Key::Named(NamedKey::Tab))
 }
 
-/// True when `key` is a "bare modifier" — a logical key that, pressed
-/// on its own, only modifies subsequent keystrokes (Ctrl, Shift, Alt,
-/// Super, AltGraph, Fn, lock keys). Such presses must not destroy the
-/// on-screen selection: the user is mid-chord toward `Ctrl+Shift+C`.
-fn is_bare_modifier_key(key: &Key) -> bool {
-    matches!(
-        key,
-        Key::Named(
-            NamedKey::Control
-                | NamedKey::Shift
-                | NamedKey::Alt
-                | NamedKey::Super
-                | NamedKey::Meta
-                | NamedKey::Hyper
-                | NamedKey::AltGraph
-                | NamedKey::CapsLock
-                | NamedKey::NumLock
-                | NamedKey::ScrollLock
-                | NamedKey::Fn
-                | NamedKey::FnLock
-                | NamedKey::Symbol
-                | NamedKey::SymbolLock
-        )
-    )
-}
-
-fn xterm_mod_code(mods: ModifiersState) -> u8 {
-    let mut m = 0u8;
-    if mods.contains(ModifiersState::SHIFT) {
-        m |= 1;
-    }
-    if mods.contains(ModifiersState::ALT) {
-        m |= 2;
-    }
-    if mods.contains(ModifiersState::CONTROL) {
-        m |= 4;
-    }
-    if m == 0 {
-        1
-    } else {
-        m + 1
-    }
-}
-
-fn direction_letter(k: NamedKey) -> Option<char> {
-    Some(match k {
-        NamedKey::ArrowUp => 'A',
-        NamedKey::ArrowDown => 'B',
-        NamedKey::ArrowRight => 'C',
-        NamedKey::ArrowLeft => 'D',
-        NamedKey::Home => 'H',
-        NamedKey::End => 'F',
-        _ => return None,
-    })
-}
-
-fn tilde_code(k: NamedKey) -> Option<u8> {
-    Some(match k {
-        NamedKey::PageUp => 5,
-        NamedKey::PageDown => 6,
-        NamedKey::Insert => 2,
-        NamedKey::Delete => 3,
-        NamedKey::F5 => 15,
-        NamedKey::F6 => 17,
-        NamedKey::F7 => 18,
-        NamedKey::F8 => 19,
-        NamedKey::F9 => 20,
-        NamedKey::F10 => 21,
-        NamedKey::F11 => 23,
-        NamedKey::F12 => 24,
-        // Xterm tilde codes for F13–F20. The 27 / 30 gaps in the
-        // numbering are deliberate — they're reserved for legacy
-        // DEC bindings (`KP_PF{1..4}` etc.) that we don't emit.
-        NamedKey::F13 => 25,
-        NamedKey::F14 => 26,
-        NamedKey::F15 => 28,
-        NamedKey::F16 => 29,
-        NamedKey::F17 => 31,
-        NamedKey::F18 => 32,
-        NamedKey::F19 => 33,
-        NamedKey::F20 => 34,
-        _ => return None,
-    })
-}
-
-fn f1_f4_letter(k: NamedKey) -> Option<char> {
-    Some(match k {
-        NamedKey::F1 => 'P',
-        NamedKey::F2 => 'Q',
-        NamedKey::F3 => 'R',
-        NamedKey::F4 => 'S',
-        _ => return None,
-    })
-}
-
-fn named_key_bytes(k: NamedKey, mods: ModifiersState, app_cursor: bool) -> Option<Vec<u8>> {
-    let mod_code = xterm_mod_code(mods);
-    let modified = mod_code > 1;
-
-    if let Some(c) = direction_letter(k) {
-        return Some(if modified {
-            format!("\x1b[1;{}{}", mod_code, c).into_bytes()
-        } else if app_cursor {
-            format!("\x1bO{}", c).into_bytes()
-        } else {
-            format!("\x1b[{}", c).into_bytes()
-        });
-    }
-    if let Some(n) = tilde_code(k) {
-        return Some(if modified {
-            format!("\x1b[{};{}~", n, mod_code).into_bytes()
-        } else {
-            format!("\x1b[{}~", n).into_bytes()
-        });
-    }
-    if let Some(c) = f1_f4_letter(k) {
-        return Some(if modified {
-            format!("\x1b[1;{}{}", mod_code, c).into_bytes()
-        } else {
-            format!("\x1bO{}", c).into_bytes()
-        });
-    }
-    // Shift+Tab → CBT (cursor back tab, `ESC [ Z`). Apps like `bash`
-    // and `readline` reverse-cycle completion menus with this. Bare
-    // Tab keeps sending `\t` so forward completion still works.
-    if matches!(k, NamedKey::Tab) && mods.contains(ModifiersState::SHIFT) {
-        return Some(b"\x1b[Z".to_vec());
-    }
-    // Plain keys with optional alt-prefix.
-    let bytes: &'static [u8] = match k {
-        NamedKey::Enter => b"\r",
-        NamedKey::Backspace => b"\x7f",
-        NamedKey::Tab => b"\t",
-        NamedKey::Escape => b"\x1b",
-        _ => return None,
-    };
-    Some(if mods.contains(ModifiersState::ALT) {
-        let mut v = vec![0x1b];
-        v.extend_from_slice(bytes);
-        v
-    } else {
-        bytes.to_vec()
-    })
-}
-
 /// Encode a mouse event as an escape sequence. `button` follows xterm:
 /// 0=L, 1=M, 2=R, 64/65=wheel up/down. `press=false` is a release.
 fn encode_mouse(sgr: bool, button: u32, col: u16, row: u16, press: bool) -> Vec<u8> {
@@ -8571,15 +8426,6 @@ fn abbreviate_home(path: &str) -> String {
         }
     }
     path.to_string()
-}
-
-fn ctrl_byte(b: u8) -> Option<u8> {
-    match b {
-        b'@'..=b'_' => Some(b & 0x1f),
-        b'a'..=b'z' => Some(b - b'a' + 1),
-        b'?' => Some(0x7f),
-        _ => None,
-    }
 }
 
 pub fn run(cfg: RunConfig) -> Result<()> {
@@ -9339,41 +9185,6 @@ mod tests {
     }
 
     #[test]
-    fn tilde_code_covers_f5_through_f20() {
-        // xterm assigns specific tilde codes to F5..F20 with gaps at
-        // 16, 22, 27, 30 that legacy DEC bindings still claim. Pin the
-        // full table so an accidental renumbering can't silently
-        // misencode keypresses for users with extended keyboards.
-        assert_eq!(tilde_code(NamedKey::F5), Some(15));
-        assert_eq!(tilde_code(NamedKey::F12), Some(24));
-        assert_eq!(tilde_code(NamedKey::F13), Some(25));
-        assert_eq!(tilde_code(NamedKey::F14), Some(26));
-        assert_eq!(tilde_code(NamedKey::F15), Some(28));
-        assert_eq!(tilde_code(NamedKey::F16), Some(29));
-        assert_eq!(tilde_code(NamedKey::F17), Some(31));
-        assert_eq!(tilde_code(NamedKey::F18), Some(32));
-        assert_eq!(tilde_code(NamedKey::F19), Some(33));
-        assert_eq!(tilde_code(NamedKey::F20), Some(34));
-        // F1–F4 use the SS3 form, not tilde — must return None here.
-        assert_eq!(tilde_code(NamedKey::F1), None);
-        assert_eq!(tilde_code(NamedKey::F4), None);
-    }
-
-    #[test]
-    fn named_key_bytes_shift_tab_sends_cbt() {
-        // Bare Tab is plain `\t`; with Shift it must become CBT
-        // (`ESC[Z`) so readline/menu apps can reverse-cycle.
-        let plain = named_key_bytes(NamedKey::Tab, ModifiersState::empty(), false).unwrap();
-        assert_eq!(plain, b"\t".to_vec());
-        let shift_tab = named_key_bytes(NamedKey::Tab, ModifiersState::SHIFT, false).unwrap();
-        assert_eq!(shift_tab, b"\x1b[Z".to_vec());
-        // Alt+Tab still uses the plain-key alt-prefix path
-        // (`\x1b\t`) — this is only the Shift override.
-        let alt_tab = named_key_bytes(NamedKey::Tab, ModifiersState::ALT, false).unwrap();
-        assert_eq!(alt_tab, b"\x1b\t".to_vec());
-    }
-
-    #[test]
     fn parse_key_spec_accepts_punctuation_aliases() {
         // Real-world bindings often want `Ctrl+Plus` (zoom in) but
         // `+` is also our separator, so `Ctrl++` confuses the splitter.
@@ -9778,20 +9589,6 @@ mod tests {
         // Alt + a non-Tab key is not the switch chord.
         assert!(!is_window_switch_chord(&Key::Named(NamedKey::Enter), true, false));
         assert!(!is_window_switch_chord(&Key::Character("a".into()), true, false));
-    }
-
-    #[test]
-    fn bare_modifier_keys_are_recognised() {
-        assert!(is_bare_modifier_key(&Key::Named(NamedKey::Control)));
-        assert!(is_bare_modifier_key(&Key::Named(NamedKey::Shift)));
-        assert!(is_bare_modifier_key(&Key::Named(NamedKey::Alt)));
-        assert!(is_bare_modifier_key(&Key::Named(NamedKey::Super)));
-        assert!(is_bare_modifier_key(&Key::Named(NamedKey::AltGraph)));
-        assert!(is_bare_modifier_key(&Key::Named(NamedKey::CapsLock)));
-        // Regular keys are not bare modifiers.
-        assert!(!is_bare_modifier_key(&Key::Named(NamedKey::Enter)));
-        assert!(!is_bare_modifier_key(&Key::Named(NamedKey::Tab)));
-        assert!(!is_bare_modifier_key(&Key::Character("a".into())));
     }
 
     #[test]

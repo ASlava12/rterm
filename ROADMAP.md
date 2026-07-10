@@ -255,9 +255,16 @@
   имя→код (`cursor_shape_code` / `mouse_mode_code`). Реэкспорт
   `pub(crate) use payload::*` — вызовы из `event_loop.rs` и тесты в
   `lib.rs` резолвятся без правок. `lib.rs` 10.8k → 10.5k.
-  Осталось (по желанию): распилить сам `window_event` на per-arm методы;
-  input-кодировщики (`named_key_bytes`/`encode_mouse`/…) — в `input.rs`
-  вместе с их тестами. (2) чистая математика (геометрия, хит-тесты,
+  Затем input-кодировщики клавиатуры в `input.rs` как приватные:
+  `named_key_bytes` + его CSI-хелперы (`xterm_mod_code` /
+  `direction_letter` / `tilde_code` / `f1_f4_letter`),
+  `is_bare_modifier_key`, `ctrl_byte` — вместе с их 3 юнит-тестами
+  (переехали в `input::tests`, вызовы + тесты в одном модуле → ни
+  `pub(crate)`, ни реэкспорт не нужны). `encode_mouse` осознанно
+  оставлен в `lib.rs` — реально общий (есть mouse-release-вызов вне
+  `input.rs`). `lib.rs` 10.5k → 10.3k.
+  Осталось (по желанию): распилить сам `window_event` на per-arm методы.
+  (2) чистая математика (геометрия, хит-тесты,
   кодирование) — в свободные функции ради юнит-тестов; (3) убрать
   дублирование (инлайн-копии `close_tab_at` и т.п.), стейл-комментарии,
   мёртвый код; (4) единообразить идиомы (poison-tolerant локи,
