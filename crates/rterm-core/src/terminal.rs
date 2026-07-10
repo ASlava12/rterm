@@ -5150,6 +5150,14 @@ impl<'a> Perform for TerminalPerform<'a> {
                 // shell next advertises a real title.
                 *self.current_title = None;
                 self.title_stack.clear();
+                // Kitty keyboard flags are session state — a hard reset
+                // must return to legacy encoding (the soft reset DECSTR
+                // already clears these). Otherwise, after an app enables
+                // flag 8 and then `tput reset`/RIS runs, the now-legacy
+                // shell keeps getting CSI-u-encoded keys and plain typing
+                // renders as garbage (`[97u` instead of `a`).
+                self.kitty_kbd_stack[0].clear();
+                self.kitty_kbd_stack[1].clear();
             }
             _ => {}
         }
@@ -6860,6 +6868,23 @@ mod tests {
         // Pop past the bottom is safe → 0.
         t.advance(b"\x1b[<5u");
         assert_eq!(t.kitty_keyboard_flags(), 0);
+    }
+
+    #[test]
+    fn ris_clears_kitty_keyboard_flags() {
+        // A hard reset (RIS, `ESC c`) must return keyboard encoding to
+        // legacy, like the soft reset DECSTR already does. Otherwise an app
+        // that enabled flag 8 then a `tput reset`/RIS leaves the now-legacy
+        // shell getting CSI-u-encoded keys — plain typing renders as garbage.
+        let mut t = term(8, 2);
+        t.advance(b"\x1b[>8u");
+        assert_eq!(t.kitty_keyboard_flags(), 8);
+        t.advance(b"\x1bc"); // RIS
+        assert_eq!(
+            t.kitty_keyboard_flags(),
+            0,
+            "RIS cleared the kitty keyboard flag stack",
+        );
     }
 
     #[test]

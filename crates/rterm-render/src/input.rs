@@ -2136,8 +2136,14 @@ fn kitty_encode_key(
     let report_events = flags & KITTY_REPORT_EVENTS != 0;
     let report_text = flags & KITTY_REPORT_TEXT != 0;
     let event = if report_events && repeat { Some(2u8) } else { None };
-    let text_field = if report_text {
-        text.filter(|t| !t.is_empty())
+    // The associated-text field (flag 16) carries the text the key would
+    // insert. A ctrl/alt/super combo produces no insertable text (it maps
+    // to a control action), so per the Kitty spec the field must be
+    // omitted — otherwise e.g. Ctrl+A emits `...;5;97u`, making a
+    // Kitty-aware app insert a spurious `a` in addition to handling Ctrl+A.
+    // Also drop any control char that slipped into `text`.
+    let text_field = if report_text && !non_shift {
+        text.filter(|t| !t.is_empty() && !t.chars().any(char::is_control))
     } else {
         None
     };
@@ -2212,6 +2218,23 @@ mod tests {
         assert_eq!(
             kitty_encode_key(&ch("a"), Some("a"), none, false, ALL_ESC | TEXT),
             Some(b"\x1b[97;1;97u".to_vec())
+        );
+        // Report-text with a ctrl/alt/super combo must OMIT the text field
+        // (those combos insert no text). Ctrl+A → `CSI 97;5u`, NOT
+        // `...;5;1u`/`...;5;97u` — otherwise the app inserts a spurious char.
+        assert_eq!(
+            kitty_encode_key(&ch("a"), Some("\x01"), ctrl, false, DISAMBIG | TEXT),
+            Some(b"\x1b[97;5u".to_vec())
+        );
+        assert_eq!(
+            kitty_encode_key(&ch("a"), Some("a"), alt, false, DISAMBIG | TEXT),
+            Some(b"\x1b[97;3u".to_vec())
+        );
+        // But shift alone DOES produce insertable text, so the field stays:
+        // Shift+A under report-all+text → `CSI 97;2;65u`.
+        assert_eq!(
+            kitty_encode_key(&ch("A"), Some("A"), shift, false, ALL_ESC | TEXT),
+            Some(b"\x1b[97;2;65u".to_vec())
         );
         // Functional keys fall through to legacy (None) — named_key_bytes
         // already emits the xterm modifier form the protocol reuses.
