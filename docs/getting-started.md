@@ -24,7 +24,7 @@ cargo run -p rterm-app -- --smoke   # headless smoke-тест (без окна)
 | Платформа | Путь |
 |-----------|------|
 | Linux (XDG) | `~/.config/rterm/` |
-| macOS | `~/Library/Application Support/rterm/` (или `~/.config/rterm/`, если задан `XDG_CONFIG_HOME`) |
+| macOS | `~/.config/rterm/` (или `$XDG_CONFIG_HOME/rterm/`, если переменная задана) |
 | Windows | `%APPDATA%\rterm\` |
 
 Точные пути, которые rterm видит прямо сейчас:

@@ -157,7 +157,9 @@ allow_osc52 = false
 # theme — canonical built-in theme name.
 #   Type:   string. Run `rterm --list-actions` and look for
 #           `cycle_theme` to see all names, or use the settings overlay
-#           (default Ctrl+Shift+,). Built-ins: "default", "dark",
+#           (`open_settings` — no default key; open it from the command
+#           palette Ctrl+Shift+P or the menu, or bind it yourself).
+#           Built-ins: "default", "dark",
 #           "dracula", "solarized-dark", "solarized-light", "nord",
 #           "gruvbox-dark", "light". Empty `""` = no preference (falls
 #           back to `[colors]` overrides if any, otherwise the built-in
@@ -256,7 +258,8 @@ enabled = true
 # Disabled by default — `xxd image.png` / `nc < image.png` /
 # hex-dump utilities all stream the same magic bytes intentionally
 # and would surprise-render as pictures. Toggle anytime via the
-# Settings overlay (Ctrl+Shift+, → "Auto-detect inline images").
+# Settings overlay (`open_settings`, e.g. from the command palette →
+# "Auto-detect inline images").
 #
 # `cat picture.png` "just works" — the parser sniffs PTY ONLCR
 # in the PNG header (double-`\r` before `\n` is the calling card)

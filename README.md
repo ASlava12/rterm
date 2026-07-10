@@ -124,7 +124,7 @@ API are split across focused files.
 | `Alt+←/↑/→/↓`               | Focus pane spatially                      |
 | `Alt+1..9`                  | Focus pane N (DFS order)                  |
 | `Alt+Shift+←/↑/→/↓`         | Resize focused pane                       |
-| `Ctrl+Shift+V` / `Insert`   | Paste                                     |
+| `Ctrl+Shift+V` / `Shift+Insert` | Paste                                 |
 | `Ctrl+Shift+C` / `Ctrl+Ins` | Copy selection                            |
 | `Ctrl+Shift+Y`              | Copy hovered URL                          |
 | `Ctrl+Shift+F`              | Search scrollback                         |

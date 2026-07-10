@@ -165,8 +165,9 @@ allow_osc52 = false
 [appearance]
 # theme — каноническое имя встроенной темы.
 #   Тип:    строка. Полный список — `rterm --list-actions` (раздел
-#           `cycle_theme`) или окно настроек (по умолчанию
-#           Ctrl+Shift+,). Встроенные: "default", "dark", "dracula",
+#           `cycle_theme`) или окно настроек (`open_settings` — без
+#           дефолтной клавиши: откройте через палитру Ctrl+Shift+P или
+#           меню, либо забиндьте сами). Встроенные: "default", "dark", "dracula",
 #           "solarized-dark", "solarized-light", "nord",
 #           "gruvbox-dark", "light". Пустая строка `""` = без
 #           предпочтения (откат на `[colors]`-оверрайды, иначе
@@ -266,7 +267,7 @@ enabled = true
 # Выключено по умолчанию — `xxd image.png` / `nc < image.png` /
 # hex-дамп утилиты шлют те же magic-байты намеренно и неожиданно
 # превратились бы в картинку. Переключается через Settings оверлей
-# (Ctrl+Shift+, → "Auto-detect inline images").
+# (`open_settings`, напр. из палитры → "Auto-detect inline images").
 #
 # `cat picture.png` "просто работает" — парсер обнаруживает PTY
 # ONLCR в PNG-заголовке (двойной `\r` перед `\n` — характерный

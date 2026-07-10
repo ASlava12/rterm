@@ -2823,9 +2823,10 @@ pub struct App {
     /// loop checks elapsed time and fires when stable.
     pending_pty_resize_at: Option<Instant>,
     /// Show the live settings overlay (terminator-style configuration
-    /// panel). Toggled via Ctrl+Shift+, / `open_settings` action; while
-    /// open, keys drive theme / font / opacity changes instead of going
-    /// to the PTY.
+    /// panel). Toggled via the `open_settings` action (no default key —
+    /// reachable from the command palette / menu, or a user binding);
+    /// while open, keys drive theme / font / opacity changes instead of
+    /// going to the PTY.
     show_settings: bool,
     /// Active right-click / hamburger context menu. While `Some`, the
     /// menu absorbs mouse + keyboard input and dims the underlying panes.

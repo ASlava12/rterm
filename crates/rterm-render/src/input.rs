@@ -882,8 +882,9 @@ impl App {
             }
             return false;
         }
-        // Allow the binding that opened the overlay (Ctrl+Shift+,) to
-        // close it too, plus app-shortcuts like Ctrl+Q for quit.
+        // Allow whatever key opened the overlay (the `open_settings`
+        // action — no default binding, so a user-defined one) to close
+        // it too, plus app-shortcuts like Ctrl+Q for quit.
         if let Some(exit) = self.handle_app_shortcut(event) {
             return exit;
         }
