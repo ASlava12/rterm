@@ -420,6 +420,11 @@ impl ApplicationHandler<UserEvent> for App {
                     || self.mouse_pty_pane.is_some()
                 {
                     self.handle_drag(position.x, position.y);
+                } else {
+                    // No drag in progress: report bare-hover motion to a
+                    // pane running any-event tracking (?1003). Inert for
+                    // every other mode.
+                    self.report_hover_motion(position.x, position.y);
                 }
                 if self.paste_modal_dragging {
                     self.paste_modal_drag_edit(position.x, position.y);

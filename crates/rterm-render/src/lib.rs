@@ -2840,6 +2840,11 @@ pub struct App {
     /// Pane index currently receiving PTY mouse events. Set when a press
     /// happens while mouse reporting is on; cleared on release.
     mouse_pty_pane: Option<usize>,
+    /// Last `(pane_idx, cx, cy)` reported for bare-hover motion under
+    /// any-event tracking (`?1003`). Dedups so we emit one report per
+    /// cell (or per pixel under `?1016`) crossed rather than one per raw
+    /// `CursorMoved`, which would flood the TUI.
+    last_hover_report: Option<(usize, u16, u16)>,
     /// Until-instant for a bell-induced visual flash of the surface
     /// clear. The flash intensity fades linearly from 1.0 down to 0 as
     /// this deadline approaches (window = `BELL_FLASH_FADE_MS`), so the
@@ -3242,6 +3247,7 @@ impl App {
             last_click: None,
             last_header_empty_click: None,
             mouse_pty_pane: None,
+            last_hover_report: None,
             flash_until: None,
             search: None,
             gap_dragging: None,
@@ -8849,6 +8855,10 @@ mod tests {
         // A pathological over-255 button saturates instead of panicking.
         let sat = encode_mouse(false, 0xff, 0, 0, true);
         assert_eq!(sat[3], 255u8);
+        // Bare-hover motion under ?1003 uses button 3 (no button) + 32
+        // (motion) = 35; with Ctrl → 35|16 = 51.
+        assert_eq!(encode_mouse(true, 35, 4, 2, true), b"\x1b[<35;5;3M".to_vec());
+        assert_eq!(encode_mouse(true, 35 | 16, 4, 2, true), b"\x1b[<51;5;3M".to_vec());
     }
 
     #[test]

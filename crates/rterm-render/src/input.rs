@@ -1796,6 +1796,43 @@ impl App {
         false
     }
 
+    /// Report bare-hover motion (no button held) to a pane running
+    /// any-event mouse tracking (`?1003`). Deduped by reported cell (or
+    /// pixel under `?1016`) so a TUI gets one motion event per cell
+    /// crossed, not one per raw `CursorMoved`. Inert for every other mouse
+    /// mode — `?1000`/`?1002` don't report button-less motion — so it does
+    /// nothing unless an app explicitly turns on `?1003`.
+    pub(crate) fn report_hover_motion(&mut self, x: f64, y: f64) {
+        let Some(idx) = self.pane_at(x, y) else {
+            // Left every pane — reset the dedup so re-entry reports fresh.
+            self.last_hover_report = None;
+            return;
+        };
+        // Read the mode, dropping the pane borrow before mutating `self`.
+        let mode_info = self
+            .active_tab()
+            .and_then(|t| t.pane_at(idx))
+            .and_then(mouse_mode_for);
+        let Some((mode, sgr, pixel)) = mode_info else {
+            self.last_hover_report = None;
+            return;
+        };
+        if mode != MouseTracking::AnyEvent {
+            return;
+        }
+        let (cx, cy) = self.mouse_report_coords(idx, x, y, pixel);
+        if self.last_hover_report == Some((idx, cx, cy)) {
+            return; // same cell/pixel — already reported
+        }
+        self.last_hover_report = Some((idx, cx, cy));
+        // Button 3 (no button) + 32 (motion bit) + any modifiers.
+        let button = 35 | mouse_mod_bits(self.modifiers);
+        let bytes = encode_mouse(sgr, button, cx, cy, true);
+        if let Some(pane) = self.active_tab().and_then(|t| t.pane_at(idx)) {
+            pane.send_input(&bytes);
+        }
+    }
+
     pub(crate) fn handle_drag(&mut self, x: f64, y: f64) {
         // Promote a pending tab press to a real drag once the cursor
         // has moved past the threshold — only THEN fire `tab.drag_start`
