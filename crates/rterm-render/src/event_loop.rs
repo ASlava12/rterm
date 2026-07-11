@@ -94,7 +94,13 @@ impl ApplicationHandler<UserEvent> for App {
                 if !self.session_restore.is_empty() {
                     let entries = std::mem::take(&mut self.session_restore);
                     for entry in entries {
-                        self.new_tab_in(entry.cwd.as_deref());
+                        // Only apply the per-tab title when a tab was
+                        // actually pushed — a failed spawn would otherwise
+                        // graft this entry's title onto the PREVIOUS tab
+                        // (and emit a wrong tab index).
+                        if !self.new_tab_in(entry.cwd.as_deref()) {
+                            continue;
+                        }
                         if let Some(title) = entry.title {
                             if let Some(tab) = self.tabs.last_mut() {
                                 tab.custom_title = if title.is_empty() {
@@ -107,7 +113,8 @@ impl ApplicationHandler<UserEvent> for App {
                             // without this, status-line plugins that
                             // re-render on the event would miss the
                             // restored title and show the auto-derived
-                            // one until the next title change.
+                            // one until the next title change. `tabs.len()`
+                            // is the just-pushed tab's 1-based index.
                             let tab_idx = self.tabs.len();
                             self.events.emit(
                                 "tab.title",
@@ -2399,6 +2406,11 @@ impl App {
                         ime_cursor_rect(rect, col, row, cell_w, line_h);
                     use unicode_width::UnicodeWidthStr;
                     let w = (self.ime_preedit.width() as f32 * cell_w).max(cell_w);
+                    // Clamp to the focused pane's right edge so a long
+                    // composition near the right of a split doesn't paint
+                    // its backdrop quad + glyphs over the neighbouring pane.
+                    let max_w = (rect.left + rect.width - x).max(cell_w);
+                    let w = w.min(max_w);
                     Some((
                         self.ime_preedit.clone(),
                         PaneRect { left: x, top: y, width: w, height: h },

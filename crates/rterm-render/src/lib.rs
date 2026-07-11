@@ -5044,9 +5044,15 @@ impl App {
     /// Spawn a new tab using `cwd` for the initial pane's working directory.
     /// Falls back to the spawner's default (typically the process cwd) when
     /// `cwd` is `None`.
-    fn new_tab_in(&mut self, cwd: Option<&str>) {
-        let Some(pane) = self.spawn_pane(cwd) else { return };
+    /// Open a new tab in `cwd`. Returns `true` when a tab was actually
+    /// pushed, `false` when the pane failed to spawn (fd exhaustion, PTY
+    /// error) — callers that then touch `tabs.last_mut()` (e.g. session
+    /// restore applying a per-tab title) must not do so on `false`, or the
+    /// title lands on the previous tab.
+    fn new_tab_in(&mut self, cwd: Option<&str>) -> bool {
+        let Some(pane) = self.spawn_pane(cwd) else { return false };
         self.push_new_tab(pane, cwd);
+        true
     }
 
     /// Open a new tab whose pane runs the named `[[profiles]]` preset
