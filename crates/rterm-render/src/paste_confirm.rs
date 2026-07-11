@@ -29,11 +29,12 @@ pub(crate) struct PasteConfirmation {
     /// original verbatim; `Edit` mode mutates this in place as the
     /// user edits. Always rendered as the dialog body.
     pub(crate) text: String,
-    /// Pane that requested the paste. Stored as a uid so a pane
-    /// switch / close doesn't redirect the paste — when the source
-    /// pane no longer exists, the modal silently drops the paste
-    /// on Apply.
-    #[allow(dead_code)] // reserved for the "send to original pane even after focus change" follow-up
+    /// Pane that requested the paste. Stored as a uid so a focus change
+    /// while the modal is up (pane death + refocus, a plugin `focus_pane`,
+    /// …) can't redirect the paste into the wrong shell:
+    /// `activate_paste_button` applies it via
+    /// `commit_paste_now(text, Some(pane_uid))`, and when the source pane
+    /// no longer exists the paste is silently dropped.
     pub(crate) pane_uid: u64,
     /// Whether we're showing the confirm dialog or the editor.
     pub(crate) mode: PasteMode,
