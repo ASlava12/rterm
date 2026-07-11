@@ -351,6 +351,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // any composition preview.
                     Ime::Commit(text) => {
                         self.ime_preedit.clear();
+                        self.ime_anchor = None;
                         if !text.is_empty() {
                             // Route through the broadcast-aware dispatch so
                             // committed IME text reaches every pane when
@@ -361,13 +362,22 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                     // Composition in progress — store the preedit for
-                    // inline rendering at the cursor.
+                    // inline rendering at the cursor, and anchor it to the
+                    // pane it belongs to so a later focus change can drop it.
                     Ime::Preedit(text, _range) => {
                         self.ime_preedit = text;
+                        self.ime_anchor = if self.ime_preedit.is_empty() {
+                            None
+                        } else {
+                            self.focused_pane().map(|p| p.uid)
+                        };
                     }
                     // Composition ended / IME turned off — nothing is
                     // being composed anymore.
-                    Ime::Disabled => self.ime_preedit.clear(),
+                    Ime::Disabled => {
+                        self.ime_preedit.clear();
+                        self.ime_anchor = None;
+                    }
                     Ime::Enabled => {}
                 }
                 // Re-anchor the IME candidate window to the terminal
@@ -2395,6 +2405,17 @@ impl App {
         // otherwise conflict with) as `(text, rect)`. `None`
         // when nothing is composing. The rect starts at the
         // cursor pixel and spans the composition's display width.
+        // Drop a stale composition if focus moved to a different pane while
+        // composing — otherwise the preedit would render on (and a later
+        // commit could leak into) the wrong terminal. Pane UIDs are stable
+        // for a pane's lifetime, so this only fires on a real focus change,
+        // never mid-composition on the same pane.
+        if !self.ime_preedit.is_empty()
+            && self.focused_pane().map(|p| p.uid) != self.ime_anchor
+        {
+            self.ime_preedit.clear();
+            self.ime_anchor = None;
+        }
         let preedit_info: Option<(String, PaneRect)> =
             if self.ime_preedit.is_empty() {
                 None

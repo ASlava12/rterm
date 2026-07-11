@@ -3111,6 +3111,11 @@ pub struct App {
     /// cursor. Empty when no composition is active. Updated from
     /// `WindowEvent::Ime(Preedit)` and cleared on Commit / Disabled.
     ime_preedit: String,
+    /// UID of the pane that owns the in-flight composition (captured when
+    /// the preedit is set). If focus moves to a different pane mid-
+    /// composition, the render path drops the now-orphaned preedit so it
+    /// isn't drawn on — nor committed into — the wrong terminal.
+    ime_anchor: Option<u64>,
 }
 
 const CURSOR_BLINK_PERIOD_MS: u128 = 1000;
@@ -3306,6 +3311,7 @@ impl App {
             last_frame_tick: None,
             waker: None,
             ime_preedit: String::new(),
+            ime_anchor: None,
             last_atlas_trim: None,
             tab_silence_ms,
             slow_command_ms,
