@@ -277,28 +277,14 @@ impl App {
     /// currently focused pane (direct, non-modal paste). A target uid
     /// that no longer resolves drops the paste.
     pub(crate) fn commit_paste_now(&mut self, text: &str, target_uid: Option<u64>) {
-        let pane = match target_uid {
-            Some(uid) => match self.find_pane_by_uid(uid) {
-                Some(p) => p,
-                None => {
-                    tracing::warn!(uid, "paste target pane is gone — dropping paste");
-                    return;
-                }
-            },
-            None => match self.focused_pane() {
-                Some(p) => p,
-                None => return,
-            },
-        };
         // Strip embedded bracketed-paste markers first so a malicious
         // clipboard payload can't include a literal `\x1b[201~` to "close"
         // our paste early and have the following bytes interpreted as
-        // shell commands. We deliberately keep `\n` as-is when wrapping in
-        // bracketed-paste (the shell's bracketed-paste handler treats
-        // newlines literally and adds them to the input buffer rather than
-        // executing). Outside bracketed paste, collapse newlines into a
-        // single `\r` so multi-line clipboard contents look like one
-        // command rather than a script the shell auto-executes.
+        // shell commands. `normalize_paste` then keeps `\n` as-is when the
+        // pane is in bracketed-paste mode (the shell treats newlines
+        // literally and buffers them) or collapses to `\r` otherwise (so
+        // multi-line clipboard content reads as one command, not a script
+        // the shell auto-executes).
         let stripped: String = text.replace("\x1b[200~", "").replace("\x1b[201~", "");
         // Drop empty pastes silently — emits no PTY bytes, no `paste`
         // event, no spurious bracketed-paste markers. Plugins listening
@@ -306,29 +292,52 @@ impl App {
         if stripped.is_empty() {
             return;
         }
-        let bracketed = pane
-            .terminal
-            .lock()
-            .map(|t| t.bracketed_paste())
-            .unwrap_or(false);
-        let to_send: String = if bracketed {
-            // Bracketed paste: keep newlines as `\n`. Shells (zsh/bash/fish)
-            // collect the whole payload as a single input "burst" — so
-            // pressing Enter after the paste runs it, not as part of it.
-            stripped.replace("\r\n", "\n")
+        // The `paste` event reports the transformed text of one target;
+        // captured from the first pane written.
+        let mut emitted: Option<String> = None;
+        if self.broadcast_input && target_uid.is_none() {
+            // Broadcast a direct (non-modal) paste to every pane in the
+            // active tab, mirroring keystroke broadcast. Each pane's shell
+            // may differ in bracketed-paste state, so wrap PER PANE. A
+            // modal-targeted paste (`target_uid`) stays pinned to its pane.
+            if let Some(tab) = self.active_tab() {
+                for pane in tab.panes() {
+                    let bracketed = pane
+                        .terminal
+                        .lock()
+                        .map(|t| t.bracketed_paste())
+                        .unwrap_or(false);
+                    let to_send = normalize_paste(&stripped, bracketed);
+                    pane.send_input(&wrap_paste(&to_send, bracketed));
+                    if emitted.is_none() {
+                        emitted = Some(to_send);
+                    }
+                }
+            }
         } else {
-            // Plain paste: legacy xterm behaviour collapses to `\r`.
-            stripped.replace("\r\n", "\r").replace('\n', "\r")
-        };
-        if bracketed {
-            let mut out = Vec::with_capacity(to_send.len() + 12);
-            out.extend_from_slice(b"\x1b[200~");
-            out.extend_from_slice(to_send.as_bytes());
-            out.extend_from_slice(b"\x1b[201~");
-            pane.send_input(&out);
-        } else {
-            pane.send_input(to_send.as_bytes());
+            let pane = match target_uid {
+                Some(uid) => match self.find_pane_by_uid(uid) {
+                    Some(p) => p,
+                    None => {
+                        tracing::warn!(uid, "paste target pane is gone — dropping paste");
+                        return;
+                    }
+                },
+                None => match self.focused_pane() {
+                    Some(p) => p,
+                    None => return,
+                },
+            };
+            let bracketed = pane
+                .terminal
+                .lock()
+                .map(|t| t.bracketed_paste())
+                .unwrap_or(false);
+            let to_send = normalize_paste(&stripped, bracketed);
+            pane.send_input(&wrap_paste(&to_send, bracketed));
+            emitted = Some(to_send);
         }
+        let Some(to_send) = emitted else { return };
         // Ensure the next frame renders the shell's echo even if the
         // continuous-redraw chain was stalled between events — without
         // this, the paste's cursor advance can be visible while the
@@ -2039,6 +2048,32 @@ fn alt_scroll_bytes(step: i32, app_cursor: bool) -> Vec<u8> {
     out
 }
 
+/// Normalize a marker-stripped clipboard payload for pasting into a pane.
+/// In bracketed-paste mode the shell buffers the whole payload, so newlines
+/// stay `\n`; otherwise legacy xterm behaviour collapses every newline to a
+/// single `\r` so multi-line content reads as one command line.
+fn normalize_paste(stripped: &str, bracketed: bool) -> String {
+    if bracketed {
+        stripped.replace("\r\n", "\n")
+    } else {
+        stripped.replace("\r\n", "\r").replace('\n', "\r")
+    }
+}
+
+/// Wrap normalized paste text in `CSI 200 ~` / `CSI 201 ~` when the pane is
+/// in bracketed-paste mode, else return the bytes as-is.
+fn wrap_paste(to_send: &str, bracketed: bool) -> Vec<u8> {
+    if bracketed {
+        let mut out = Vec::with_capacity(to_send.len() + 12);
+        out.extend_from_slice(b"\x1b[200~");
+        out.extend_from_slice(to_send.as_bytes());
+        out.extend_from_slice(b"\x1b[201~");
+        out
+    } else {
+        to_send.as_bytes().to_vec()
+    }
+}
+
 
 fn xterm_mod_code(mods: ModifiersState) -> u8 {
     let mut m = 0u8;
@@ -2318,6 +2353,20 @@ mod tests {
         // Magnitude repeats the key; zero yields nothing.
         assert_eq!(alt_scroll_bytes(3, false), b"\x1b[A\x1b[A\x1b[A".to_vec());
         assert!(alt_scroll_bytes(0, false).is_empty());
+    }
+
+    #[test]
+    fn paste_normalize_and_wrap() {
+        // Bracketed: newlines stay `\n`, payload wrapped in 200~/201~.
+        assert_eq!(normalize_paste("a\r\nb", true), "a\nb");
+        assert_eq!(normalize_paste("a\nb", true), "a\nb");
+        assert_eq!(
+            wrap_paste("a\nb", true),
+            b"\x1b[200~a\nb\x1b[201~".to_vec(),
+        );
+        // Plain: every newline collapses to `\r`, no wrapping.
+        assert_eq!(normalize_paste("a\r\nb\nc", false), "a\rb\rc");
+        assert_eq!(wrap_paste("a\rb", false), b"a\rb".to_vec());
     }
 
     #[test]
