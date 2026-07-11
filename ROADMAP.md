@@ -412,12 +412,13 @@
   по правому краю фокусной панели (`max_w = rect.left + rect.width - x`),
   так что длинная композиция у правого края сплита не рисует backdrop +
   глифы поверх соседней панели. (`940b18a`)
-- [ ] **Mouse: ?1003 bare-hover motion.** (review-батч 3)
-  `mouse_pty_pane` ставится только на press, поэтому motion репортится
-  лишь при зажатой кнопке. ?1003 (any-event) должен репортить и hover без
-  кнопки. Нужен репорт motion на каждый CursorMoved, когда у панели под
-  курсором активен ?1003 (проверка mode + `mouse_report_coords`, дедуп по
-  смене ячейки, чтобы не флудить). ?1002 (drag) уже работает.
+- [x] **Mouse: ?1003 bare-hover motion.** (2026-07)
+  Новый `report_hover_motion` (`input.rs`) в else-ветке CursorMoved-gate:
+  когда нет drag'а и у панели под курсором активен ?1003 (any-event),
+  шлёт motion-репорт (button 3 «no button» + 32 motion + модификаторы),
+  дедуп по ячейке/пикселю (?1016), чтобы не флудить TUI. Инертен для
+  прочих mouse-режимов. Тест на кодирование bare-hover кнопки (35). ?1002
+  drag уже работал (батч 3). (`5f76e5e`)
 - [x] **Restore: title применяется не к тому табу при провале spawn.** (2026-07)
   `new_tab_in` теперь возвращает `bool` (был push или нет); restore-цикл
   (`event_loop.rs`) при `false` делает `continue` — title и `tab.title`-
